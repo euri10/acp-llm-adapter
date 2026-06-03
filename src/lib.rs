@@ -317,7 +317,7 @@ pub mod deepseek {
     }
 
     /// A client abstraction for streaming chat-completions turns.
-    pub trait LlmClient {
+    pub trait LlmClient: Send + Sync {
         /// Stream a turn and yield normalized reasoning, text, and terminal events.
         ///
         /// # Errors

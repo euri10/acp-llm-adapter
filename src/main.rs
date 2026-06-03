@@ -15,16 +15,24 @@
 // `#[must_use]` on every internal binary helper is noise at this stage.
 #![allow(clippy::must_use_candidate)]
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
-    ClientCapabilities, InitializeRequest, InitializeResponse, PromptCapabilities, ProtocolVersion,
+    ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, SessionMode, SessionModeState, SessionNotification, SessionUpdate, StopReason,
 };
 use agent_client_protocol::{Agent, ConnectTo, Stdio};
 use clap::{Parser, Subcommand};
+use deepseek_acp_adapter::deepseek::{
+    ChatMessage, ChatRequest, DeepSeekClient, FinishReason, LlmClient, StreamEvent,
+};
+use futures_util::StreamExt;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 type AdapterResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
@@ -79,15 +87,22 @@ fn init_tracing() -> AdapterResult<()> {
 }
 
 async fn serve() -> Result<(), agent_client_protocol::Error> {
+    let llm_client = Arc::new(
+        DeepSeekClient::from_env().map_err(agent_client_protocol::Error::into_internal_error)?,
+    );
     let state = Arc::new(Mutex::new(AdapterState::default()));
-    serve_with_transport(Stdio::new(), state).await
+    serve_with_transport(Stdio::new(), state, llm_client).await
 }
 
 async fn serve_with_transport(
     transport: impl ConnectTo<Agent>,
     state: Arc<Mutex<AdapterState>>,
+    llm_client: Arc<dyn LlmClient>,
 ) -> Result<(), agent_client_protocol::Error> {
     let initialize_state = Arc::clone(&state);
+    let new_session_state = Arc::clone(&state);
+    let prompt_state = Arc::clone(&state);
+    let prompt_client = Arc::clone(&llm_client);
 
     Agent
         .builder()
@@ -101,6 +116,26 @@ async fn serve_with_transport(
         .on_receive_request(
             async move |_request: AuthenticateRequest, responder, _cx| {
                 responder.respond(handle_authenticate_request())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: NewSessionRequest, responder, _cx| {
+                responder.respond(handle_new_session_request(&new_session_state, &request)?)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: PromptRequest, responder, cx| {
+                let response = handle_prompt_request(
+                    &prompt_state,
+                    prompt_client.as_ref(),
+                    request,
+                    |notification| cx.send_notification(notification),
+                )
+                .await?;
+
+                responder.respond(response)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -118,6 +153,83 @@ fn handle_initialize_request(
 
 fn handle_authenticate_request() -> AuthenticateResponse {
     AuthenticateResponse::new()
+}
+
+fn handle_new_session_request(
+    state: &Arc<Mutex<AdapterState>>,
+    request: &NewSessionRequest,
+) -> Result<NewSessionResponse, agent_client_protocol::Error> {
+    validate_session_paths(request)?;
+
+    let session_id = format!("session-{}", Uuid::new_v4());
+    let mut guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    guard
+        .sessions
+        .insert(session_id.clone().into(), SessionRecord::default());
+
+    Ok(NewSessionResponse::new(session_id).modes(default_session_modes()))
+}
+
+async fn handle_prompt_request(
+    state: &Arc<Mutex<AdapterState>>,
+    llm_client: &dyn LlmClient,
+    request: PromptRequest,
+    mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<PromptResponse, agent_client_protocol::Error> {
+    let user_text = text_from_prompt(&request.prompt)?;
+    let user_message = ChatMessage::user(user_text.clone());
+    let messages = {
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let session = guard.sessions.get(&request.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session id: {}", request.session_id.0))
+        })?;
+
+        let mut messages = session.history.clone();
+        messages.push(user_message.clone());
+        messages
+    };
+
+    let mut stream = llm_client
+        .stream_chat(ChatRequest::new(messages))
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let mut assistant_text = String::new();
+    let mut stop_reason = StopReason::EndTurn;
+
+    while let Some(event) = stream.next().await {
+        match event.map_err(agent_client_protocol::Error::into_internal_error)? {
+            StreamEvent::Thought(chunk) => notify(session_notification(
+                request.session_id.clone(),
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(chunk.into())),
+            ))?,
+            StreamEvent::Message(chunk) => {
+                assistant_text.push_str(&chunk);
+                notify(session_notification(
+                    request.session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(chunk.into())),
+                ))?;
+            }
+            StreamEvent::Finished(reason) => {
+                stop_reason = stop_reason_from_finish(&reason);
+            }
+        }
+    }
+
+    let mut guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
+        agent_client_protocol::Error::invalid_params()
+            .data(format!("unknown session id: {}", request.session_id.0))
+    })?;
+    session.history.push(user_message);
+    session.history.push(ChatMessage::assistant(assistant_text));
+
+    Ok(PromptResponse::new(stop_reason))
 }
 
 fn build_initialize_response(protocol_version: ProtocolVersion) -> InitializeResponse {
@@ -140,23 +252,136 @@ fn record_client_capabilities(
     Ok(())
 }
 
+fn validate_session_paths(request: &NewSessionRequest) -> Result<(), agent_client_protocol::Error> {
+    if !request.cwd.is_absolute() {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("session cwd must be an absolute path"));
+    }
+
+    if request
+        .additional_directories
+        .iter()
+        .any(|path| !path.is_absolute())
+    {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("additional session directories must be absolute paths"));
+    }
+
+    Ok(())
+}
+
+fn default_session_modes() -> SessionModeState {
+    SessionModeState::new("chat", vec![SessionMode::new("chat", "Chat")])
+}
+
+fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_protocol::Error> {
+    let mut text = String::new();
+
+    for block in prompt {
+        match block {
+            ContentBlock::Text(content) => text.push_str(&content.text),
+            _ => {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("only text prompt blocks are supported"));
+            }
+        }
+    }
+
+    if text.trim().is_empty() {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("prompt must include non-empty text"));
+    }
+
+    Ok(text)
+}
+
+fn session_notification(
+    session_id: agent_client_protocol::schema::SessionId,
+    update: SessionUpdate,
+) -> SessionNotification {
+    SessionNotification::new(session_id, update)
+}
+
+fn stop_reason_from_finish(reason: &FinishReason) -> StopReason {
+    match reason {
+        FinishReason::EndTurn | FinishReason::ToolCalls | FinishReason::Other(_) => {
+            StopReason::EndTurn
+        }
+        FinishReason::MaxTokens => StopReason::MaxTokens,
+        FinishReason::Refusal => StopReason::Refusal,
+    }
+}
+
 #[derive(Debug, Default)]
 struct AdapterState {
     client_capabilities: Option<ClientCapabilities>,
+    sessions: HashMap<agent_client_protocol::schema::SessionId, SessionRecord>,
+}
+
+#[derive(Debug, Default)]
+struct SessionRecord {
+    history: Vec<ChatMessage>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AdapterState, Cli, Command, build_initialize_response, handle_authenticate_request,
-        handle_initialize_request,
+        handle_initialize_request, handle_new_session_request, handle_prompt_request,
     };
+    use deepseek_acp_adapter::deepseek::{
+        ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
+    };
+    use futures_util::stream::{self, BoxStream};
     use std::sync::{Arc, Mutex};
 
     use agent_client_protocol::schema::{
-        ClientCapabilities, FileSystemCapabilities, InitializeRequest, ProtocolVersion,
+        ClientCapabilities, ContentBlock, FileSystemCapabilities, InitializeRequest,
+        NewSessionRequest, PromptRequest, ProtocolVersion, SessionUpdate, StopReason,
     };
     use clap::Parser;
+
+    struct FakeLlmClient {
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+        events: Mutex<Option<Vec<Result<StreamEvent, DeepSeekError>>>>,
+    }
+
+    impl FakeLlmClient {
+        fn new(events: Vec<Result<StreamEvent, DeepSeekError>>) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                events: Mutex::new(Some(events)),
+            }
+        }
+
+        fn requests(&self) -> Arc<Mutex<Vec<ChatRequest>>> {
+            Arc::clone(&self.requests)
+        }
+    }
+
+    impl LlmClient for FakeLlmClient {
+        fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
+            self.requests
+                .lock()
+                .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
+                .push(request);
+            let events = self
+                .events
+                .lock()
+                .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
+                .take()
+                .ok_or_else(|| {
+                    DeepSeekError::InvalidResponse(
+                        "fake client stream was requested more than once".to_string(),
+                    )
+                })?;
+
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
 
     #[test_log::test]
     fn parses_serve_subcommand() {
@@ -223,5 +448,131 @@ mod tests {
         let response = handle_authenticate_request();
 
         assert!(response.meta.is_none());
+    }
+
+    #[test_log::test]
+    fn new_session_returns_id_and_mode() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let response = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+
+        assert!(response.session_id.0.starts_with("session-"));
+        let modes = response
+            .modes
+            .ok_or_else(agent_client_protocol::Error::internal_error)?;
+        assert_eq!(modes.current_mode_id.0.as_ref(), "chat");
+        assert_eq!(modes.available_modes.len(), 1);
+
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert!(guard.sessions.contains_key(&response.session_id));
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_protocol::Error>
+    {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let client = FakeLlmClient::new(vec![
+            Ok(StreamEvent::Thought("thinking".to_string())),
+            Ok(StreamEvent::Message("hello".to_string())),
+            Ok(StreamEvent::Message(" world".to_string())),
+            Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+        ]);
+        let requests = client.requests();
+        let mut notifications = Vec::new();
+
+        let response = handle_prompt_request(
+            &state,
+            &client,
+            PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("hi")]),
+            |notification| {
+                notifications.push(notification);
+                Ok(())
+            },
+        )
+        .await?;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(notifications.len(), 3);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::AgentThoughtChunk(_)
+        ));
+        assert!(matches!(
+            notifications[1].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+        assert!(matches!(
+            notifications[2].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+
+        let request_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(request_guard.len(), 1);
+        assert_eq!(request_guard[0].messages()[0].content(), "hi");
+        drop(request_guard);
+
+        let state_guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let stored = state_guard
+            .sessions
+            .get(&session.session_id)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::internal_error().data("missing stored session")
+            })?;
+        assert_eq!(stored.history.len(), 2);
+        assert_eq!(stored.history[0].content(), "hi");
+        assert_eq!(stored.history[1].content(), "hello world");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let first_client = FakeLlmClient::new(vec![
+            Ok(StreamEvent::Message("first answer".to_string())),
+            Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+        ]);
+        handle_prompt_request(
+            &state,
+            &first_client,
+            PromptRequest::new(
+                session.session_id.clone(),
+                vec![ContentBlock::from("first")],
+            ),
+            |_| Ok(()),
+        )
+        .await?;
+
+        let second_client =
+            FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::MaxTokens))]);
+        let second_requests = second_client.requests();
+        let response = handle_prompt_request(
+            &state,
+            &second_client,
+            PromptRequest::new(session.session_id, vec![ContentBlock::from("second")]),
+            |_| Ok(()),
+        )
+        .await?;
+
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+        let request_guard = second_requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let messages = request_guard[0].messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content(), "first");
+        assert_eq!(messages[1].content(), "first answer");
+        assert_eq!(messages[2].content(), "second");
+
+        Ok(())
     }
 }
