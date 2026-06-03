@@ -94,19 +94,30 @@ async fn serve_with_transport(
         .name("deepseek-acp-adapter")
         .on_receive_request(
             async move |request: InitializeRequest, responder, _cx| {
-                record_client_capabilities(&initialize_state, request.client_capabilities)?;
-                responder.respond(build_initialize_response(request.protocol_version))
+                responder.respond(handle_initialize_request(&initialize_state, request)?)
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |_request: AuthenticateRequest, responder, _cx| {
-                responder.respond(AuthenticateResponse::new())
+                responder.respond(handle_authenticate_request())
             },
             agent_client_protocol::on_receive_request!(),
         )
         .connect_to(transport)
         .await
+}
+
+fn handle_initialize_request(
+    state: &Arc<Mutex<AdapterState>>,
+    request: InitializeRequest,
+) -> Result<InitializeResponse, agent_client_protocol::Error> {
+    record_client_capabilities(state, request.client_capabilities)?;
+    Ok(build_initialize_response(request.protocol_version))
+}
+
+fn handle_authenticate_request() -> AuthenticateResponse {
+    AuthenticateResponse::new()
 }
 
 fn build_initialize_response(protocol_version: ProtocolVersion) -> InitializeResponse {
@@ -137,7 +148,8 @@ struct AdapterState {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterState, Cli, Command, build_initialize_response, record_client_capabilities,
+        AdapterState, Cli, Command, build_initialize_response, handle_authenticate_request,
+        handle_initialize_request,
     };
     use std::sync::{Arc, Mutex};
 
@@ -186,9 +198,7 @@ mod tests {
                 .terminal(true),
         );
 
-        record_client_capabilities(&state, request.client_capabilities)?;
-
-        let response = build_initialize_response(request.protocol_version);
+        let response = handle_initialize_request(&state, request)?;
 
         assert_eq!(response.protocol_version, ProtocolVersion::LATEST);
         let guard = state
@@ -206,5 +216,12 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test_log::test]
+    fn authenticate_request_returns_empty_response() {
+        let response = handle_authenticate_request();
+
+        assert!(response.meta.is_none());
     }
 }

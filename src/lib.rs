@@ -527,6 +527,24 @@ pub mod deepseek {
         }
 
         #[test_log::test]
+        fn config_trims_values_and_defaults_blank_entries() -> Result<(), DeepSeekError> {
+            let environment = FakeEnvironment {
+                values: BTreeMap::from([
+                    ("DEEPSEEK_API_KEY", "  secret-token  "),
+                    ("DEEPSEEK_BASE_URL", "   "),
+                    ("DEEPSEEK_MODEL", "  custom-model  "),
+                ]),
+            };
+
+            let config = DeepSeekConfig::from_environment(&environment)?;
+
+            assert_eq!(config.base_url(), DeepSeekConfig::DEFAULT_BASE_URL);
+            assert_eq!(config.model(), "custom-model");
+
+            Ok(())
+        }
+
+        #[test_log::test]
         fn parses_reasoning_and_text_chunks_in_order() -> Result<(), DeepSeekError> {
             let fixture = r#"
             {
@@ -551,6 +569,53 @@ pub mod deepseek {
                     StreamEvent::Message("answer".to_string()),
                     StreamEvent::Finished(FinishReason::EndTurn),
                 ]
+            );
+
+            Ok(())
+        }
+
+        #[test_log::test]
+        fn parses_empty_chunks_and_unknown_finish_reasons() -> Result<(), DeepSeekError> {
+            let fixture = r#"
+            {
+              "choices": [
+                {
+                  "delta": {
+                    "reasoning_content": "",
+                    "content": ""
+                  },
+                  "finish_reason": "rate_limit"
+                }
+              ]
+            }
+            "#;
+
+            let updates = parse_chat_completion_chunk(fixture)?;
+
+            assert_eq!(
+                updates,
+                vec![StreamEvent::Finished(FinishReason::Other(
+                    "rate_limit".to_string()
+                ))]
+            );
+
+            Ok(())
+        }
+
+        #[test_log::test]
+        fn rejects_chunks_without_choices() -> Result<(), DeepSeekError> {
+            let fixture = r#"{ "choices": [] }"#;
+
+            let Err(error) = parse_chat_completion_chunk(fixture) else {
+                return Err(DeepSeekError::InvalidResponse(
+                    "expected empty choice list to fail".to_string(),
+                ));
+            };
+
+            assert!(matches!(error, DeepSeekError::InvalidResponse(_)));
+            assert_eq!(
+                error.to_string(),
+                "invalid DeepSeek response: chat completion chunk did not include any choices"
             );
 
             Ok(())
