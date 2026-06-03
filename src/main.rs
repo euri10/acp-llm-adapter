@@ -16,6 +16,7 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -42,6 +43,12 @@ use deepseek_acp_adapter::deepseek::{
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
+use globset::{Glob, GlobSetBuilder};
+use grep::regex::RegexMatcher;
+use grep::searcher::sinks::UTF8;
+use grep::searcher::{BinaryDetection, SearcherBuilder};
+use ignore::WalkBuilder;
+use ignore::gitignore::GitignoreBuilder;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -671,6 +678,24 @@ struct ReadFileArguments {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ListDirArguments {
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobArguments {
+    pattern: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrepArguments {
+    pattern: String,
+}
+
+const TOOL_OUTPUT_LIMIT: usize = 200;
+const TOOL_OUTPUT_LIMIT_U32: u32 = 200;
+
 /// Registry for tools the model can call during a turn.
 trait ToolRegistry: Send + Sync {
     /// Return tool definitions to advertise to the model.
@@ -710,7 +735,12 @@ struct ReadOnlyToolRegistry;
 
 impl ToolRegistry for ReadOnlyToolRegistry {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        vec![read_file_tool_definition()]
+        vec![
+            read_file_tool_definition(),
+            list_dir_tool_definition(),
+            glob_tool_definition(),
+            grep_tool_definition(),
+        ]
     }
 
     fn execute<'a>(
@@ -722,6 +752,9 @@ impl ToolRegistry for ReadOnlyToolRegistry {
         Box::pin(async move {
             match call.name() {
                 "read_file" => read_file_tool_execution(call, context, connection).await,
+                "list_dir" => list_dir_tool_execution(call, context),
+                "glob" => glob_tool_execution(call, context),
+                "grep" => grep_tool_execution(call, context),
                 _ => ToolExecution::failed(format!("unknown tool: {}", call.name())),
             }
         })
@@ -784,6 +817,51 @@ fn read_file_tool_definition() -> ToolDefinition {
     )
 }
 
+fn list_dir_tool_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "list_dir",
+        "List entries in a directory.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+            },
+            "required": ["path"],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+fn glob_tool_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "glob",
+        "Find paths matching a glob pattern.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+            },
+            "required": ["pattern"],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+fn grep_tool_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "grep",
+        "Search files for a regular expression.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string" },
+            },
+            "required": ["pattern"],
+            "additionalProperties": false,
+        }),
+    )
+}
+
 async fn read_file_tool_execution(
     call: &DeepSeekToolCall,
     context: &ToolContext,
@@ -798,8 +876,8 @@ async fn read_file_tool_execution(
 
     let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
     let start_line = parsed_arguments.line.unwrap_or(1);
-    let requested_limit = parsed_arguments.limit.unwrap_or(200);
-    let limit = requested_limit.min(200);
+    let requested_limit = parsed_arguments.limit.unwrap_or(TOOL_OUTPUT_LIMIT_U32);
+    let limit = requested_limit.min(TOOL_OUTPUT_LIMIT_U32);
 
     if start_line == 0 {
         return ToolExecution::failed("read_file line must be at least 1");
@@ -852,6 +930,241 @@ async fn read_file_tool_execution(
         },
         Err(error) => ToolExecution::failed(error),
     }
+}
+
+fn list_dir_tool_execution(call: &DeepSeekToolCall, context: &ToolContext) -> ToolExecution {
+    let parsed_arguments = match serde_json::from_str::<ListDirArguments>(call.arguments()) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return ToolExecution::failed(format!("invalid list_dir arguments: {error}"));
+        }
+    };
+
+    let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
+    let entries = match collect_directory_entries(&resolved_path) {
+        Ok(entries) => entries,
+        Err(error) => return ToolExecution::failed(error),
+    };
+
+    let truncated = entries.len() > TOOL_OUTPUT_LIMIT;
+    let entries = entries
+        .into_iter()
+        .take(TOOL_OUTPUT_LIMIT)
+        .collect::<Vec<_>>();
+    let output_text = render_tool_lines(&entries, truncated, "entries", TOOL_OUTPUT_LIMIT);
+
+    ToolExecution {
+        content: output_text,
+        raw_output: serde_json::json!({
+            "path": resolved_path,
+            "entries": entries,
+            "truncated": truncated,
+        }),
+        success: true,
+    }
+}
+
+fn glob_tool_execution(call: &DeepSeekToolCall, context: &ToolContext) -> ToolExecution {
+    let parsed_arguments = match serde_json::from_str::<GlobArguments>(call.arguments()) {
+        Ok(arguments) => arguments,
+        Err(error) => return ToolExecution::failed(format!("invalid glob arguments: {error}")),
+    };
+
+    let matcher = match Glob::new(&parsed_arguments.pattern) {
+        Ok(glob) => {
+            let mut builder = GlobSetBuilder::new();
+            builder.add(glob);
+            match builder.build() {
+                Ok(set) => set,
+                Err(error) => {
+                    return ToolExecution::failed(format!("invalid glob pattern: {error}"));
+                }
+            }
+        }
+        Err(error) => return ToolExecution::failed(format!("invalid glob pattern: {error}")),
+    };
+
+    let root_gitignore = build_root_gitignore(&context.cwd);
+    let mut glob_paths = Vec::new();
+    let walker = WalkBuilder::new(&context.cwd)
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return ToolExecution::failed(error.to_string()),
+        };
+
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+
+        if is_hidden_path(entry.path()) {
+            continue;
+        }
+
+        let path = entry.path();
+        let relative_path = path.strip_prefix(&context.cwd).unwrap_or(path);
+        if root_gitignore.as_ref().is_some_and(|matcher| {
+            matcher
+                .matched_path_or_any_parents(relative_path, false)
+                .is_ignore()
+        }) {
+            continue;
+        }
+        if matcher.is_match(relative_path) || matcher.is_match(path) {
+            glob_paths.push(relative_path.display().to_string());
+        }
+    }
+
+    glob_paths.sort_unstable();
+    let truncated = glob_paths.len() > TOOL_OUTPUT_LIMIT;
+    let entries = glob_paths
+        .into_iter()
+        .take(TOOL_OUTPUT_LIMIT)
+        .collect::<Vec<_>>();
+    let output_text = render_tool_lines(&entries, truncated, "matches", TOOL_OUTPUT_LIMIT);
+
+    ToolExecution {
+        content: output_text,
+        raw_output: serde_json::json!({
+            "pattern": parsed_arguments.pattern,
+            "matches": entries,
+            "truncated": truncated,
+        }),
+        success: true,
+    }
+}
+
+fn grep_tool_execution(call: &DeepSeekToolCall, context: &ToolContext) -> ToolExecution {
+    let parsed_arguments = match serde_json::from_str::<GrepArguments>(call.arguments()) {
+        Ok(arguments) => arguments,
+        Err(error) => return ToolExecution::failed(format!("invalid grep arguments: {error}")),
+    };
+
+    let matcher = match RegexMatcher::new_line_matcher(&parsed_arguments.pattern) {
+        Ok(matcher) => matcher,
+        Err(error) => return ToolExecution::failed(format!("invalid grep regex: {error}")),
+    };
+
+    let root_gitignore = build_root_gitignore(&context.cwd);
+    let (mut grep_hits, truncated) =
+        match collect_grep_matches(&context.cwd, root_gitignore.as_ref(), &matcher) {
+            Ok(result) => result,
+            Err(error) => return ToolExecution::failed(error),
+        };
+
+    grep_hits.sort_unstable_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.line.cmp(&right.line))
+            .then(left.text.cmp(&right.text))
+    });
+    let lines = grep_hits
+        .into_iter()
+        .take(TOOL_OUTPUT_LIMIT)
+        .map(|entry| format!("{}:{}:{}", entry.path, entry.line, entry.text))
+        .collect::<Vec<_>>();
+    let output_text = render_tool_lines(&lines, truncated, "matches", TOOL_OUTPUT_LIMIT);
+
+    ToolExecution {
+        content: output_text,
+        raw_output: serde_json::json!({
+            "pattern": parsed_arguments.pattern,
+            "matches": lines,
+            "truncated": truncated,
+        }),
+        success: true,
+    }
+}
+
+fn collect_grep_matches(
+    root: &Path,
+    root_gitignore: Option<&ignore::gitignore::Gitignore>,
+    matcher: &RegexMatcher,
+) -> Result<(Vec<GrepMatch>, bool), String> {
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .line_number(true)
+        .build();
+    let mut grep_hits = Vec::<GrepMatch>::new();
+    let mut truncated = false;
+
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return Err(error.to_string()),
+        };
+
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+
+        if is_hidden_path(entry.path()) {
+            continue;
+        }
+
+        let path = entry.path().to_path_buf();
+        let relative_path = path.strip_prefix(root).unwrap_or(&path);
+        if root_gitignore.as_ref().is_some_and(|matcher| {
+            matcher
+                .matched_path_or_any_parents(relative_path, false)
+                .is_ignore()
+        }) {
+            continue;
+        }
+
+        let search_result = searcher.search_path(
+            matcher,
+            &path,
+            UTF8(|line_number, line| {
+                if grep_hits.len() >= TOOL_OUTPUT_LIMIT {
+                    truncated = true;
+                    return Ok(false);
+                }
+
+                grep_hits.push(GrepMatch {
+                    path: relative_path.display().to_string(),
+                    line: line_number,
+                    text: line.to_string(),
+                });
+                if grep_hits.len() >= TOOL_OUTPUT_LIMIT {
+                    truncated = true;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            }),
+        );
+        if let Err(error) = search_result {
+            return Err(format!("failed to grep {}: {error}", path.display()));
+        }
+
+        if truncated {
+            break;
+        }
+    }
+
+    Ok((grep_hits, truncated))
 }
 
 async fn read_file_from_client(
@@ -911,6 +1224,76 @@ fn resolve_tool_path(context: &ToolContext, path: &Path) -> PathBuf {
     }
 
     candidate
+}
+
+fn collect_directory_entries(path: &Path) -> Result<Vec<String>, String> {
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| format!("failed to read directory {}: {error}", path.display()))?
+        .map(|entry| {
+            entry.map_err(|error| {
+                format!(
+                    "failed to read directory entry in {}: {error}",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    entries.sort_unstable_by(|left, right| {
+        left.file_name()
+            .to_string_lossy()
+            .cmp(&right.file_name().to_string_lossy())
+    });
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let display = entry.file_name().to_string_lossy().into_owned();
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => format!("{display}/"),
+                _ => display,
+            }
+        })
+        .collect())
+}
+
+fn is_hidden_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+}
+
+fn build_root_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let gitignore_path = root.join(".gitignore");
+    if !gitignore_path.is_file() {
+        return None;
+    }
+
+    let mut builder = GitignoreBuilder::new(root);
+    if builder.add(&gitignore_path).is_some() {
+        return None;
+    }
+
+    builder.build().ok()
+}
+
+fn render_tool_lines(lines: &[String], truncated: bool, label: &str, limit: usize) -> String {
+    let mut output = lines.join("\n");
+
+    if truncated {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = write!(output, "... truncated after {limit} {label}");
+    }
+
+    output
+}
+
+#[derive(Debug, Clone)]
+struct GrepMatch {
+    path: String,
+    line: u64,
+    text: String,
 }
 
 #[derive(Debug, Default)]
@@ -1140,10 +1523,10 @@ struct SessionRecord {
 mod tests {
     use super::{
         AdapterState, Backend, Cli, Command, EmptyToolRegistry, MAX_TURN_REQUESTS, MockLlmClient,
-        ReadTextFileRequester, ToolContext, ToolExecution, ToolRegistry, build_dev_agent,
-        build_initialize_response, handle_authenticate_request, handle_cancel_notification,
-        handle_initialize_request, handle_new_session_request, handle_prompt_request,
-        read_file_tool_execution, run_smoke_flow, serve_with_transport,
+        ReadOnlyToolRegistry, ReadTextFileRequester, ToolContext, ToolExecution, ToolRegistry,
+        build_dev_agent, build_initialize_response, handle_authenticate_request,
+        handle_cancel_notification, handle_initialize_request, handle_new_session_request,
+        handle_prompt_request, read_file_tool_execution, run_smoke_flow, serve_with_transport,
     };
     use agent_client_protocol::schema::McpServer;
     use agent_client_protocol::{Agent, Channel, Client};
@@ -1850,6 +2233,120 @@ mod tests {
         drop(request_guard);
 
         server.abort();
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn local_tools_list_dir_and_glob() -> Result<(), agent_client_protocol::Error> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-local-tools-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(temp_root.join("src"))
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::create_dir_all(temp_root.join("ignored"))
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("README.md"), "read me")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("src/lib.rs"), "pub fn lib() {}")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("src/main.rs"), "fn main() {}")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("ignored/secret.rs"), "fn secret() {}")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join(".gitignore"), "ignored/\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-local-tools"),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let registry = ReadOnlyToolRegistry;
+
+        let list_result = registry
+            .execute(
+                &DeepSeekToolCall::new(
+                    "call-list",
+                    "list_dir",
+                    serde_json::json!({ "path": "." }).to_string(),
+                ),
+                &context,
+                None,
+            )
+            .await;
+        assert!(list_result.content.contains("README.md"));
+        assert!(list_result.content.contains("src/"));
+        assert_eq!(
+            list_result.raw_output["truncated"],
+            serde_json::json!(false)
+        );
+
+        let glob_result = registry
+            .execute(
+                &DeepSeekToolCall::new(
+                    "call-glob",
+                    "glob",
+                    serde_json::json!({ "pattern": "**/*.rs" }).to_string(),
+                ),
+                &context,
+                None,
+            )
+            .await;
+        assert!(glob_result.content.contains("src/lib.rs"));
+        assert!(glob_result.content.contains("src/main.rs"));
+        assert!(!glob_result.content.contains("ignored/secret.rs"));
+        assert_eq!(
+            glob_result.raw_output["truncated"],
+            serde_json::json!(false)
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn local_tools_grep_respects_gitignore_and_truncates()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-grep-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(temp_root.join("ignored"))
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let visible = (1..=201).map(|_| "needle").collect::<Vec<_>>().join("\n");
+        std::fs::write(temp_root.join("visible.rs"), format!("{visible}\n"))
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("ignored/secret.rs"), "needle\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join(".gitignore"), "ignored/\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-grep"),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let registry = ReadOnlyToolRegistry;
+
+        let result = registry
+            .execute(
+                &DeepSeekToolCall::new(
+                    "call-grep",
+                    "grep",
+                    serde_json::json!({ "pattern": "needle" }).to_string(),
+                ),
+                &context,
+                None,
+            )
+            .await;
+
+        assert!(result.content.contains("visible.rs:1:needle"));
+        assert!(result.content.contains("visible.rs:200:needle"));
+        assert!(result.content.contains("... truncated after 200 matches"));
+        assert!(!result.content.contains("ignored/secret.rs"));
+        assert_eq!(result.raw_output["truncated"], serde_json::json!(true));
 
         Ok(())
     }
