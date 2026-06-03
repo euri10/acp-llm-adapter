@@ -445,6 +445,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "clap",
+ "futures-util",
  "globset",
  "grep",
  "ignore",
