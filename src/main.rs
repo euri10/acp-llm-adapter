@@ -16,6 +16,8 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::{error::Error, process::ExitCode};
 
@@ -23,17 +25,20 @@ use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, SessionId, SessionMode, SessionModeState, SessionNotification,
-    SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    PromptResponse, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionMode, SessionModeState,
+    SessionNotification, SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
-use agent_client_protocol::{Agent, ConnectTo, Stdio};
-use clap::{Parser, Subcommand};
+use agent_client_protocol::util::MatchDispatch;
+use agent_client_protocol::{AcpAgent, Agent, Client, ConnectTo, SessionMessage, Stdio};
+use clap::{Parser, Subcommand, ValueEnum};
 use deepseek_acp_adapter::deepseek::{
-    ChatMessage, ChatRequest, DeepSeekClient, FinishReason, LlmClient, StreamEvent,
+    ChatMessage, ChatRequest, DeepSeekClient, DeepSeekError, FinishReason, LlmClient, StreamEvent,
     ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
 };
 use futures_util::StreamExt;
+use futures_util::stream::{self, BoxStream};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -56,7 +61,32 @@ struct Cli {
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Command {
     /// Run the ACP server over standard input and output.
-    Serve,
+    Serve {
+        #[arg(long, value_enum, default_value_t = Backend::Real)]
+        backend: Backend,
+    },
+    #[command(hide = true)]
+    Dev {
+        #[arg(long, value_enum, default_value_t = Backend::Mock)]
+        backend: Backend,
+        #[arg(long, default_value = "Hello from the dev smoke test.")]
+        prompt: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    Real,
+    Mock,
+}
+
+impl Backend {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::Mock => "mock",
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -77,7 +107,8 @@ fn run() -> AdapterResult<()> {
 
     runtime.block_on(async {
         match Cli::parse().command {
-            Command::Serve => serve().await,
+            Command::Serve { backend } => serve(backend).await,
+            Command::Dev { backend, prompt } => dev(backend, prompt).await,
         }
     })?;
 
@@ -92,17 +123,185 @@ fn init_tracing() -> AdapterResult<()> {
     Ok(())
 }
 
-async fn serve() -> Result<(), agent_client_protocol::Error> {
-    let llm_client = Arc::new(
-        DeepSeekClient::from_env().map_err(agent_client_protocol::Error::into_internal_error)?,
-    );
+async fn serve(backend: Backend) -> Result<(), agent_client_protocol::Error> {
+    let llm_client = llm_client_for_backend(backend)?;
     let tool_registry = Arc::new(EmptyToolRegistry);
     let state = Arc::new(Mutex::new(AdapterState::default()));
     serve_with_transport(Stdio::new(), state, llm_client, tool_registry).await
 }
 
+async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protocol::Error> {
+    let agent = build_dev_agent(
+        &std::env::current_exe().map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to locate current executable: {error}"))
+        })?,
+        backend,
+    )?;
+    let result = run_smoke_flow(agent, prompt).await?;
+    print_dev_smoke_result(&result);
+    Ok(())
+}
+
+fn llm_client_for_backend(
+    backend: Backend,
+) -> Result<Arc<dyn LlmClient>, agent_client_protocol::Error> {
+    match backend {
+        Backend::Real => Ok(Arc::new(
+            DeepSeekClient::from_env()
+                .map_err(agent_client_protocol::Error::into_internal_error)?,
+        )),
+        Backend::Mock => Ok(Arc::new(MockLlmClient)),
+    }
+}
+
+fn build_dev_agent(
+    executable: &Path,
+    backend: Backend,
+) -> Result<AcpAgent, agent_client_protocol::Error> {
+    let command = executable.to_string_lossy();
+    let agent_config = serde_json::json!({
+        "type": "stdio",
+        "name": "deepseek-acp-adapter-dev",
+        "command": command,
+        "args": [
+            "serve",
+            "--backend",
+            backend.as_str(),
+        ],
+        "env": [],
+    });
+
+    AcpAgent::from_str(&agent_config.to_string())
+}
+
+async fn run_smoke_flow(
+    transport: impl ConnectTo<Client> + 'static,
+    prompt: String,
+) -> Result<DevSmokeResult, agent_client_protocol::Error> {
+    Client
+        .builder()
+        .name("deepseek-acp-adapter-dev-client")
+        .on_receive_request(
+            async move |request: RequestPermissionRequest, responder, _cx| {
+                let outcome =
+                    request
+                        .options
+                        .first()
+                        .map_or(RequestPermissionOutcome::Cancelled, |option| {
+                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                                option.option_id.clone(),
+                            ))
+                        });
+
+                responder.respond(RequestPermissionResponse::new(outcome))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(transport, async move |cx| {
+            let initialize_response = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
+                .block_task()
+                .await?;
+            let new_session_response = cx
+                .send_request(NewSessionRequest::new(std::env::current_dir().map_err(
+                    |error| {
+                        agent_client_protocol::Error::internal_error()
+                            .data(format!("failed to get current directory: {error}"))
+                    },
+                )?))
+                .block_task()
+                .await?;
+            let mut session = cx.attach_session(new_session_response.clone(), Vec::new())?;
+            session.send_prompt(prompt.as_str())?;
+
+            let mut updates = Vec::new();
+            let mut response_text = String::new();
+            loop {
+                match session.read_update().await? {
+                    SessionMessage::SessionMessage(dispatch) => {
+                        MatchDispatch::new(dispatch)
+                            .if_notification(async |notification: SessionNotification| {
+                                updates.push(format!("{:?}", notification.update));
+                                if let SessionUpdate::AgentMessageChunk(ContentChunk {
+                                    content: ContentBlock::Text(text),
+                                    ..
+                                }) = notification.update
+                                {
+                                    response_text.push_str(&text.text);
+                                }
+                                Ok(())
+                            })
+                            .await
+                            .otherwise_ignore()?;
+                    }
+                    SessionMessage::StopReason(stop_reason) => {
+                        return Ok(DevSmokeResult {
+                            initialize_response,
+                            new_session_response,
+                            updates,
+                            response_text,
+                            stop_reason,
+                        });
+                    }
+                    _ => {
+                        return Err(agent_client_protocol::Error::internal_error()
+                            .data("unexpected session message variant"));
+                    }
+                }
+            }
+        })
+        .await
+}
+
+fn print_dev_smoke_result(result: &DevSmokeResult) {
+    println!("initialize response: {:?}", result.initialize_response);
+    println!("new session response: {:?}", result.new_session_response);
+
+    for update in &result.updates {
+        println!("session update: {update}");
+    }
+
+    println!("stop reason: {:?}", result.stop_reason);
+    println!("response text: {}", result.response_text);
+}
+
+#[derive(Debug, Clone)]
+struct DevSmokeResult {
+    initialize_response: InitializeResponse,
+    new_session_response: NewSessionResponse,
+    updates: Vec<String>,
+    response_text: String,
+    stop_reason: StopReason,
+}
+
+#[derive(Debug, Default)]
+struct MockLlmClient;
+
+impl LlmClient for MockLlmClient {
+    fn stream_chat(
+        &self,
+        request: ChatRequest,
+        _cancellation_token: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
+        let prompt = request.messages().last().map_or_else(
+            || "mock prompt".to_owned(),
+            |message| message.content().to_owned(),
+        );
+        let response_text = format!("mock response to: {prompt}");
+
+        let events = vec![
+            Ok(StreamEvent::Thought("mock reasoning".to_owned())),
+            Ok(StreamEvent::Message(response_text)),
+            Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+        ];
+
+        Ok(Box::pin(stream::iter(events)))
+    }
+}
+
 async fn serve_with_transport(
-    transport: impl ConnectTo<Agent>,
+    transport: impl ConnectTo<Agent> + 'static,
     state: Arc<Mutex<AdapterState>>,
     llm_client: Arc<dyn LlmClient>,
     tool_registry: Arc<dyn ToolRegistry>,
@@ -679,11 +878,13 @@ struct SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterState, Cli, Command, EmptyToolRegistry, MAX_TURN_REQUESTS, ToolExecution,
-        ToolRegistry, build_initialize_response, handle_authenticate_request,
-        handle_cancel_notification, handle_initialize_request, handle_new_session_request,
-        handle_prompt_request,
+        AdapterState, Backend, Cli, Command, EmptyToolRegistry, MAX_TURN_REQUESTS, MockLlmClient,
+        ToolExecution, ToolRegistry, build_dev_agent, build_initialize_response,
+        handle_authenticate_request, handle_cancel_notification, handle_initialize_request,
+        handle_new_session_request, handle_prompt_request, run_smoke_flow, serve_with_transport,
     };
+    use agent_client_protocol::Channel;
+    use agent_client_protocol::schema::McpServer;
     use deepseek_acp_adapter::deepseek::{
         ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
         ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
@@ -819,9 +1020,57 @@ mod tests {
         assert!(matches!(
             parsed,
             Ok(Cli {
-                command: Command::Serve
+                command: Command::Serve {
+                    backend: Backend::Real
+                }
             })
         ));
+    }
+
+    #[test_log::test]
+    fn parses_dev_subcommand() {
+        let parsed = Cli::try_parse_from([
+            "deepseek-acp-adapter",
+            "dev",
+            "--backend",
+            "mock",
+            "--prompt",
+            "smoke",
+        ]);
+
+        assert!(matches!(
+            parsed,
+            Ok(Cli {
+                command: Command::Dev {
+                    backend: Backend::Mock,
+                    prompt,
+                }
+            }) if prompt == "smoke"
+        ));
+    }
+
+    #[test_log::test]
+    fn build_dev_agent_uses_backend_and_executable_path() -> Result<(), agent_client_protocol::Error>
+    {
+        let agent = build_dev_agent(
+            std::path::Path::new("/tmp/deepseek-acp-adapter"),
+            Backend::Mock,
+        )?;
+
+        let McpServer::Stdio(stdio) = agent.server() else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected stdio transport")
+            );
+        };
+
+        assert_eq!(
+            stdio.command,
+            std::path::PathBuf::from("/tmp/deepseek-acp-adapter")
+        );
+        assert_eq!(stdio.args, vec!["serve", "--backend", "mock"]);
+        assert!(stdio.env.is_empty());
+
+        Ok(())
     }
 
     #[test_log::test]
@@ -1194,6 +1443,48 @@ mod tests {
         assert_eq!(messages[0].content(), "first");
         assert_eq!(messages[1].content(), "first answer");
         assert_eq!(messages[2].content(), "second");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn dev_smoke_flow_runs_initialize_new_and_prompt()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
+        let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
+        let (client_transport, server_transport) = Channel::duplex();
+        let server_state = Arc::clone(&state);
+        let server_client = Arc::clone(&llm_client);
+        let server_tools = Arc::clone(&tool_registry);
+
+        let server = tokio::spawn(async move {
+            serve_with_transport(server_transport, server_state, server_client, server_tools).await
+        });
+
+        let result = run_smoke_flow(client_transport, "smoke prompt".to_string()).await?;
+
+        assert_eq!(
+            result.initialize_response.protocol_version,
+            ProtocolVersion::LATEST
+        );
+        assert!(
+            result
+                .new_session_response
+                .session_id
+                .0
+                .starts_with("session-")
+        );
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(result.response_text, "mock response to: smoke prompt");
+        assert!(
+            result
+                .updates
+                .iter()
+                .any(|update| update.contains("AgentMessageChunk"))
+        );
+
+        server.abort();
 
         Ok(())
     }
