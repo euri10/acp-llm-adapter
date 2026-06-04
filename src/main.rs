@@ -24,14 +24,13 @@ use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::schema::{
     AvailableCommand, AvailableCommandInput, ClientCapabilities, ContentBlock, ContentChunk,
-    InitializeRequest, InitializeResponse, McpServer, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionInfo, SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    StopReason, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput,
+    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfo, SessionMode,
+    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, StopReason,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Client, ConnectTo, SessionMessage, Stdio};
@@ -42,16 +41,11 @@ use deepseek_acp_adapter::deepseek::{
 };
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
-use rmcp::model::{CallToolRequestParams, Content as McpContent, JsonObject, Tool as McpTool};
-use rmcp::service::RunningService;
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
-use rmcp::{Peer, RoleClient, ServiceExt};
-use serde_json::Value;
-use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 mod acp;
+mod mcp;
 mod tools;
 mod turn;
 
@@ -68,9 +62,20 @@ pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
     WriteTextFileRequester, handle_new_session_request, serve_with_transport,
 };
+pub(crate) use mcp::{
+    McpSession, McpToolTarget, connect_mcp_sessions, is_mcp_tool_name, mcp_tool_execution,
+    mcp_tool_kind,
+};
+#[cfg(test)]
+pub(crate) use mcp::{
+    connect_mcp_stdio_session, mcp_call_arguments, mcp_tool_mappings, mcp_tool_result_text,
+    sanitize_tool_name_part,
+};
+#[cfg(test)]
+use tools::ToolExecution;
 #[cfg(test)]
 use tools::ToolRegistry;
-use tools::{AdapterToolRegistry, ToolContext, ToolExecution};
+use tools::{AdapterToolRegistry, ToolContext};
 pub(crate) use turn::tool_raw_input;
 #[cfg(test)]
 pub(crate) use turn::{ModelRequestSettings, stream_model_turn};
@@ -103,7 +108,6 @@ const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
 const DEEPSEEK_V4_PRO_MODEL_ID: &str = "deepseek-v4-pro";
 const REASONING_EFFORT_HIGH_ID: &str = "high";
 const REASONING_EFFORT_MAX_ID: &str = "max";
-const MCP_TOOL_PREFIX: &str = "mcp";
 const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");
 const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -668,100 +672,6 @@ fn permission_options() -> Vec<PermissionOption> {
     ]
 }
 
-#[derive(Debug, Clone)]
-struct McpToolTarget {
-    server_name: String,
-    original_name: String,
-    peer: Peer<RoleClient>,
-}
-
-async fn mcp_tool_execution(
-    store: &SessionStore,
-    call: &DeepSeekToolCall,
-    context: &ToolContext,
-) -> ToolExecution {
-    let target = match find_mcp_tool_target(store, &context.session_id, call.name()) {
-        Ok(Some(target)) => target,
-        Ok(None) => return ToolExecution::failed(format!("unknown MCP tool: {}", call.name())),
-        Err(error) => return ToolExecution::failed(error.to_string()),
-    };
-
-    let arguments = match mcp_call_arguments(call) {
-        Ok(arguments) => arguments,
-        Err(error) => return ToolExecution::failed(error),
-    };
-
-    let result = target
-        .peer
-        .call_tool(
-            CallToolRequestParams::new(target.original_name.clone()).with_arguments(arguments),
-        )
-        .await;
-
-    match result {
-        Ok(result) => {
-            let model_output = mcp_tool_result_text(&result.content);
-            let raw_output = serde_json::to_value(&result).unwrap_or_else(|error| {
-                serde_json::json!({
-                    "error": format!("failed to serialize MCP tool result: {error}")
-                })
-            });
-            ToolExecution {
-                content: model_output,
-                raw_output,
-                success: !result.is_error.unwrap_or(false),
-            }
-        }
-        Err(error) => ToolExecution::failed(format!(
-            "MCP tool '{}' on server '{}' failed: {error}",
-            target.original_name, target.server_name
-        )),
-    }
-}
-
-fn find_mcp_tool_target(
-    store: &SessionStore,
-    session_id: &SessionId,
-    exposed_name: &str,
-) -> Result<Option<McpToolTarget>, agent_client_protocol::Error> {
-    store.find_mcp_target(session_id, exposed_name)
-}
-
-fn mcp_call_arguments(call: &DeepSeekToolCall) -> Result<JsonObject, String> {
-    match serde_json::from_str::<Value>(call.arguments()) {
-        Ok(Value::Object(arguments)) => Ok(arguments),
-        Ok(_) => Err(format!(
-            "MCP tool '{}' arguments must be a JSON object",
-            call.name()
-        )),
-        Err(error) => Err(format!(
-            "invalid MCP tool '{}' arguments: {error}",
-            call.name()
-        )),
-    }
-}
-
-fn mcp_tool_result_text(content: &[McpContent]) -> String {
-    let parts = content
-        .iter()
-        .map(|content| {
-            content.raw.as_text().map_or_else(
-                || {
-                    serde_json::to_string(&content.raw)
-                        .unwrap_or_else(|error| format!("failed to serialize MCP content: {error}"))
-                },
-                |text| text.text.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if parts.is_empty() {
-        String::new()
-    } else {
-        parts.join("\n")
-    }
-}
-
 #[derive(Debug, Default)]
 struct PendingToolCalls {
     calls: Vec<PendingToolCall>,
@@ -816,120 +726,6 @@ impl PendingToolCall {
         })?;
 
         Ok(DeepSeekToolCall::new(id, name, self.arguments))
-    }
-}
-
-async fn connect_mcp_sessions(
-    servers: &[McpServer],
-) -> Result<Vec<McpSession>, agent_client_protocol::Error> {
-    let mut sessions = Vec::new();
-
-    for server in servers {
-        match server {
-            McpServer::Stdio(stdio) => sessions.push(connect_mcp_stdio_session(stdio).await?),
-            _ => {
-                return Err(agent_client_protocol::Error::invalid_params()
-                    .data("only stdio MCP servers are supported"));
-            }
-        }
-    }
-
-    Ok(sessions)
-}
-
-async fn connect_mcp_stdio_session(
-    server: &McpServerStdio,
-) -> Result<McpSession, agent_client_protocol::Error> {
-    if !server.command.is_absolute() {
-        return Err(agent_client_protocol::Error::invalid_params().data(format!(
-            "MCP server '{}' command must be absolute",
-            server.name
-        )));
-    }
-
-    let command = TokioCommand::new(&server.command).configure(|command| {
-        command.args(&server.args);
-        for variable in &server.env {
-            command.env(&variable.name, &variable.value);
-        }
-    });
-    let transport = TokioChildProcess::new(command).map_err(|error| {
-        agent_client_protocol::Error::invalid_params().data(format!(
-            "failed to start MCP server '{}': {error}",
-            server.name
-        ))
-    })?;
-    let service = ().serve(transport).await.map_err(|error| {
-        agent_client_protocol::Error::invalid_params().data(format!(
-            "failed to initialize MCP server '{}': {error}",
-            server.name
-        ))
-    })?;
-    let peer = service.peer().clone();
-    let tools = peer.list_all_tools().await.map_err(|error| {
-        agent_client_protocol::Error::invalid_params().data(format!(
-            "failed to list MCP tools for server '{}': {error}",
-            server.name
-        ))
-    })?;
-    let mappings = mcp_tool_mappings(&server.name, tools);
-
-    Ok(McpSession {
-        name: server.name.clone(),
-        tools: mappings,
-        peer,
-        _service: service,
-    })
-}
-
-fn mcp_tool_mappings(server_name: &str, tools: Vec<McpTool>) -> Vec<McpToolMapping> {
-    tools
-        .into_iter()
-        .map(|tool| {
-            let original_name = tool.name.to_string();
-            let exposed_name = mcp_tool_name(server_name, &original_name);
-            let description = tool.description.map_or_else(
-                || format!("MCP tool '{original_name}' from server '{server_name}'"),
-                |description| description.to_string(),
-            );
-            let definition = ToolDefinition::new(
-                exposed_name.clone(),
-                description,
-                Value::Object(tool.input_schema.as_ref().clone()),
-            );
-
-            McpToolMapping {
-                exposed_name,
-                original_name,
-                definition,
-            }
-        })
-        .collect()
-}
-
-fn mcp_tool_name(server_name: &str, tool_name: &str) -> String {
-    format!(
-        "{MCP_TOOL_PREFIX}__{}__{}",
-        sanitize_tool_name_part(server_name),
-        sanitize_tool_name_part(tool_name)
-    )
-}
-
-fn sanitize_tool_name_part(value: &str) -> String {
-    let mut sanitized = String::new();
-    for character in value.chars() {
-        if character.is_ascii_alphanumeric() {
-            sanitized.push(character.to_ascii_lowercase());
-        } else {
-            sanitized.push('_');
-        }
-    }
-
-    let trimmed = sanitized.trim_matches('_');
-    if trimmed.is_empty() {
-        "unnamed".to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -1095,21 +891,6 @@ struct AdapterState {
     default_model: String,
     client_capabilities: Option<ClientCapabilities>,
     sessions: HashMap<agent_client_protocol::schema::SessionId, SessionRecord>,
-}
-
-#[derive(Debug)]
-struct McpSession {
-    name: String,
-    tools: Vec<McpToolMapping>,
-    peer: Peer<RoleClient>,
-    _service: RunningService<RoleClient, ()>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct McpToolMapping {
-    exposed_name: String,
-    original_name: String,
-    definition: ToolDefinition,
 }
 
 impl AdapterState {
@@ -2657,6 +2438,50 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn mcp_tools_use_explicit_execute_permission_kind()
+    -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        handle_set_session_mode_request(
+            &store,
+            &SetSessionModeRequest::new(session.session_id.clone(), "accept-edits"),
+        )?;
+        let context = ToolContext {
+            session_id: session.session_id,
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "call-mcp-permission",
+            "mcp__server__tool",
+            serde_json::json!({ "message": "hello" }).to_string(),
+        );
+        let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_ALLOW_ONCE_OPTION_ID,
+            )),
+        )]);
+
+        let decision =
+            request_tool_permission(&store, &context, &call, super::mcp_tool_kind(), &requester)
+                .await?;
+
+        assert_eq!(decision, PermissionDecision::AllowOnce);
+        let requests = requester.requests();
+        let request_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(request_guard.len(), 1);
+        assert_eq!(
+            request_guard[0].tool_call.fields.kind,
+            Some(ToolKind::Execute)
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
     async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_protocol::Error>
     {
         let store = test_store();
@@ -3757,6 +3582,8 @@ mod tests {
         assert!(!PermissionPosture::AcceptEdits.allows_without_prompt(ToolKind::Execute));
         assert!(PermissionPosture::Yolo.allows_without_prompt(ToolKind::Execute));
         assert!(!PermissionPosture::Yolo.allows_without_prompt(ToolKind::Read));
+        assert!(super::is_mcp_tool_name("mcp__server__tool"));
+        assert_eq!(super::mcp_tool_kind(), ToolKind::Execute);
     }
 
     #[test_log::test]
@@ -4780,7 +4607,7 @@ mod tests {
         assert_eq!(registry.kind("write_file"), ToolKind::Edit);
         assert_eq!(registry.kind("edit_file"), ToolKind::Edit);
         assert_eq!(registry.kind("run_command"), ToolKind::Execute);
-        assert_eq!(registry.kind("mcp__server__tool"), ToolKind::Other);
+        assert_eq!(registry.kind("mcp__server__tool"), ToolKind::Execute);
         assert_eq!(registry.kind("bogus"), ToolKind::Other);
     }
 

@@ -114,7 +114,7 @@ impl ToolRegistry for AdapterToolRegistry {
             "glob" | "grep" => ToolKind::Search,
             "write_file" | "edit_file" => ToolKind::Edit,
             "run_command" => ToolKind::Execute,
-            name if name.starts_with(super::MCP_TOOL_PREFIX) => ToolKind::Other,
+            name if super::is_mcp_tool_name(name) => super::mcp_tool_kind(),
             _ => ToolKind::Other,
         }
     }
@@ -170,7 +170,7 @@ impl ToolRegistry for AdapterToolRegistry {
                     )
                     .await
                 }
-                name if name.starts_with(super::MCP_TOOL_PREFIX) => {
+                name if super::is_mcp_tool_name(name) => {
                     super::mcp_tool_execution(store, call, context).await
                 }
                 _ => ToolExecution::failed(format!("unknown tool: {}", call.name())),
