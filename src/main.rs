@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -73,7 +74,8 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 type AdapterResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
-const MAX_TURN_REQUESTS: usize = 100;
+/// Default maximum number of tool-call/response cycles per prompt turn.
+const DEFAULT_MAX_TURN_REQUESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(99);
 const PERMISSION_ALLOW_ONCE_OPTION_ID: &str = "allow_once";
 const PERMISSION_ALLOW_ALWAYS_OPTION_ID: &str = "allow_always";
 const PERMISSION_REJECT_ONCE_OPTION_ID: &str = "reject_once";
@@ -172,6 +174,9 @@ enum Command {
     Serve {
         #[arg(long, value_enum, default_value_t = Backend::Real)]
         backend: Backend,
+        /// Maximum tool-call/response cycles per prompt turn (must be ≥ 1).
+        #[arg(long, default_value_t = DEFAULT_MAX_TURN_REQUESTS)]
+        max_turn_requests: NonZeroUsize,
     },
     #[command(hide = true)]
     Dev {
@@ -215,7 +220,10 @@ fn run() -> AdapterResult<()> {
 
     runtime.block_on(async {
         match Cli::parse().command {
-            Command::Serve { backend } => serve(backend).await,
+            Command::Serve {
+                backend,
+                max_turn_requests,
+            } => serve(backend, max_turn_requests).await,
             Command::Dev { backend, prompt } => dev(backend, prompt).await,
         }
     })?;
@@ -231,11 +239,21 @@ fn init_tracing() -> AdapterResult<()> {
     Ok(())
 }
 
-async fn serve(backend: Backend) -> Result<(), agent_client_protocol::Error> {
+async fn serve(
+    backend: Backend,
+    max_turn_requests: NonZeroUsize,
+) -> Result<(), agent_client_protocol::Error> {
     let llm_client = llm_client_for_backend(backend)?;
     let tool_registry = Arc::new(AdapterToolRegistry);
     let state = Arc::new(Mutex::new(AdapterState::new(initial_model_from_env())));
-    serve_with_transport(Stdio::new(), state, llm_client, tool_registry).await
+    serve_with_transport(
+        Stdio::new(),
+        state,
+        llm_client,
+        tool_registry,
+        max_turn_requests,
+    )
+    .await
 }
 
 async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protocol::Error> {
@@ -724,6 +742,7 @@ async fn serve_with_transport(
     state: Arc<Mutex<AdapterState>>,
     llm_client: Arc<dyn LlmClient>,
     tool_registry: Arc<dyn ToolRegistry>,
+    max_turn_requests: NonZeroUsize,
 ) -> Result<(), agent_client_protocol::Error> {
     let initialize_state = Arc::clone(&state);
     let new_session_state = Arc::clone(&state);
@@ -809,6 +828,7 @@ async fn serve_with_transport(
                         tools.as_ref(),
                         Some(&connection as &dyn ToolCallRequester),
                         request,
+                        max_turn_requests,
                         |notification| connection.send_notification(notification),
                     )
                     .await;
@@ -1051,6 +1071,7 @@ async fn handle_prompt_request(
     tool_registry: &dyn ToolRegistry,
     connection: Option<&dyn ToolCallRequester>,
     request: PromptRequest,
+    max_turn_requests: NonZeroUsize,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
     let user_text = text_from_prompt(&request.prompt)?;
@@ -1110,6 +1131,7 @@ async fn handle_prompt_request(
             tool_context,
             request,
             cancellation_token: cancellation_token.clone(),
+            max_turn_requests,
         },
         messages,
         ModelRequestSettings {
@@ -1131,6 +1153,7 @@ struct PromptTurnEnvironment<'a> {
     tool_context: ToolContext,
     request: PromptRequest,
     cancellation_token: CancellationToken,
+    max_turn_requests: NonZeroUsize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1151,7 +1174,7 @@ async fn run_prompt_turn(
 
     let mut stop_reason = StopReason::MaxTurnRequests;
 
-    for _ in 0..MAX_TURN_REQUESTS {
+    for _ in 0..env.max_turn_requests.get() {
         let turn = stream_model_turn(
             env.llm_client,
             &messages,
@@ -3377,8 +3400,8 @@ struct SessionRecord {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterState, AdapterToolRegistry, Backend, Cli, Command, DevSmokeResult,
-        EmptyToolRegistry, MAX_TURN_REQUESTS, McpSession, MockLlmClient, ModelRequestSettings,
+        AdapterState, AdapterToolRegistry, Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS,
+        DevSmokeResult, EmptyToolRegistry, McpSession, MockLlmClient, ModelRequestSettings,
         PendingToolCalls, PermissionDecision, PermissionPosture, PermissionRequester,
         ReadTextFileRequester, ReasoningEffort, SESSION_CONFIG_MODEL_ID,
         SESSION_CONFIG_REASONING_EFFORT_ID, ToolCallRequester, ToolContext, ToolExecution,
@@ -3832,15 +3855,26 @@ mod tests {
     #[test_log::test]
     fn parses_serve_subcommand() {
         let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve"]);
-
-        assert!(matches!(
-            parsed,
-            Ok(Cli {
-                command: Command::Serve {
-                    backend: Backend::Real
-                }
-            })
-        ));
+        assert!(
+            matches!(
+                parsed,
+                Ok(Cli {
+                    command: Command::Serve {
+                        backend: Backend::Real,
+                        ..
+                    }
+                })
+            ),
+            "expected Ok(Cli::Serve {{ backend: Real }}), got {parsed:?}"
+        );
+        if let Ok(Cli {
+            command: Command::Serve {
+                max_turn_requests, ..
+            },
+        }) = parsed
+        {
+            assert_eq!(max_turn_requests, DEFAULT_MAX_TURN_REQUESTS);
+        }
     }
 
     #[test_log::test]
@@ -4289,6 +4323,7 @@ mod tests {
             &EmptyToolRegistry,
             None,
             PromptRequest::new(session.session_id, vec![ContentBlock::from("hi")]),
+            DEFAULT_MAX_TURN_REQUESTS,
             |_| Ok(()),
         )
         .await?;
@@ -4552,6 +4587,7 @@ mod tests {
             &EmptyToolRegistry,
             None,
             PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("hi")]),
+            DEFAULT_MAX_TURN_REQUESTS,
             |notification| {
                 notifications.push(notification);
                 Ok(())
@@ -4620,6 +4656,7 @@ mod tests {
                 &EmptyToolRegistry,
                 None,
                 PromptRequest::new(prompt_session_id, vec![ContentBlock::from("cancel me")]),
+                DEFAULT_MAX_TURN_REQUESTS,
                 |notification| {
                     notification_tx
                         .send(notification)
@@ -4753,6 +4790,7 @@ mod tests {
                 session.session_id.clone(),
                 vec![ContentBlock::from("use tool")],
             ),
+            DEFAULT_MAX_TURN_REQUESTS,
             |notification| {
                 notifications.push(notification);
                 Ok(())
@@ -4808,7 +4846,8 @@ mod tests {
     -> Result<(), agent_client_protocol::Error> {
         let state = Arc::new(Mutex::new(AdapterState::default()));
         let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
-        let mut streams = (0..MAX_TURN_REQUESTS)
+        let limit = DEFAULT_MAX_TURN_REQUESTS.get();
+        let mut streams = (0..limit)
             .map(|index| {
                 vec![
                     FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
@@ -4835,6 +4874,7 @@ mod tests {
             &registry,
             None,
             PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("loop")]),
+            DEFAULT_MAX_TURN_REQUESTS,
             |_| Ok(()),
         )
         .await?;
@@ -4843,7 +4883,7 @@ mod tests {
         let request_guard = requests
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(request_guard.len(), MAX_TURN_REQUESTS);
+        assert_eq!(request_guard.len(), limit);
         drop(request_guard);
 
         let guard = state
@@ -4852,7 +4892,7 @@ mod tests {
         let record = guard.sessions.get(&session.session_id).ok_or_else(|| {
             agent_client_protocol::Error::internal_error().data("missing session")
         })?;
-        assert_eq!(record.history.len(), 1 + (MAX_TURN_REQUESTS * 2));
+        assert_eq!(record.history.len(), 1 + (limit * 2));
 
         Ok(())
     }
@@ -4874,6 +4914,7 @@ mod tests {
                 session.session_id.clone(),
                 vec![ContentBlock::from("first")],
             ),
+            DEFAULT_MAX_TURN_REQUESTS,
             |_| Ok(()),
         )
         .await?;
@@ -4887,6 +4928,7 @@ mod tests {
             &EmptyToolRegistry,
             None,
             PromptRequest::new(session.session_id, vec![ContentBlock::from("second")]),
+            DEFAULT_MAX_TURN_REQUESTS,
             |_| Ok(()),
         )
         .await?;
@@ -5551,7 +5593,14 @@ mod tests {
         let server_tools = Arc::clone(&tool_registry);
 
         let server = tokio::spawn(async move {
-            serve_with_transport(server_transport, server_state, server_client, server_tools).await
+            serve_with_transport(
+                server_transport,
+                server_state,
+                server_client,
+                server_tools,
+                DEFAULT_MAX_TURN_REQUESTS,
+            )
+            .await
         });
 
         let result = run_smoke_flow(client_transport, "smoke prompt".to_string()).await?;
@@ -5936,6 +5985,7 @@ mod tests {
             &EmptyToolRegistry,
             None,
             PromptRequest::new(session.session_id, vec![ContentBlock::from("hi")]),
+            DEFAULT_MAX_TURN_REQUESTS,
             |_| Ok(()),
         )
         .await
@@ -6134,7 +6184,14 @@ mod tests {
         let server_tools = Arc::clone(&tool_registry);
 
         let server = tokio::spawn(async move {
-            serve_with_transport(server_transport, server_state, server_client, server_tools).await
+            serve_with_transport(
+                server_transport,
+                server_state,
+                server_client,
+                server_tools,
+                DEFAULT_MAX_TURN_REQUESTS,
+            )
+            .await
         });
 
         Client
@@ -6270,6 +6327,7 @@ mod tests {
                 agent_client_protocol::schema::SessionId::new("missing"),
                 vec![ContentBlock::from("hi")],
             ),
+            DEFAULT_MAX_TURN_REQUESTS,
             |_| Ok(()),
         )
         .await
@@ -6361,8 +6419,7 @@ mod tests {
             serde_json::json!({})
         );
 
-        let list_response =
-            handle_list_sessions_request(&state, &ListSessionsRequest::new())?;
+        let list_response = handle_list_sessions_request(&state, &ListSessionsRequest::new())?;
         assert!(list_response.sessions.is_empty());
         Ok(())
     }
