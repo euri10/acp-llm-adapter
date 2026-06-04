@@ -61,6 +61,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 type AdapterResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
+const MAX_TURN_REQUESTS: usize = 100;
 const PERMISSION_ALLOW_ONCE_OPTION_ID: &str = "allow_once";
 const PERMISSION_ALLOW_ALWAYS_OPTION_ID: &str = "allow_always";
 const PERMISSION_REJECT_ONCE_OPTION_ID: &str = "reject_once";
@@ -702,7 +703,9 @@ async fn run_prompt_turn(
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
     let tool_definitions = env.tool_registry.definitions();
 
-    let stop_reason = loop {
+    let mut stop_reason = StopReason::MaxTurnRequests;
+
+    for _ in 0..MAX_TURN_REQUESTS {
         let turn = stream_model_turn(
             env.llm_client,
             &messages,
@@ -715,7 +718,8 @@ async fn run_prompt_turn(
         .await?;
 
         if turn.stop_reason == StopReason::Cancelled {
-            break StopReason::Cancelled;
+            stop_reason = StopReason::Cancelled;
+            break;
         }
 
         messages.push(if turn.tool_calls.is_empty() {
@@ -728,7 +732,8 @@ async fn run_prompt_turn(
         });
 
         if !matches!(turn.finish_reason, FinishReason::ToolCalls) || turn.tool_calls.is_empty() {
-            break turn.stop_reason;
+            stop_reason = turn.stop_reason;
+            break;
         }
 
         for tool_call in &turn.tool_calls {
@@ -744,7 +749,7 @@ async fn run_prompt_turn(
                 tool_result.content_for_model(),
             ));
         }
-    };
+    }
 
     if stop_reason != StopReason::Cancelled {
         let mut guard = env
@@ -2467,18 +2472,18 @@ struct SessionRecord {
 mod tests {
     use super::{
         AdapterState, AdapterToolRegistry, Backend, Cli, Command, DevSmokeResult,
-        EmptyToolRegistry, MockLlmClient, ModelRequestSettings, PendingToolCalls,
-        PermissionDecision, PermissionPosture, PermissionRequester, ReadTextFileRequester,
-        ReasoningEffort, SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID,
-        ToolCallRequester, ToolContext, ToolExecution, ToolRegistry, build_dev_agent,
-        build_initialize_response, edit_file_tool_execution, exercise_permission_gate_smoke,
-        glob_tool_execution, grep_tool_execution, handle_authenticate_request,
-        handle_cancel_notification, handle_initialize_request, handle_new_session_request,
-        handle_prompt_request, handle_set_session_config_option_request,
-        handle_set_session_mode_request, list_dir_tool_execution, llm_client_for_backend,
-        print_dev_smoke_result, read_file_tool_execution, request_tool_permission,
-        run_command_tool_execution, run_smoke_flow, serve_with_transport,
-        write_file_tool_execution,
+        EmptyToolRegistry, MAX_TURN_REQUESTS, MockLlmClient, ModelRequestSettings,
+        PendingToolCalls, PermissionDecision, PermissionPosture, PermissionRequester,
+        ReadTextFileRequester, ReasoningEffort, SESSION_CONFIG_MODEL_ID,
+        SESSION_CONFIG_REASONING_EFFORT_ID, ToolCallRequester, ToolContext, ToolExecution,
+        ToolRegistry, build_dev_agent, build_initialize_response, edit_file_tool_execution,
+        exercise_permission_gate_smoke, glob_tool_execution, grep_tool_execution,
+        handle_authenticate_request, handle_cancel_notification, handle_initialize_request,
+        handle_new_session_request, handle_prompt_request,
+        handle_set_session_config_option_request, handle_set_session_mode_request,
+        list_dir_tool_execution, llm_client_for_backend, print_dev_smoke_result,
+        read_file_tool_execution, request_tool_permission, run_command_tool_execution,
+        run_smoke_flow, serve_with_transport, write_file_tool_execution,
     };
     use agent_client_protocol::schema::McpServer;
     use agent_client_protocol::{Agent, Channel, Client};
@@ -3614,11 +3619,11 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn prompt_tool_loop_continues_beyond_25_turns() -> Result<(), agent_client_protocol::Error>
-    {
+    async fn prompt_tool_loop_stops_at_max_turn_requests()
+    -> Result<(), agent_client_protocol::Error> {
         let state = Arc::new(Mutex::new(AdapterState::default()));
         let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
-        let mut streams = (0..30)
+        let mut streams = (0..MAX_TURN_REQUESTS)
             .map(|index| {
                 vec![
                     FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
@@ -3649,11 +3654,11 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.stop_reason, StopReason::MaxTurnRequests);
         let request_guard = requests
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(request_guard.len(), 31);
+        assert_eq!(request_guard.len(), MAX_TURN_REQUESTS);
         drop(request_guard);
 
         let guard = state
@@ -3662,7 +3667,7 @@ mod tests {
         let record = guard.sessions.get(&session.session_id).ok_or_else(|| {
             agent_client_protocol::Error::internal_error().data("missing session")
         })?;
-        assert_eq!(record.history.len(), 62);
+        assert_eq!(record.history.len(), 1 + (MAX_TURN_REQUESTS * 2));
 
         Ok(())
     }
