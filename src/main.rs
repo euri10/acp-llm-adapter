@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -1173,6 +1174,10 @@ async fn read_file_tool_execution(
     {
         match connection {
             Some(connection) => {
+                if local_file_is_non_utf8(&resolved_path) {
+                    return ToolExecution::failed(non_utf8_file_message(&resolved_path));
+                }
+
                 read_file_from_client(
                     connection,
                     &context.session_id,
@@ -1460,13 +1465,13 @@ async fn read_file_from_client(
                 .limit(limit),
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| read_file_client_error(path, &error.to_string()))?;
 
     Ok(response.content)
 }
 
 fn read_file_from_local(path: &Path, line: u32, limit: u32) -> Result<String, String> {
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let text = fs::read_to_string(path).map_err(|error| read_file_local_error(path, &error))?;
     let lines: Vec<&str> = text.lines().collect();
 
     let start_index = usize::try_from(line.saturating_sub(1))
@@ -1483,6 +1488,44 @@ fn read_file_from_local(path: &Path, line: u32, limit: u32) -> Result<String, St
         .join("\n");
 
     Ok(content)
+}
+
+fn local_file_is_non_utf8(path: &Path) -> bool {
+    fs::read_to_string(path).is_err_and(|error| error.kind() == ErrorKind::InvalidData)
+}
+
+fn read_file_local_error(path: &Path, error: &std::io::Error) -> String {
+    if error.kind() == ErrorKind::InvalidData {
+        return non_utf8_file_message(path);
+    }
+
+    format!("failed to read {}: {error}", path.display())
+}
+
+fn read_file_client_error(path: &Path, message: &str) -> String {
+    if is_utf8_error_message(message) {
+        return non_utf8_file_message(path);
+    }
+
+    format!(
+        "failed to read {} through client fs/read_text_file: {message}",
+        path.display()
+    )
+}
+
+fn non_utf8_file_message(path: &Path) -> String {
+    format!(
+        "read_file only supports UTF-8 text files; {} appears to be binary or non-UTF-8",
+        path.display()
+    )
+}
+
+fn is_utf8_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("valid utf-8")
+        || lower.contains("invalid utf-8")
+        || lower.contains("non-utf-8")
+        || lower.contains("utf8")
 }
 
 fn resolve_tool_path(context: &ToolContext, path: &Path) -> PathBuf {
@@ -1983,6 +2026,52 @@ mod tests {
                     .map(|mut calls| calls.push(call.clone()))
                     .ok();
                 self.result.clone()
+            })
+        }
+    }
+
+    struct CountingReadTextFileRequester {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl CountingReadTextFileRequester {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn calls(&self) -> Arc<Mutex<usize>> {
+            Arc::clone(&self.calls)
+        }
+    }
+
+    impl ReadTextFileRequester for CountingReadTextFileRequester {
+        fn read_text_file(
+            &self,
+            _request: ReadTextFileRequest,
+        ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+            Box::pin(async move {
+                let mut guard = self
+                    .calls
+                    .lock()
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                *guard += 1;
+                Ok(ReadTextFileResponse::new("client content"))
+            })
+        }
+    }
+
+    struct Utf8FailingReadTextFileRequester;
+
+    impl ReadTextFileRequester for Utf8FailingReadTextFileRequester {
+        fn read_text_file(
+            &self,
+            _request: ReadTextFileRequest,
+        ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+            Box::pin(async move {
+                Err(agent_client_protocol::Error::internal_error()
+                    .data("stream did not contain valid UTF-8"))
             })
         }
     }
@@ -2976,6 +3065,96 @@ mod tests {
         drop(request_guard);
 
         server.abort();
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn read_file_tool_rejects_local_non_utf8_before_client_fs()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-non-utf8-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let file_path = temp_root.join("artifact.bin");
+        std::fs::write(&file_path, [0xff, 0xfe, 0xfd])
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-non-utf8"),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            ),
+        };
+        let call = DeepSeekToolCall::new(
+            "call-non-utf8",
+            "read_file",
+            serde_json::json!({ "path": "artifact.bin" }).to_string(),
+        );
+        let requester = CountingReadTextFileRequester::new();
+        let calls = requester.calls();
+
+        let result = read_file_tool_execution(
+            &call,
+            &context,
+            Some(&requester as &dyn ReadTextFileRequester),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.content.contains("only supports UTF-8 text files"));
+        assert!(result.content.contains(&file_path.display().to_string()));
+        assert_eq!(
+            *calls
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?,
+            0
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn read_file_tool_sanitizes_client_non_utf8_error()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-client-utf8-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("session-client-utf8"),
+            cwd: temp_root,
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            ),
+        };
+        let call = DeepSeekToolCall::new(
+            "call-client-utf8",
+            "read_file",
+            serde_json::json!({ "path": "client-only.bin" }).to_string(),
+        );
+
+        let result = read_file_tool_execution(
+            &call,
+            &context,
+            Some(&Utf8FailingReadTextFileRequester as &dyn ReadTextFileRequester),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.content.contains("only supports UTF-8 text files"));
+        assert!(!result.content.contains("Internal error"));
+        assert!(
+            !result
+                .content
+                .contains("stream did not contain valid UTF-8")
+        );
 
         Ok(())
     }
