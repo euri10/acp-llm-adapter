@@ -30,17 +30,20 @@ use agent_client_protocol::schema::{
     InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+    SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectTo, SessionMessage, Stdio};
 use clap::{Parser, Subcommand, ValueEnum};
 use deepseek_acp_adapter::deepseek::{
-    ChatMessage, ChatRequest, DeepSeekClient, DeepSeekError, FinishReason, LlmClient, StreamEvent,
-    ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
+    ChatMessage, ChatRequest, DeepSeekClient, DeepSeekConfig, DeepSeekError, FinishReason,
+    LlmClient, StreamEvent, ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
 };
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -66,6 +69,13 @@ const PERMISSION_REJECT_ALWAYS_OPTION_ID: &str = "reject_always";
 const SESSION_MODE_ASK_ID: &str = "ask";
 const SESSION_MODE_ACCEPT_EDITS_ID: &str = "accept-edits";
 const SESSION_MODE_YOLO_ID: &str = "yolo";
+const SESSION_CONFIG_MODE_ID: &str = "mode";
+const SESSION_CONFIG_MODEL_ID: &str = "model";
+const SESSION_CONFIG_REASONING_EFFORT_ID: &str = "reasoning_effort";
+const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
+const DEEPSEEK_V4_PRO_MODEL_ID: &str = "deepseek-v4-pro";
+const REASONING_EFFORT_HIGH_ID: &str = "high";
+const REASONING_EFFORT_MAX_ID: &str = "max";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -146,7 +156,7 @@ fn init_tracing() -> AdapterResult<()> {
 async fn serve(backend: Backend) -> Result<(), agent_client_protocol::Error> {
     let llm_client = llm_client_for_backend(backend)?;
     let tool_registry = Arc::new(ReadOnlyToolRegistry);
-    let state = Arc::new(Mutex::new(AdapterState::default()));
+    let state = Arc::new(Mutex::new(AdapterState::new(initial_model_from_env())));
     serve_with_transport(Stdio::new(), state, llm_client, tool_registry).await
 }
 
@@ -397,6 +407,7 @@ async fn serve_with_transport(
     let initialize_state = Arc::clone(&state);
     let new_session_state = Arc::clone(&state);
     let set_mode_state = Arc::clone(&state);
+    let set_config_state = Arc::clone(&state);
     let prompt_state = Arc::clone(&state);
     let prompt_client = Arc::clone(&llm_client);
     let prompt_tools = Arc::clone(&tool_registry);
@@ -426,6 +437,15 @@ async fn serve_with_transport(
         .on_receive_request(
             async move |request: SetSessionModeRequest, responder, _cx| {
                 responder.respond(handle_set_session_mode_request(&set_mode_state, &request)?)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: SetSessionConfigOptionRequest, responder, _cx| {
+                responder.respond(handle_set_session_config_option_request(
+                    &set_config_state,
+                    &request,
+                )?)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -487,6 +507,7 @@ fn handle_new_session_request(
     let mut guard = state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let default_model = guard.default_model.clone();
     guard.sessions.insert(
         session_id.clone().into(),
         SessionRecord {
@@ -495,11 +516,22 @@ fn handle_new_session_request(
             history: Vec::new(),
             active_turn: None,
             mode: PermissionPosture::Ask,
+            model: default_model,
+            reasoning_effort: ReasoningEffort::High,
             permission_allow_always: HashSet::new(),
         },
     );
 
-    Ok(NewSessionResponse::new(session_id).modes(default_session_modes()))
+    let session = guard
+        .sessions
+        .get(&SessionId::new(session_id.clone()))
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("failed to create session")
+        })?;
+
+    Ok(NewSessionResponse::new(session_id)
+        .modes(default_session_modes())
+        .config_options(session_config_options(session)))
 }
 
 fn handle_set_session_mode_request(
@@ -523,6 +555,62 @@ fn handle_set_session_mode_request(
     Ok(SetSessionModeResponse::new())
 }
 
+fn handle_set_session_config_option_request(
+    state: &Arc<Mutex<AdapterState>>,
+    request: &SetSessionConfigOptionRequest,
+) -> Result<SetSessionConfigOptionResponse, agent_client_protocol::Error> {
+    let mut guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
+        agent_client_protocol::Error::invalid_params()
+            .data(format!("unknown session id: {}", request.session_id.0))
+    })?;
+    let value = config_value_id(&request.value)?;
+
+    match request.config_id.0.as_ref() {
+        SESSION_CONFIG_MODE_ID => {
+            let mode_id = SessionModeId::new(value.0.clone());
+            let Some(mode) = PermissionPosture::from_mode_id(&mode_id) else {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data(format!("unsupported session mode: {}", value.0)));
+            };
+            session.mode = mode;
+        }
+        SESSION_CONFIG_MODEL_ID => {
+            let model = value.0.as_ref();
+            validate_session_model(session, model)?;
+            session.model = model.to_string();
+        }
+        SESSION_CONFIG_REASONING_EFFORT_ID => {
+            let Some(effort) = ReasoningEffort::from_value_id(value) else {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data(format!("unsupported reasoning effort: {}", value.0)));
+            };
+            session.reasoning_effort = effort;
+        }
+        _ => {
+            return Err(agent_client_protocol::Error::invalid_params().data(format!(
+                "unsupported session config option: {}",
+                request.config_id.0
+            )));
+        }
+    }
+
+    Ok(SetSessionConfigOptionResponse::new(session_config_options(
+        session,
+    )))
+}
+
+fn config_value_id(
+    value: &SessionConfigOptionValue,
+) -> Result<&SessionConfigValueId, agent_client_protocol::Error> {
+    value.as_value_id().ok_or_else(|| {
+        agent_client_protocol::Error::invalid_params()
+            .data("session config option requires a selectable value id")
+    })
+}
+
 async fn handle_prompt_request(
     state: &Arc<Mutex<AdapterState>>,
     llm_client: &dyn LlmClient,
@@ -535,7 +623,7 @@ async fn handle_prompt_request(
     let user_message = ChatMessage::user(user_text.clone());
     let session_id = request.session_id.clone();
     let cancellation_token = CancellationToken::new();
-    let (messages, tool_context) = {
+    let (messages, tool_context, model, reasoning_effort) = {
         let mut guard = state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -564,6 +652,8 @@ async fn handle_prompt_request(
                 additional_directories: session.additional_directories.clone(),
                 client_capabilities,
             },
+            session.model.clone(),
+            session.reasoning_effort,
         )
     };
 
@@ -578,6 +668,10 @@ async fn handle_prompt_request(
             cancellation_token: cancellation_token.clone(),
         },
         messages,
+        ModelRequestSettings {
+            model: &model,
+            reasoning_effort,
+        },
         &mut notify,
     )
     .await;
@@ -595,9 +689,16 @@ struct PromptTurnEnvironment<'a> {
     cancellation_token: CancellationToken,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ModelRequestSettings<'a> {
+    model: &'a str,
+    reasoning_effort: ReasoningEffort,
+}
+
 async fn run_prompt_turn(
     env: PromptTurnEnvironment<'_>,
     mut messages: Vec<ChatMessage>,
+    model_settings: ModelRequestSettings<'_>,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
     let tool_definitions = env.tool_registry.definitions();
@@ -609,6 +710,7 @@ async fn run_prompt_turn(
             env.llm_client,
             &messages,
             &tool_definitions,
+            model_settings,
             env.cancellation_token.clone(),
             &env.request.session_id,
             notify,
@@ -676,13 +778,17 @@ async fn stream_model_turn(
     llm_client: &dyn LlmClient,
     messages: &[ChatMessage],
     tool_definitions: &[ToolDefinition],
+    model_settings: ModelRequestSettings<'_>,
     cancellation_token: CancellationToken,
     session_id: &SessionId,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<ModelTurn, agent_client_protocol::Error> {
     let mut stream = llm_client
         .stream_chat(
-            ChatRequest::new(messages.to_vec()).with_tools(tool_definitions.to_vec()),
+            ChatRequest::new(messages.to_vec())
+                .with_tools(tool_definitions.to_vec())
+                .with_model(model_settings.model)
+                .with_reasoning_effort(model_settings.reasoning_effort.id()),
             cancellation_token.clone(),
         )
         .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -846,6 +952,44 @@ impl PermissionPosture {
             SESSION_MODE_ASK_ID => Some(Self::Ask),
             SESSION_MODE_ACCEPT_EDITS_ID => Some(Self::AcceptEdits),
             SESSION_MODE_YOLO_ID => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ReasoningEffort {
+    #[default]
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::High => REASONING_EFFORT_HIGH_ID,
+            Self::Max => REASONING_EFFORT_MAX_ID,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::High => "High",
+            Self::Max => "Max",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::High => "Default DeepSeek thinking effort.",
+            Self::Max => "Maximum DeepSeek thinking effort for complex agent work.",
+        }
+    }
+
+    fn from_value_id(value: &SessionConfigValueId) -> Option<Self> {
+        match value.0.as_ref() {
+            REASONING_EFFORT_HIGH_ID => Some(Self::High),
+            REASONING_EFFORT_MAX_ID => Some(Self::Max),
             _ => None,
         }
     }
@@ -1796,6 +1940,96 @@ fn default_session_modes() -> SessionModeState {
     )
 }
 
+fn session_config_options(session: &SessionRecord) -> Vec<SessionConfigOption> {
+    vec![
+        SessionConfigOption::select(
+            SESSION_CONFIG_MODE_ID,
+            "Approval Preset",
+            session.mode.mode_id().0,
+            session_mode_select_options(),
+        )
+        .category(SessionConfigOptionCategory::Mode)
+        .description("Choose how the adapter requests permission for tools."),
+        SessionConfigOption::select(
+            SESSION_CONFIG_MODEL_ID,
+            "Model",
+            session.model.clone(),
+            model_select_options(session.model.as_str()),
+        )
+        .category(SessionConfigOptionCategory::Model)
+        .description("Choose which DeepSeek model the adapter should use."),
+        SessionConfigOption::select(
+            SESSION_CONFIG_REASONING_EFFORT_ID,
+            "Reasoning Effort",
+            session.reasoning_effort.id(),
+            reasoning_effort_select_options(),
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel)
+        .description("Choose how much DeepSeek thinking effort to request."),
+    ]
+}
+
+fn session_mode_select_options() -> Vec<SessionConfigSelectOption> {
+    default_session_modes()
+        .available_modes
+        .into_iter()
+        .map(|mode| SessionConfigSelectOption::new(mode.id.0, mode.name))
+        .collect()
+}
+
+fn model_select_options(current_model: &str) -> Vec<SessionConfigSelectOption> {
+    let mut options = Vec::new();
+    if !is_known_model(current_model) {
+        options.push(
+            SessionConfigSelectOption::new(current_model.to_string(), current_model.to_string())
+                .description("Current model from DEEPSEEK_MODEL."),
+        );
+    }
+
+    options.extend([
+        SessionConfigSelectOption::new(DEEPSEEK_V4_PRO_MODEL_ID, "DeepSeek V4 Pro")
+            .description("DeepSeek V4 Pro thinking model."),
+        SessionConfigSelectOption::new(DEEPSEEK_V4_FLASH_MODEL_ID, "DeepSeek V4 Flash")
+            .description("DeepSeek V4 Flash model."),
+    ]);
+
+    options
+}
+
+fn reasoning_effort_select_options() -> Vec<SessionConfigSelectOption> {
+    [ReasoningEffort::High, ReasoningEffort::Max]
+        .into_iter()
+        .map(|effort| {
+            SessionConfigSelectOption::new(effort.id(), effort.name())
+                .description(effort.description())
+        })
+        .collect()
+}
+
+fn validate_session_model(
+    session: &SessionRecord,
+    model: &str,
+) -> Result<(), agent_client_protocol::Error> {
+    if is_known_model(model) || model == session.model {
+        return Ok(());
+    }
+
+    Err(agent_client_protocol::Error::invalid_params()
+        .data(format!("unsupported DeepSeek model: {model}")))
+}
+
+fn is_known_model(model: &str) -> bool {
+    matches!(model, DEEPSEEK_V4_PRO_MODEL_ID | DEEPSEEK_V4_FLASH_MODEL_ID)
+}
+
+fn initial_model_from_env() -> String {
+    std::env::var("DEEPSEEK_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DeepSeekConfig::DEFAULT_MODEL.to_string())
+}
+
 fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_protocol::Error> {
     let mut text = String::new();
 
@@ -1834,10 +2068,27 @@ fn stop_reason_from_finish(reason: &FinishReason) -> StopReason {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AdapterState {
+    default_model: String,
     client_capabilities: Option<ClientCapabilities>,
     sessions: HashMap<agent_client_protocol::schema::SessionId, SessionRecord>,
+}
+
+impl AdapterState {
+    fn new(default_model: impl Into<String>) -> Self {
+        Self {
+            default_model: default_model.into(),
+            client_capabilities: None,
+            sessions: HashMap::new(),
+        }
+    }
+}
+
+impl Default for AdapterState {
+    fn default() -> Self {
+        Self::new(DeepSeekConfig::DEFAULT_MODEL)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1847,6 +2098,8 @@ struct SessionRecord {
     history: Vec<ChatMessage>,
     active_turn: Option<CancellationToken>,
     mode: PermissionPosture,
+    model: String,
+    reasoning_effort: ReasoningEffort,
     permission_allow_always: HashSet<String>,
 }
 
@@ -1854,12 +2107,14 @@ struct SessionRecord {
 mod tests {
     use super::{
         AdapterState, Backend, Cli, Command, DevSmokeResult, EmptyToolRegistry, MAX_TURN_REQUESTS,
-        MockLlmClient, PendingToolCalls, PermissionDecision, PermissionPosture,
-        PermissionRequester, ReadOnlyToolRegistry, ReadTextFileRequester, ToolContext,
+        MockLlmClient, ModelRequestSettings, PendingToolCalls, PermissionDecision,
+        PermissionPosture, PermissionRequester, ReadOnlyToolRegistry, ReadTextFileRequester,
+        ReasoningEffort, SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, ToolContext,
         ToolExecution, ToolRegistry, build_dev_agent, build_initialize_response,
         exercise_permission_gate_smoke, glob_tool_execution, grep_tool_execution,
         handle_authenticate_request, handle_cancel_notification, handle_initialize_request,
-        handle_new_session_request, handle_prompt_request, handle_set_session_mode_request,
+        handle_new_session_request, handle_prompt_request,
+        handle_set_session_config_option_request, handle_set_session_mode_request,
         list_dir_tool_execution, llm_client_for_backend, print_dev_smoke_result,
         read_file_tool_execution, request_tool_permission, run_smoke_flow, serve_with_transport,
     };
@@ -1880,8 +2135,9 @@ mod tests {
         InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
         ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
         RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-        SessionModeId, SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason,
-        ToolKind,
+        SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionModeId,
+        SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+        StopReason, ToolKind,
     };
     use clap::Parser;
     use futures_util::StreamExt;
@@ -2153,6 +2409,26 @@ mod tests {
         Ok((state, session.session_id, context, edit_call, shell_call))
     }
 
+    fn select_current_value(
+        options: &[SessionConfigOption],
+        id: &str,
+    ) -> Result<String, agent_client_protocol::Error> {
+        let option = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == id)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::internal_error()
+                    .data(format!("missing config option {id}"))
+            })?;
+
+        let SessionConfigKind::Select(select) = &option.kind else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data(format!("config option {id} is not a select")));
+        };
+
+        Ok(select.current_value.0.to_string())
+    }
+
     #[test_log::test]
     fn parses_serve_subcommand() {
         let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve"]);
@@ -2307,6 +2583,46 @@ mod tests {
     }
 
     #[test_log::test]
+    fn new_session_advertises_model_and_reasoning_config_options()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let response = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let options = response
+            .config_options
+            .ok_or_else(agent_client_protocol::Error::internal_error)?;
+
+        let model = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == SESSION_CONFIG_MODEL_ID)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::internal_error().data("missing model option")
+            })?;
+        assert_eq!(model.category, Some(SessionConfigOptionCategory::Model));
+        assert_eq!(
+            select_current_value(&options, SESSION_CONFIG_MODEL_ID)?,
+            "deepseek-v4-pro"
+        );
+
+        let reasoning = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == SESSION_CONFIG_REASONING_EFFORT_ID)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::internal_error()
+                    .data("missing reasoning effort option")
+            })?;
+        assert_eq!(
+            reasoning.category,
+            Some(SessionConfigOptionCategory::ThoughtLevel)
+        );
+        assert_eq!(
+            select_current_value(&options, SESSION_CONFIG_REASONING_EFFORT_ID)?,
+            "high"
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test]
     fn set_mode_updates_session_state() -> Result<(), agent_client_protocol::Error> {
         let state = Arc::new(Mutex::new(AdapterState::default()));
         let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
@@ -2324,6 +2640,117 @@ mod tests {
             agent_client_protocol::Error::internal_error().data("missing stored session")
         })?;
         assert_eq!(stored.mode, PermissionPosture::AcceptEdits);
+
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn set_config_option_updates_session_model_and_reasoning()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+
+        let model_response = handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(
+                session.session_id.clone(),
+                SESSION_CONFIG_MODEL_ID,
+                "deepseek-v4-flash",
+            ),
+        )?;
+        assert_eq!(
+            select_current_value(&model_response.config_options, SESSION_CONFIG_MODEL_ID)?,
+            "deepseek-v4-flash"
+        );
+
+        let reasoning_response = handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(
+                session.session_id.clone(),
+                SESSION_CONFIG_REASONING_EFFORT_ID,
+                "max",
+            ),
+        )?;
+        assert_eq!(
+            select_current_value(
+                &reasoning_response.config_options,
+                SESSION_CONFIG_REASONING_EFFORT_ID,
+            )?,
+            "max"
+        );
+
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
+        assert_eq!(stored.model, "deepseek-v4-flash");
+        assert_eq!(stored.reasoning_effort, ReasoningEffort::Max);
+
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn set_config_option_rejects_unknown_option() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+
+        let Err(error) = handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(session.session_id, "unknown", "value"),
+        ) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected unknown config option to fail"));
+        };
+
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn prompt_uses_updated_session_model_and_reasoning()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(
+                session.session_id.clone(),
+                SESSION_CONFIG_MODEL_ID,
+                "deepseek-v4-flash",
+            ),
+        )?;
+        handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(
+                session.session_id.clone(),
+                SESSION_CONFIG_REASONING_EFFORT_ID,
+                "max",
+            ),
+        )?;
+
+        let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+        let requests = client.requests();
+
+        let response = handle_prompt_request(
+            &state,
+            &client,
+            &EmptyToolRegistry,
+            None,
+            PromptRequest::new(session.session_id, vec![ContentBlock::from("hi")]),
+            |_| Ok(()),
+        )
+        .await?;
+
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        let request_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(request_guard.len(), 1);
+        assert_eq!(request_guard[0].model(), Some("deepseek-v4-flash"));
+        assert_eq!(request_guard[0].reasoning_effort(), Some("max"));
 
         Ok(())
     }
@@ -2702,6 +3129,10 @@ mod tests {
                 &client,
                 &messages,
                 &tool_definitions,
+                ModelRequestSettings {
+                    model: "deepseek-v4-pro",
+                    reasoning_effort: ReasoningEffort::High,
+                },
                 task_token,
                 &session_id,
                 &mut notify,

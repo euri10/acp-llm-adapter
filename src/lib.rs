@@ -338,6 +338,8 @@ pub mod deepseek {
     pub struct ChatRequest {
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDefinition>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
     }
 
     impl ChatRequest {
@@ -347,6 +349,8 @@ pub mod deepseek {
             Self {
                 messages,
                 tools: Vec::new(),
+                model: None,
+                reasoning_effort: None,
             }
         }
 
@@ -357,8 +361,29 @@ pub mod deepseek {
             self
         }
 
-        fn into_parts(self) -> (Vec<ChatMessage>, Vec<ToolDefinition>) {
-            (self.messages, self.tools)
+        /// Override the configured model for this request.
+        #[must_use]
+        pub fn with_model(mut self, model: impl Into<String>) -> Self {
+            self.model = Some(model.into());
+            self
+        }
+
+        /// Set the model reasoning effort for this request.
+        #[must_use]
+        pub fn with_reasoning_effort(mut self, reasoning_effort: impl Into<String>) -> Self {
+            self.reasoning_effort = Some(reasoning_effort.into());
+            self
+        }
+
+        fn into_parts(
+            self,
+        ) -> (
+            Vec<ChatMessage>,
+            Vec<ToolDefinition>,
+            Option<String>,
+            Option<String>,
+        ) {
+            (self.messages, self.tools, self.model, self.reasoning_effort)
         }
 
         /// Return the request messages.
@@ -371,6 +396,18 @@ pub mod deepseek {
         #[must_use]
         pub fn tools(&self) -> &[ToolDefinition] {
             &self.tools
+        }
+
+        /// Return the request model override.
+        #[must_use]
+        pub fn model(&self) -> Option<&str> {
+            self.model.as_deref()
+        }
+
+        /// Return the request reasoning effort.
+        #[must_use]
+        pub fn reasoning_effort(&self) -> Option<&str> {
+            self.reasoning_effort.as_deref()
         }
     }
 
@@ -603,15 +640,16 @@ pub mod deepseek {
                 return Err(DeepSeekError::MissingApiKey);
             }
 
-            let (messages, tools) = request.into_parts();
+            let (messages, tools, model, reasoning_effort) = request.into_parts();
             let body = ChatCompletionRequest {
-                model: self.config.model.clone(),
+                model: model.unwrap_or_else(|| self.config.model.clone()),
                 messages: messages
                     .into_iter()
                     .map(|message| WireMessage::from(&message))
                     .collect(),
                 tools: tools.iter().map(WireToolDefinition::from).collect(),
                 stream: true,
+                reasoning_effort,
             };
 
             let request = self
@@ -704,6 +742,8 @@ pub mod deepseek {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         tools: Vec<WireToolDefinition>,
         stream: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1119,10 +1159,14 @@ pub mod deepseek {
                 ),
                 ChatMessage::tool_result("call-1", "tool output"),
             ])
-            .with_tools(vec![tool_definition.clone()]);
+            .with_tools(vec![tool_definition.clone()])
+            .with_model("request-model")
+            .with_reasoning_effort("max");
 
             assert_eq!(request.messages().len(), 4);
             assert_eq!(request.tools().len(), 1);
+            assert_eq!(request.model(), Some("request-model"));
+            assert_eq!(request.reasoning_effort(), Some("max"));
 
             let mut stream = client.stream_chat(request, CancellationToken::new())?;
             let mut events = Vec::new();
@@ -1158,7 +1202,8 @@ pub mod deepseek {
             })?;
             let request_json: serde_json::Value = serde_json::from_str(request_body)?;
 
-            assert_eq!(request_json["model"], "mock-model");
+            assert_eq!(request_json["model"], "request-model");
+            assert_eq!(request_json["reasoning_effort"], "max");
             assert_eq!(request_json["stream"], serde_json::json!(true));
             assert_eq!(request_json["messages"][0]["role"], "system");
             assert_eq!(request_json["messages"][1]["role"], "user");
