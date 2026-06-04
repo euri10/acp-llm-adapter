@@ -33,15 +33,16 @@ use agent_client_protocol::schema::{
     PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-    SessionConfigValueId, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TerminalOutputRequest, TerminalOutputResponse,
-    ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind, UnstructuredCommandInput, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    SelectedPermissionOutcome, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOption, SessionConfigValueId, SessionId,
+    SessionInfo, SessionListCapabilities, SessionMode, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TerminalOutputRequest, TerminalOutputResponse, ToolCall as AcpToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectTo, SessionMessage, Stdio};
@@ -1614,6 +1615,7 @@ fn build_initialize_response(_protocol_version: ProtocolVersion) -> InitializeRe
                 .prompt_capabilities(PromptCapabilities::new())
                 .session_capabilities(
                     SessionCapabilities::new()
+                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                         .list(SessionListCapabilities::new())
                         .close(SessionCloseCapabilities::new()),
                 )
@@ -2870,13 +2872,13 @@ mod tests {
                 .resume
                 .is_none()
         );
-        // additionalDirectories is NOT advertised here (covered by daa-ud0).
+        // additionalDirectories is advertised for extra workspace roots.
         assert!(
             response
                 .agent_capabilities
                 .session_capabilities
                 .additional_directories
-                .is_none()
+                .is_some()
         );
         // logout capability is advertised.
         assert!(response.agent_capabilities.auth.logout.is_some());
@@ -4822,7 +4824,11 @@ mod tests {
         let alternate_directory = temp_root.join("alternate");
         std::fs::create_dir_all(&alternate_directory)
             .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("found.txt"), "primary")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
         std::fs::write(alternate_directory.join("found.txt"), "found")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(alternate_directory.join("alternate-only.txt"), "found")
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let context = ToolContext {
             session_id: agent_client_protocol::schema::SessionId::new("session-paths"),
@@ -4832,7 +4838,11 @@ mod tests {
         };
         assert_eq!(
             super::resolve_tool_path(&context, std::path::Path::new("found.txt")),
-            alternate_directory.join("found.txt")
+            temp_root.join("found.txt")
+        );
+        assert_eq!(
+            super::resolve_tool_path(&context, std::path::Path::new("alternate-only.txt")),
+            alternate_directory.join("alternate-only.txt")
         );
         assert_eq!(
             super::resolve_tool_path(&context, std::path::Path::new("/abs/path")),

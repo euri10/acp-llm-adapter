@@ -104,6 +104,11 @@ If Zed is launched from a GUI app launcher, it may not inherit your shell enviro
 
 Tool calls are permission-gated and surfaced through ACP so the editor can show native diffs and command output.
 
+For sessions that advertise `additionalDirectories`, relative file paths resolve against the
+session `cwd` first and then each additional directory in order. Absolute paths are passed
+through unchanged, and `run_command` runs as a regular shell command rooted at `cwd` rather
+than a filesystem sandbox.
+
 ## Current Limitations
 
 - No TUI
@@ -111,4 +116,3 @@ Tool calls are permission-gated and surfaced through ACP so the editor can show 
 - No `loadSession`
 - No auto model router
 - No `apply_patch`-style edits in v0.1
-
