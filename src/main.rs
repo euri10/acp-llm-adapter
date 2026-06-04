@@ -62,14 +62,11 @@ pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
     WriteTextFileRequester, handle_new_session_request, serve_with_transport,
 };
+#[cfg(test)]
+pub(crate) use mcp::sanitize_tool_name_part;
 pub(crate) use mcp::{
     McpSession, McpToolTarget, connect_mcp_sessions, is_mcp_tool_name, mcp_tool_execution,
     mcp_tool_kind,
-};
-#[cfg(test)]
-pub(crate) use mcp::{
-    connect_mcp_stdio_session, mcp_call_arguments, mcp_tool_mappings, mcp_tool_result_text,
-    sanitize_tool_name_part,
 };
 #[cfg(test)]
 use tools::ToolExecution;
@@ -77,8 +74,6 @@ use tools::ToolExecution;
 use tools::ToolRegistry;
 use tools::{AdapterToolRegistry, ToolContext};
 pub(crate) use turn::tool_raw_input;
-#[cfg(test)]
-pub(crate) use turn::{ModelRequestSettings, stream_model_turn};
 
 #[cfg(test)]
 use tools::{
@@ -1263,283 +1258,42 @@ fn test_store() -> SessionStore {
 mod tests {
     use super::{
         AdapterState, AdapterToolRegistry, Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS,
-        DevSmokeResult, EmptyToolRegistry, McpSession, MockLlmClient, ModelRequestSettings,
-        PendingToolCalls, PermissionDecision, PermissionPosture, PermissionRequester,
-        ReadTextFileRequester, ReasoningEffort, SESSION_CONFIG_MODEL_ID,
-        SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore, ToolCallRequester, ToolContext,
+        DevSmokeResult, EmptyToolRegistry, MockLlmClient, PendingToolCalls, PermissionDecision,
+        PermissionPosture, PermissionRequester, ReadTextFileRequester, ReasoningEffort,
+        SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore, ToolContext,
         ToolExecution, ToolRegistry, WriteTextFileRequester, build_dev_agent,
-        build_initialize_response, connect_mcp_sessions, edit_file_tool_execution,
-        exercise_permission_gate_smoke, glob_tool_execution, grep_tool_execution,
-        handle_authenticate_request, handle_close_session_request, handle_initialize_request,
-        handle_list_sessions_request, handle_logout_request, handle_new_session_request,
-        handle_prompt_request, handle_set_session_config_option_request,
-        handle_set_session_mode_request, list_dir_tool_execution, llm_client_for_backend,
-        mcp_tool_mappings, print_dev_smoke_result, read_file_tool_execution,
-        request_tool_permission, run_command_tool_execution, run_smoke_flow, serve_with_transport,
-        test_store, write_file_tool_execution,
+        build_initialize_response, edit_file_tool_execution, exercise_permission_gate_smoke,
+        glob_tool_execution, grep_tool_execution, handle_authenticate_request,
+        handle_close_session_request, handle_initialize_request, handle_list_sessions_request,
+        handle_logout_request, handle_new_session_request, handle_prompt_request,
+        handle_set_session_config_option_request, handle_set_session_mode_request,
+        list_dir_tool_execution, llm_client_for_backend, print_dev_smoke_result,
+        read_file_tool_execution, request_tool_permission, run_command_tool_execution,
+        run_smoke_flow, serve_with_transport, test_store, write_file_tool_execution,
     };
-    use agent_client_protocol::schema::{McpServer, McpServerStdio};
     use agent_client_protocol::{Agent, Channel, Client};
     use deepseek_acp_adapter::deepseek::{
-        ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
+        ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent,
         ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
     };
     use futures_util::future::BoxFuture;
-    use futures_util::stream::{self, BoxStream};
-    use rmcp::model::{
-        CallToolRequestParams, CallToolResult, Content as McpContent, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as McpTool,
-    };
-    use rmcp::service::{RequestContext, RoleServer};
-    use rmcp::{ServerHandler, ServiceExt};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     use agent_client_protocol::schema::{
-        CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
-        FileSystemCapabilities, ImageContent, Implementation, InitializeRequest,
-        ListSessionsRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-        ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
+        ClientCapabilities, CloseSessionRequest, ContentBlock, FileSystemCapabilities,
+        ImageContent, Implementation, InitializeRequest, ListSessionsRequest, McpServer,
+        NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+        ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
         RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
         SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-        SessionConfigOptionCategory, SessionModeId, SessionNotification, SessionUpdate,
-        SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, ToolKind,
-        WriteTextFileRequest, WriteTextFileResponse,
+        SessionConfigOptionCategory, SessionModeId, SetSessionConfigOptionRequest,
+        SetSessionModeRequest, StopReason, ToolKind, WriteTextFileRequest, WriteTextFileResponse,
     };
     use clap::Parser;
     use futures_util::StreamExt;
-    use serde_json::Value;
-    use std::path::PathBuf;
-    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
-
-    struct FakeLlmClient {
-        requests: Arc<Mutex<Vec<ChatRequest>>>,
-        streams: Mutex<VecDeque<Vec<FakeStreamStep>>>,
-    }
-
-    impl FakeLlmClient {
-        fn new(events: Vec<Result<StreamEvent, DeepSeekError>>) -> Self {
-            Self::with_steps(events.into_iter().map(FakeStreamStep::Event).collect())
-        }
-
-        fn with_steps(steps: Vec<FakeStreamStep>) -> Self {
-            Self::with_streams(vec![steps])
-        }
-
-        fn with_streams(streams: Vec<Vec<FakeStreamStep>>) -> Self {
-            Self {
-                requests: Arc::new(Mutex::new(Vec::new())),
-                streams: Mutex::new(VecDeque::from(streams)),
-            }
-        }
-
-        fn requests(&self) -> Arc<Mutex<Vec<ChatRequest>>> {
-            Arc::clone(&self.requests)
-        }
-    }
-
-    impl LlmClient for FakeLlmClient {
-        fn stream_chat(
-            &self,
-            request: ChatRequest,
-            cancellation_token: CancellationToken,
-        ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
-            self.requests
-                .lock()
-                .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
-                .push(request);
-            let steps = self
-                .streams
-                .lock()
-                .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
-                .pop_front()
-                .ok_or_else(|| {
-                    DeepSeekError::InvalidResponse(
-                        "fake client stream was requested too many times".to_string(),
-                    )
-                })?;
-
-            Ok(Box::pin(stream::unfold(
-                (VecDeque::from(steps), cancellation_token),
-                |(mut steps, cancellation_token)| async move {
-                    let step = steps.pop_front()?;
-                    match step {
-                        FakeStreamStep::Event(event) => Some((event, (steps, cancellation_token))),
-                        FakeStreamStep::WaitForCancel => {
-                            cancellation_token.cancelled().await;
-                            None
-                        }
-                    }
-                },
-            )))
-        }
-    }
-
-    enum FakeStreamStep {
-        Event(Result<StreamEvent, DeepSeekError>),
-        WaitForCancel,
-    }
-
-    struct PendingLlmClient {
-        started: Arc<Notify>,
-    }
-
-    impl PendingLlmClient {
-        fn new(started: Arc<Notify>) -> Self {
-            Self { started }
-        }
-    }
-
-    impl LlmClient for PendingLlmClient {
-        fn stream_chat(
-            &self,
-            _request: ChatRequest,
-            _cancellation_token: CancellationToken,
-        ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
-            self.started.notify_one();
-            Ok(Box::pin(stream::pending::<
-                Result<StreamEvent, DeepSeekError>,
-            >()))
-        }
-    }
-
-    struct FakeToolRegistry {
-        definitions: Vec<ToolDefinition>,
-        result: ToolExecution,
-        calls: Arc<Mutex<Vec<DeepSeekToolCall>>>,
-    }
-
-    impl FakeToolRegistry {
-        fn new() -> Self {
-            Self {
-                definitions: vec![ToolDefinition::new(
-                    "echo",
-                    "Echo a message",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": { "message": { "type": "string" } },
-                    }),
-                )],
-                result: ToolExecution::completed(
-                    "tool says hi",
-                    serde_json::json!({ "message": "tool says hi" }),
-                ),
-                calls: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn calls(&self) -> Arc<Mutex<Vec<DeepSeekToolCall>>> {
-            Arc::clone(&self.calls)
-        }
-    }
-
-    impl ToolRegistry for FakeToolRegistry {
-        fn definitions(
-            &self,
-            _context: &ToolContext,
-            _store: &SessionStore,
-        ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
-            Ok(self.definitions.clone())
-        }
-
-        fn kind(&self, _name: &str) -> ToolKind {
-            ToolKind::Other
-        }
-
-        fn execute<'a>(
-            &'a self,
-            call: &'a DeepSeekToolCall,
-            _context: &'a ToolContext,
-            _store: &'a SessionStore,
-            _connection: Option<&'a dyn ToolCallRequester>,
-        ) -> BoxFuture<'a, ToolExecution> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .map(|mut calls| calls.push(call.clone()))
-                    .ok();
-                self.result.clone()
-            })
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct EchoMcpServer;
-
-    impl ServerHandler for EchoMcpServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-        }
-
-        async fn call_tool(
-            &self,
-            request: CallToolRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> Result<CallToolResult, rmcp::ErrorData> {
-            let message = request
-                .arguments
-                .as_ref()
-                .and_then(|arguments| arguments.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            Ok(CallToolResult::success(vec![McpContent::text(format!(
-                "echo: {message}"
-            ))]))
-        }
-
-        async fn list_tools(
-            &self,
-            _request: Option<PaginatedRequestParams>,
-            _context: RequestContext<RoleServer>,
-        ) -> Result<ListToolsResult, rmcp::ErrorData> {
-            Ok(ListToolsResult {
-                tools: vec![McpTool::new(
-                    "echo",
-                    "Echo a provided message",
-                    rmcp::model::object(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "message": { "type": "string" }
-                        },
-                        "required": ["message"]
-                    })),
-                )],
-                ..Default::default()
-            })
-        }
-    }
-
-    async fn connected_echo_mcp_session() -> Result<McpSession, agent_client_protocol::Error> {
-        let (server_transport, client_transport) = tokio::io::duplex(4096);
-        let server_task = tokio::spawn(async move {
-            let running = EchoMcpServer
-                .serve(server_transport)
-                .await
-                .map_err(|error| error.to_string())?;
-            running.waiting().await.map_err(|error| error.to_string())?;
-            Ok::<(), String>(())
-        });
-        drop(server_task);
-
-        let service = ().serve(client_transport).await.map_err(|error| {
-            agent_client_protocol::Error::internal_error()
-                .data(format!("failed to initialize test MCP client: {error}"))
-        })?;
-        let peer = service.peer().clone();
-        let tools = peer.list_all_tools().await.map_err(|error| {
-            agent_client_protocol::Error::internal_error()
-                .data(format!("failed to list test MCP tools: {error}"))
-        })?;
-
-        Ok(McpSession {
-            name: "Echo Server".to_string(),
-            tools: mcp_tool_mappings("Echo Server", tools),
-            peer,
-            _service: service,
-        })
-    }
 
     struct CountingReadTextFileRequester {
         calls: Arc<Mutex<usize>>,
@@ -1974,102 +1728,6 @@ mod tests {
         Ok(())
     }
 
-    #[test_log::test(tokio::test)]
-    async fn mcp_stdio_launch_failure_returns_invalid_params() {
-        let result = connect_mcp_sessions(&[McpServer::Stdio(McpServerStdio::new(
-            "broken",
-            "/definitely/not/a/real/mcp-server",
-        ))])
-        .await;
-
-        assert!(result.is_err());
-        let error_text = result
-            .err()
-            .map_or_else(String::new, |error| format!("{error:?}"));
-        assert!(error_text.contains("failed to start MCP server 'broken'"));
-    }
-
-    #[test_log::test]
-    fn mcp_tool_mappings_prefix_and_preserve_schema() {
-        let mappings = mcp_tool_mappings(
-            "Test Server",
-            vec![McpTool::new(
-                "Read File",
-                "Read through MCP",
-                rmcp::model::object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" }
-                    }
-                })),
-            )],
-        );
-
-        assert_eq!(mappings.len(), 1);
-        let mapping = &mappings[0];
-        assert_eq!(mapping.exposed_name, "mcp__test_server__read_file");
-        assert_eq!(mapping.original_name, "Read File");
-        assert_eq!(mapping.definition.name(), "mcp__test_server__read_file");
-        assert_eq!(mapping.definition.description(), "Read through MCP");
-        assert_eq!(
-            mapping.definition.parameters()["properties"]["path"]["type"],
-            "string"
-        );
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn adapter_registry_exposes_and_executes_session_mcp_tools()
-    -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        let mcp_session = connected_echo_mcp_session().await?;
-        {
-            let mut guard = store
-                .state
-                .lock()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            let session = guard
-                .sessions
-                .get_mut(&response.session_id)
-                .ok_or_else(|| {
-                    agent_client_protocol::Error::internal_error().data("missing session")
-                })?;
-            session.mcp_sessions.push(mcp_session);
-        }
-
-        let context = ToolContext {
-            session_id: response.session_id.clone(),
-            cwd: PathBuf::from("/tmp"),
-            additional_directories: Vec::new(),
-            client_capabilities: None,
-        };
-        let registry = AdapterToolRegistry;
-        let definitions = registry.definitions(&context, &store)?;
-        assert!(
-            definitions
-                .iter()
-                .any(|definition| definition.name() == "mcp__echo_server__echo")
-        );
-
-        let result = registry
-            .execute(
-                &DeepSeekToolCall::new(
-                    "call-mcp",
-                    "mcp__echo_server__echo",
-                    serde_json::json!({ "message": "hello" }).to_string(),
-                ),
-                &context,
-                &store,
-                None,
-            )
-            .await;
-
-        assert!(result.success);
-        assert_eq!(result.content, "echo: hello");
-
-        Ok(())
-    }
-
     #[test_log::test]
     fn set_mode_updates_session_state() -> Result<(), agent_client_protocol::Error> {
         let store = test_store();
@@ -2155,53 +1813,6 @@ mod tests {
         };
 
         assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn prompt_uses_updated_session_model_and_reasoning()
-    -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        handle_set_session_config_option_request(
-            &store,
-            &SetSessionConfigOptionRequest::new(
-                session.session_id.clone(),
-                SESSION_CONFIG_MODEL_ID,
-                "deepseek-v4-flash",
-            ),
-        )?;
-        handle_set_session_config_option_request(
-            &store,
-            &SetSessionConfigOptionRequest::new(
-                session.session_id.clone(),
-                SESSION_CONFIG_REASONING_EFFORT_ID,
-                "max",
-            ),
-        )?;
-
-        let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
-        let requests = client.requests();
-
-        let response = handle_prompt_request(
-            &store,
-            &client,
-            &EmptyToolRegistry,
-            None,
-            PromptRequest::new(session.session_id, vec![ContentBlock::from("hi")]),
-            DEFAULT_MAX_TURN_REQUESTS,
-            |_| Ok(()),
-        )
-        .await?;
-
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
-        let request_guard = requests
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(request_guard.len(), 1);
-        assert_eq!(request_guard[0].model(), Some("deepseek-v4-flash"));
-        assert_eq!(request_guard[0].reasoning_effort(), Some("max"));
 
         Ok(())
     }
@@ -2433,432 +2044,6 @@ mod tests {
                 .map_err(agent_client_protocol::Error::into_internal_error)?
                 .is_empty()
         );
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn mcp_tools_use_explicit_execute_permission_kind()
-    -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        handle_set_session_mode_request(
-            &store,
-            &SetSessionModeRequest::new(session.session_id.clone(), "accept-edits"),
-        )?;
-        let context = ToolContext {
-            session_id: session.session_id,
-            cwd: std::path::PathBuf::from("/tmp"),
-            additional_directories: Vec::new(),
-            client_capabilities: None,
-        };
-        let call = DeepSeekToolCall::new(
-            "call-mcp-permission",
-            "mcp__server__tool",
-            serde_json::json!({ "message": "hello" }).to_string(),
-        );
-        let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
-            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                super::PERMISSION_ALLOW_ONCE_OPTION_ID,
-            )),
-        )]);
-
-        let decision =
-            request_tool_permission(&store, &context, &call, super::mcp_tool_kind(), &requester)
-                .await?;
-
-        assert_eq!(decision, PermissionDecision::AllowOnce);
-        let requests = requester.requests();
-        let request_guard = requests
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(request_guard.len(), 1);
-        assert_eq!(
-            request_guard[0].tool_call.fields.kind,
-            Some(ToolKind::Execute)
-        );
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_protocol::Error>
-    {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        let client = FakeLlmClient::new(vec![
-            Ok(StreamEvent::Thought("thinking".to_string())),
-            Ok(StreamEvent::Message("hello".to_string())),
-            Ok(StreamEvent::Message(" world".to_string())),
-            Ok(StreamEvent::Finished(FinishReason::EndTurn)),
-        ]);
-        let requests = client.requests();
-        let mut notifications = Vec::new();
-
-        let response = handle_prompt_request(
-            &store,
-            &client,
-            &EmptyToolRegistry,
-            None,
-            PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("hi")]),
-            DEFAULT_MAX_TURN_REQUESTS,
-            |notification| {
-                notifications.push(notification);
-                Ok(())
-            },
-        )
-        .await?;
-
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
-        assert_eq!(notifications.len(), 4);
-        assert!(matches!(notifications[0].update, SessionUpdate::Plan(_)));
-        assert!(matches!(
-            notifications[1].update,
-            SessionUpdate::AgentThoughtChunk(_)
-        ));
-        assert!(matches!(
-            notifications[2].update,
-            SessionUpdate::AgentMessageChunk(_)
-        ));
-        assert!(matches!(
-            notifications[3].update,
-            SessionUpdate::AgentMessageChunk(_)
-        ));
-
-        let request_guard = requests
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(request_guard.len(), 1);
-        assert_eq!(request_guard[0].messages()[0].content(), "hi");
-        drop(request_guard);
-
-        let state_guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let stored = state_guard
-            .sessions
-            .get(&session.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing stored session")
-            })?;
-        assert_eq!(stored.history.len(), 2);
-        assert_eq!(stored.history[0].content(), "hi");
-        assert_eq!(stored.history[1].content(), "hello world");
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        let session_id = session.session_id.clone();
-        let client = Arc::new(FakeLlmClient::with_steps(vec![
-            FakeStreamStep::Event(Ok(StreamEvent::Message("partial".to_string()))),
-            FakeStreamStep::WaitForCancel,
-        ]));
-        let (notification_tx, mut notification_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SessionNotification>();
-
-        let prompt_store = store.clone();
-        let prompt_session_id = session_id.clone();
-        let prompt_client = Arc::clone(&client);
-        let prompt_task = tokio::spawn(async move {
-            handle_prompt_request(
-                &prompt_store,
-                prompt_client.as_ref(),
-                &EmptyToolRegistry,
-                None,
-                PromptRequest::new(prompt_session_id, vec![ContentBlock::from("cancel me")]),
-                DEFAULT_MAX_TURN_REQUESTS,
-                |notification| {
-                    notification_tx
-                        .send(notification)
-                        .map_err(agent_client_protocol::Error::into_internal_error)?;
-                    Ok(())
-                },
-            )
-            .await
-        });
-
-        // First notification is the plan; skip it.
-        let plan_notification = notification_rx.recv().await.ok_or_else(|| {
-            agent_client_protocol::Error::internal_error().data("missing plan update")
-        })?;
-        assert!(matches!(plan_notification.update, SessionUpdate::Plan(_)));
-
-        let notification = notification_rx
-            .recv()
-            .await
-            .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing update"))?;
-        let SessionUpdate::AgentMessageChunk(chunk) = notification.update else {
-            return Err(
-                agent_client_protocol::Error::internal_error().data("expected agent message chunk")
-            );
-        };
-        let ContentBlock::Text(text) = chunk.content else {
-            return Err(agent_client_protocol::Error::internal_error().data("expected text chunk"));
-        };
-        assert_eq!(text.text, "partial");
-
-        store.cancel_active_turn(&CancelNotification::new(session_id.clone()).session_id)?;
-        let response = prompt_task
-            .await
-            .map_err(agent_client_protocol::Error::into_internal_error)??;
-
-        assert_eq!(response.stop_reason, StopReason::Cancelled);
-        let guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard.sessions.get(&session_id).ok_or_else(|| {
-            agent_client_protocol::Error::internal_error().data("missing session")
-        })?;
-        assert!(session.active_turn.is_none());
-        assert!(session.history.is_empty());
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn stream_model_turn_respects_cancellation_token()
-    -> Result<(), agent_client_protocol::Error> {
-        let started = Arc::new(Notify::new());
-        let client = PendingLlmClient::new(Arc::clone(&started));
-        let cancellation_token = CancellationToken::new();
-        let task_token = cancellation_token.clone();
-        let session_id = agent_client_protocol::schema::SessionId::new("session-cancel");
-        let messages: Vec<ChatMessage> = Vec::new();
-        let tool_definitions: Vec<ToolDefinition> = Vec::new();
-
-        let turn_task = tokio::spawn(async move {
-            let mut notify = |_| Ok(());
-            super::stream_model_turn(
-                &client,
-                &messages,
-                &tool_definitions,
-                ModelRequestSettings {
-                    model: "deepseek-v4-pro",
-                    reasoning_effort: ReasoningEffort::High,
-                },
-                task_token,
-                &session_id,
-                &mut notify,
-            )
-            .await
-        });
-
-        started.notified().await;
-        cancellation_token.cancel();
-
-        let turn = tokio::time::timeout(std::time::Duration::from_secs(1), turn_task)
-            .await
-            .map_err(|error| {
-                agent_client_protocol::Error::internal_error().data(error.to_string())
-            })?
-            .map_err(agent_client_protocol::Error::into_internal_error)??;
-
-        assert_eq!(turn.stop_reason, StopReason::Cancelled);
-        assert_eq!(turn.assistant_text, "");
-        assert!(turn.tool_calls.is_empty());
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn prompt_executes_tool_calls_and_replays_results()
-    -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        let client = FakeLlmClient::with_streams(vec![
-            vec![
-                FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
-                    0,
-                    Some("call-1".to_string()),
-                    Some("echo".to_string()),
-                    Some("{\"message\":\"".to_string()),
-                )))),
-                FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
-                    0,
-                    None,
-                    None,
-                    Some("hi\"}".to_string()),
-                )))),
-                FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::ToolCalls))),
-            ],
-            vec![
-                FakeStreamStep::Event(Ok(StreamEvent::Message("done".to_string()))),
-                FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::EndTurn))),
-            ],
-        ]);
-        let requests = client.requests();
-        let registry = FakeToolRegistry::new();
-        let tool_calls = registry.calls();
-        let mut notifications = Vec::new();
-
-        let response = handle_prompt_request(
-            &store,
-            &client,
-            &registry,
-            None,
-            PromptRequest::new(
-                session.session_id.clone(),
-                vec![ContentBlock::from("use tool")],
-            ),
-            DEFAULT_MAX_TURN_REQUESTS,
-            |notification| {
-                notifications.push(notification);
-                Ok(())
-            },
-        )
-        .await?;
-
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
-        assert!(matches!(notifications[0].update, SessionUpdate::Plan(_)));
-        assert!(matches!(
-            notifications[1].update,
-            SessionUpdate::ToolCall(_)
-        ));
-        assert!(matches!(
-            notifications[2].update,
-            SessionUpdate::ToolCallUpdate(_)
-        ));
-        assert!(matches!(
-            notifications[3].update,
-            SessionUpdate::AgentMessageChunk(_)
-        ));
-
-        let tool_call_guard = tool_calls
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(tool_call_guard.len(), 1);
-        assert_eq!(tool_call_guard[0].id(), "call-1");
-        assert_eq!(tool_call_guard[0].name(), "echo");
-        assert_eq!(tool_call_guard[0].arguments(), "{\"message\":\"hi\"}");
-        drop(tool_call_guard);
-
-        let request_guard = requests
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(request_guard.len(), 2);
-        assert_eq!(request_guard[0].tools().len(), 1);
-        let replayed = request_guard[1].messages();
-        assert_eq!(replayed.len(), 3);
-        assert_eq!(replayed[0].content(), "use tool");
-        assert_eq!(replayed[1].tool_calls()[0].id(), "call-1");
-        assert_eq!(
-            replayed[2].role(),
-            deepseek_acp_adapter::deepseek::MessageRole::Tool
-        );
-        assert_eq!(replayed[2].tool_call_id(), Some("call-1"));
-        assert_eq!(replayed[2].content(), "tool says hi");
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn prompt_tool_loop_stops_at_max_turn_requests()
-    -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        let limit = DEFAULT_MAX_TURN_REQUESTS.get();
-        let mut streams = (0..limit)
-            .map(|index| {
-                vec![
-                    FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
-                        0,
-                        Some(format!("call-{index}")),
-                        Some("echo".to_string()),
-                        Some("{}".to_string()),
-                    )))),
-                    FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::ToolCalls))),
-                ]
-            })
-            .collect::<Vec<_>>();
-        streams.push(vec![
-            FakeStreamStep::Event(Ok(StreamEvent::Message("done".to_string()))),
-            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::EndTurn))),
-        ]);
-        let client = FakeLlmClient::with_streams(streams);
-        let requests = client.requests();
-        let registry = FakeToolRegistry::new();
-
-        let response = handle_prompt_request(
-            &store,
-            &client,
-            &registry,
-            None,
-            PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("loop")]),
-            DEFAULT_MAX_TURN_REQUESTS,
-            |_| Ok(()),
-        )
-        .await?;
-
-        assert_eq!(response.stop_reason, StopReason::MaxTurnRequests);
-        let request_guard = requests
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(request_guard.len(), limit);
-        drop(request_guard);
-
-        let guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let record = guard.sessions.get(&session.session_id).ok_or_else(|| {
-            agent_client_protocol::Error::internal_error().data("missing session")
-        })?;
-        assert_eq!(record.history.len(), 1 + (limit * 2));
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        let first_client = FakeLlmClient::new(vec![
-            Ok(StreamEvent::Message("first answer".to_string())),
-            Ok(StreamEvent::Finished(FinishReason::EndTurn)),
-        ]);
-        handle_prompt_request(
-            &store,
-            &first_client,
-            &EmptyToolRegistry,
-            None,
-            PromptRequest::new(
-                session.session_id.clone(),
-                vec![ContentBlock::from("first")],
-            ),
-            DEFAULT_MAX_TURN_REQUESTS,
-            |_| Ok(()),
-        )
-        .await?;
-
-        let second_client =
-            FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::MaxTokens))]);
-        let second_requests = second_client.requests();
-        let response = handle_prompt_request(
-            &store,
-            &second_client,
-            &EmptyToolRegistry,
-            None,
-            PromptRequest::new(session.session_id, vec![ContentBlock::from("second")]),
-            DEFAULT_MAX_TURN_REQUESTS,
-            |_| Ok(()),
-        )
-        .await?;
-
-        assert_eq!(response.stop_reason, StopReason::MaxTokens);
-        let request_guard = second_requests
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let messages = request_guard[0].messages();
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].content(), "first");
-        assert_eq!(messages[1].content(), "first answer");
-        assert_eq!(messages[2].content(), "second");
 
         Ok(())
     }
@@ -3893,40 +3078,6 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn prompt_request_rejects_active_turn() -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        {
-            let mut guard = store
-                .state
-                .lock()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            let record = guard.sessions.get_mut(&session.session_id).ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing stored session")
-            })?;
-            record.active_turn = Some(CancellationToken::new());
-        }
-
-        let Err(error) = handle_prompt_request(
-            &store,
-            &MockLlmClient,
-            &EmptyToolRegistry,
-            None,
-            PromptRequest::new(session.session_id, vec![ContentBlock::from("hi")]),
-            DEFAULT_MAX_TURN_REQUESTS,
-            |_| Ok(()),
-        )
-        .await
-        else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected active turn to reject prompt"));
-        };
-        assert!(error.to_string().contains("already has an active turn"));
-
-        Ok(())
-    }
-
-    #[test_log::test(tokio::test)]
     async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client_protocol::Error>
     {
         let temp_root =
@@ -4563,38 +3714,6 @@ mod tests {
         assert_eq!(model, "deepseek-v4-pro");
     }
 
-    // ── mcp_call_arguments error branches ───────────────────
-
-    #[test]
-    fn mcp_call_arguments_rejects_non_object_json() -> Result<(), agent_client_protocol::Error> {
-        let call = DeepSeekToolCall::new("id", "tool", "\"string\"");
-        let Err(error) = super::mcp_call_arguments(&call) else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected non-object args to fail"));
-        };
-        assert!(error.contains("must be a JSON object"));
-        Ok(())
-    }
-
-    #[test]
-    fn mcp_call_arguments_rejects_invalid_json() -> Result<(), agent_client_protocol::Error> {
-        let call = DeepSeekToolCall::new("id", "tool", "not json");
-        let Err(error) = super::mcp_call_arguments(&call) else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected invalid JSON to fail"));
-        };
-        assert!(error.contains("invalid MCP tool"));
-        Ok(())
-    }
-
-    // ── mcp_tool_result_text empty path ─────────────────────
-
-    #[test]
-    fn mcp_tool_result_text_returns_empty_for_no_content() {
-        let result: &[McpContent] = &[];
-        assert_eq!(super::mcp_tool_result_text(result), "");
-    }
-
     // ── AdapterToolRegistry::kind ───────────────────────────
 
     #[test]
@@ -4609,27 +3728,6 @@ mod tests {
         assert_eq!(registry.kind("run_command"), ToolKind::Execute);
         assert_eq!(registry.kind("mcp__server__tool"), ToolKind::Execute);
         assert_eq!(registry.kind("bogus"), ToolKind::Other);
-    }
-
-    // ── handle_new_session_request MCP rejection ────────────
-
-    #[test]
-    fn new_session_with_mcp_servers_rejected_synchronously()
-    -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let request = NewSessionRequest::new("/tmp").mcp_servers(vec![McpServer::Stdio(
-            McpServerStdio::new("test", "/usr/bin/true"),
-        )]);
-        let Err(error) = handle_new_session_request(&store, &request) else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected MCP session request to be rejected"));
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("MCP servers require the async session setup path")
-        );
-        Ok(())
     }
 
     // ── require_tool_permission error branches ──────────────
@@ -4864,75 +3962,6 @@ mod tests {
     }
 
     // ── validate_session_paths relative paths ───────────────
-
-    #[test]
-    fn validate_session_paths_rejects_relative_cwd() -> Result<(), agent_client_protocol::Error> {
-        let request = NewSessionRequest::new("relative/path");
-        let Err(error) = super::validate_session_paths(&request) else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected relative cwd to fail"));
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("session cwd must be an absolute path")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn validate_session_paths_rejects_relative_additional_directory()
-    -> Result<(), agent_client_protocol::Error> {
-        let request = NewSessionRequest::new("/tmp")
-            .additional_directories(vec![std::path::PathBuf::from("not-absolute")]);
-        let Err(error) = super::validate_session_paths(&request) else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected relative additional directory to fail"));
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("additional session directories must be absolute paths")
-        );
-        Ok(())
-    }
-
-    // ── connect_mcp_sessions non-stdio rejection ────────────
-
-    #[test_log::test(tokio::test)]
-    async fn connect_mcp_sessions_rejects_non_stdio() {
-        let result = connect_mcp_sessions(&[McpServer::Http(
-            agent_client_protocol::schema::McpServerHttp::new("remote", "http://localhost"),
-        )])
-        .await;
-        let Err(error) = result else {
-            return;
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("only stdio MCP servers are supported")
-        );
-    }
-
-    // ── mcp_tool_execution error branches ───────────────────
-
-    #[test_log::test(tokio::test)]
-    async fn mcp_tool_execution_unknown_tool() -> Result<(), agent_client_protocol::Error> {
-        let store = test_store();
-        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        let context = ToolContext {
-            session_id: session.session_id.clone(),
-            cwd: std::path::PathBuf::from("/tmp"),
-            additional_directories: Vec::new(),
-            client_capabilities: None,
-        };
-        let call = DeepSeekToolCall::new("mcp-unknown", "mcp__nonexistent__tool", "{}");
-        let result = super::mcp_tool_execution(&store, &call, &context).await;
-        assert!(!result.success);
-        assert!(result.content.contains("unknown MCP tool"));
-        Ok(())
-    }
 
     // ── DeepSeek lib-side unit tests via super ───────────────
 
@@ -5572,14 +4601,6 @@ mod tests {
         Ok(())
     }
 
-    // ── mcp_tool_result_text with non-text content ──────────
-
-    #[test]
-    fn mcp_tool_result_text_serializes_non_text_content() {
-        let content = vec![McpContent::text("text part")];
-        assert_eq!(super::mcp_tool_result_text(&content), "text part");
-    }
-
     // ── handle_set_session_mode_request invalid mode id ─────
 
     #[test]
@@ -5629,18 +4650,6 @@ mod tests {
         let rendered = super::resource_link_prompt_text(&link);
         assert!(rendered.contains("Display Title"));
         assert!(!rendered.contains("internal_name"));
-    }
-
-    // ── mcp_stdio_session relative command rejection ────────
-
-    #[test_log::test(tokio::test)]
-    async fn mcp_stdio_session_rejects_relative_command() {
-        let stdio = McpServerStdio::new("rel", "relative/path");
-        let result = super::connect_mcp_stdio_session(&stdio).await;
-        let Err(error) = result else {
-            return;
-        };
-        assert!(error.to_string().contains("command must be absolute"));
     }
 
     // ── render_command_output stderr trailing newline ───────

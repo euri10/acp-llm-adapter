@@ -622,3 +622,99 @@ pub(crate) fn validate_session_paths(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_new_session_request, handle_prompt_request, validate_session_paths};
+    use crate::tools::EmptyToolRegistry;
+    use crate::{DEFAULT_MAX_TURN_REQUESTS, MockLlmClient, test_store};
+    use agent_client_protocol::schema::{ContentBlock, NewSessionRequest, PromptRequest};
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn new_session_with_mcp_servers_rejected_synchronously()
+    -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let request = NewSessionRequest::new("/tmp").mcp_servers(vec![
+            agent_client_protocol::schema::McpServer::Stdio(
+                agent_client_protocol::schema::McpServerStdio::new("test", "/usr/bin/true"),
+            ),
+        ]);
+        let Err(error) = handle_new_session_request(&store, &request) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected MCP session request to be rejected"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("MCP servers require the async session setup path")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_session_paths_rejects_relative_cwd() -> Result<(), agent_client_protocol::Error> {
+        let request = NewSessionRequest::new("relative/path");
+        let Err(error) = validate_session_paths(&request) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected relative cwd to fail"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("session cwd must be an absolute path")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_session_paths_rejects_relative_additional_directory()
+    -> Result<(), agent_client_protocol::Error> {
+        let request = NewSessionRequest::new("/tmp")
+            .additional_directories(vec![std::path::PathBuf::from("not-absolute")]);
+        let Err(error) = validate_session_paths(&request) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected relative additional directory to fail"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("additional session directories must be absolute paths")
+        );
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn prompt_request_rejects_active_turn() -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        {
+            let mut guard = store
+                .state
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let record = guard.sessions.get_mut(&session.session_id).ok_or_else(|| {
+                agent_client_protocol::Error::internal_error().data("missing stored session")
+            })?;
+            record.active_turn = Some(CancellationToken::new());
+        }
+
+        let Err(error) = handle_prompt_request(
+            &store,
+            &MockLlmClient,
+            &EmptyToolRegistry,
+            None,
+            PromptRequest::new(session.session_id, vec![ContentBlock::from("hi")]),
+            DEFAULT_MAX_TURN_REQUESTS,
+            |_| Ok(()),
+        )
+        .await
+        else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected active turn to reject prompt"));
+        };
+        assert!(error.to_string().contains("already has an active turn"));
+
+        Ok(())
+    }
+}
