@@ -271,8 +271,8 @@ async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protoc
 }
 
 async fn exercise_permission_gate_smoke() -> Result<(), agent_client_protocol::Error> {
-    let state = Arc::new(Mutex::new(AdapterState::default()));
-    let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())));
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
         session_id: session.session_id.clone(),
         cwd: std::env::current_dir().map_err(|error| {
@@ -288,7 +288,7 @@ async fn exercise_permission_gate_smoke() -> Result<(), agent_client_protocol::E
         serde_json::json!({ "path": "smoke.txt" }).to_string(),
     );
     let decision = request_tool_permission(
-        &state,
+        &store,
         &context,
         &call,
         ToolKind::Edit,
@@ -301,13 +301,7 @@ async fn exercise_permission_gate_smoke() -> Result<(), agent_client_protocol::E
             .data("permission gate smoke check did not allow always"));
     }
 
-    let guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing permission smoke session")
-    })?;
-    if !stored.permission_allow_always.contains("write_file") {
+    if !store.is_always_allowed(&session.session_id, "write_file")? {
         return Err(agent_client_protocol::Error::internal_error()
             .data("permission gate smoke check did not cache allow_always"));
     }
@@ -744,23 +738,24 @@ async fn serve_with_transport(
     tool_registry: Arc<dyn ToolRegistry>,
     max_turn_requests: NonZeroUsize,
 ) -> Result<(), agent_client_protocol::Error> {
-    let initialize_state = Arc::clone(&state);
-    let new_session_state = Arc::clone(&state);
-    let set_mode_state = Arc::clone(&state);
-    let set_config_state = Arc::clone(&state);
-    let prompt_state = Arc::clone(&state);
+    let store = SessionStore::new(state);
+    let initialize_store = store.clone();
+    let new_session_store = store.clone();
+    let set_mode_store = store.clone();
+    let set_config_store = store.clone();
+    let prompt_store = store.clone();
     let prompt_client = Arc::clone(&llm_client);
     let prompt_tools = Arc::clone(&tool_registry);
-    let cancel_state = Arc::clone(&state);
-    let list_sessions_state = Arc::clone(&state);
-    let close_session_state = Arc::clone(&state);
+    let cancel_store = store.clone();
+    let list_sessions_store = store.clone();
+    let close_session_store = store.clone();
 
     Agent
         .builder()
         .name("deepseek-acp-adapter")
         .on_receive_request(
             async move |request: InitializeRequest, responder, _cx| {
-                responder.respond(handle_initialize_request(&initialize_state, request)?)
+                responder.respond(handle_initialize_request(&initialize_store, request)?)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -772,12 +767,12 @@ async fn serve_with_transport(
         )
         .on_receive_request(
             async move |request: NewSessionRequest, responder, cx| {
-                let session_state = Arc::clone(&new_session_state);
+                let session_store = new_session_store.clone();
                 let connection = cx.clone();
 
                 cx.spawn(async move {
                     let response =
-                        handle_new_session_request_connected(&session_state, &request).await?;
+                        handle_new_session_request_connected(&session_store, &request).await?;
                     let session_id = response.session_id.clone();
 
                     // Advertise available slash commands after session creation.
@@ -801,14 +796,14 @@ async fn serve_with_transport(
         )
         .on_receive_request(
             async move |request: SetSessionModeRequest, responder, _cx| {
-                responder.respond(handle_set_session_mode_request(&set_mode_state, &request)?)
+                responder.respond(handle_set_session_mode_request(&set_mode_store, &request)?)
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: SetSessionConfigOptionRequest, responder, _cx| {
                 responder.respond(handle_set_session_config_option_request(
-                    &set_config_state,
+                    &set_config_store,
                     &request,
                 )?)
             },
@@ -816,14 +811,14 @@ async fn serve_with_transport(
         )
         .on_receive_request(
             async move |request: PromptRequest, responder, cx| {
-                let state = Arc::clone(&prompt_state);
+                let store = prompt_store.clone();
                 let client = Arc::clone(&prompt_client);
                 let tools = Arc::clone(&prompt_tools);
                 let connection = cx.clone();
 
                 cx.spawn(async move {
                     let result = handle_prompt_request(
-                        &state,
+                        &store,
                         client.as_ref(),
                         tools.as_ref(),
                         Some(&connection as &dyn ToolCallRequester),
@@ -844,7 +839,7 @@ async fn serve_with_transport(
         .on_receive_request(
             async move |request: ListSessionsRequest, responder, _cx| {
                 responder.respond(handle_list_sessions_request(
-                    &list_sessions_state,
+                    &list_sessions_store,
                     &request,
                 )?)
             },
@@ -853,7 +848,7 @@ async fn serve_with_transport(
         .on_receive_request(
             async move |request: CloseSessionRequest, responder, _cx| {
                 responder.respond(handle_close_session_request(
-                    &close_session_state,
+                    &close_session_store,
                     &request,
                 )?)
             },
@@ -867,7 +862,7 @@ async fn serve_with_transport(
         )
         .on_receive_notification(
             async move |notification: CancelNotification, _cx| {
-                handle_cancel_notification(&cancel_state, &notification)
+                cancel_store.cancel_active_turn(&notification.session_id)
             },
             agent_client_protocol::on_receive_notification!(),
         )
@@ -876,10 +871,10 @@ async fn serve_with_transport(
 }
 
 fn handle_initialize_request(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     request: InitializeRequest,
 ) -> Result<InitializeResponse, agent_client_protocol::Error> {
-    record_client_capabilities(state, request.client_capabilities)?;
+    store.record_client_capabilities(request.client_capabilities)?;
     Ok(build_initialize_response(request.protocol_version))
 }
 
@@ -888,34 +883,19 @@ fn handle_authenticate_request() -> AuthenticateResponse {
 }
 
 fn handle_list_sessions_request(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     _request: &ListSessionsRequest,
 ) -> Result<ListSessionsResponse, agent_client_protocol::Error> {
-    let guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-
-    let sessions: Vec<SessionInfo> = guard
-        .sessions
-        .iter()
-        .map(|(session_id, record)| {
-            SessionInfo::new(session_id.clone(), record.cwd.clone())
-                .additional_directories(record.additional_directories.clone())
-        })
-        .collect();
-
+    let sessions = store.list_sessions()?;
     Ok(ListSessionsResponse::new(sessions))
 }
 
 fn handle_close_session_request(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     request: &CloseSessionRequest,
 ) -> Result<CloseSessionResponse, agent_client_protocol::Error> {
-    let mut guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-
-    if guard.sessions.remove(&request.session_id).is_none() {
+    let existed = store.remove_session(&request.session_id)?;
+    if !existed {
         return Err(agent_client_protocol::Error::invalid_params()
             .data(format!("unknown session id: {}", request.session_id.0)));
     }
@@ -931,38 +911,36 @@ fn handle_logout_request() -> LogoutResponse {
 }
 
 fn handle_new_session_request(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     request: &NewSessionRequest,
 ) -> Result<NewSessionResponse, agent_client_protocol::Error> {
     if !request.mcp_servers.is_empty() {
         return Err(agent_client_protocol::Error::invalid_params()
             .data("MCP servers require the async session setup path"));
     }
-    insert_session_record(state, request, Vec::new())
+    insert_session_record(store, request, Vec::new())
 }
 
 async fn handle_new_session_request_connected(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     request: &NewSessionRequest,
 ) -> Result<NewSessionResponse, agent_client_protocol::Error> {
     validate_session_paths(request)?;
     let mcp_sessions = connect_mcp_sessions(&request.mcp_servers).await?;
-    insert_session_record(state, request, mcp_sessions)
+    insert_session_record(store, request, mcp_sessions)
 }
 
 fn insert_session_record(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     request: &NewSessionRequest,
     mcp_sessions: Vec<McpSession>,
 ) -> Result<NewSessionResponse, agent_client_protocol::Error> {
     validate_session_paths(request)?;
     let session_id = format!("session-{}", Uuid::new_v4());
-    let mut guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let default_model = guard.default_model.clone();
-    guard.sessions.insert(
-        session_id.clone().into(),
+    let default_model = store.default_model()?;
+    let sid: SessionId = session_id.clone().into();
+    store.insert_session(
+        sid.clone(),
         SessionRecord {
             cwd: request.cwd.clone(),
             additional_directories: request.additional_directories.clone(),
@@ -974,22 +952,17 @@ fn insert_session_record(
             permission_allow_always: HashSet::new(),
             mcp_sessions,
         },
-    );
+    )?;
 
-    let session = guard
-        .sessions
-        .get(&SessionId::new(session_id.clone()))
-        .ok_or_else(|| {
-            agent_client_protocol::Error::internal_error().data("failed to create session")
-        })?;
+    store.lookup_session(&sid)?;
 
     Ok(NewSessionResponse::new(session_id)
         .modes(default_session_modes())
-        .config_options(session_config_options(session)))
+        .config_options(store.session_config_options(&sid)?))
 }
 
 fn handle_set_session_mode_request(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     request: &SetSessionModeRequest,
 ) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
     let Some(mode) = PermissionPosture::from_mode_id(&request.mode_id) else {
@@ -997,29 +970,14 @@ fn handle_set_session_mode_request(
             .data(format!("unsupported session mode: {}", request.mode_id.0)));
     };
 
-    let mut guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::invalid_params()
-            .data(format!("unknown session id: {}", request.session_id.0))
-    })?;
-    session.mode = mode;
-
+    store.set_mode(&request.session_id, mode)?;
     Ok(SetSessionModeResponse::new())
 }
 
 fn handle_set_session_config_option_request(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     request: &SetSessionConfigOptionRequest,
 ) -> Result<SetSessionConfigOptionResponse, agent_client_protocol::Error> {
-    let mut guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::invalid_params()
-            .data(format!("unknown session id: {}", request.session_id.0))
-    })?;
     let value = config_value_id(&request.value)?;
 
     match request.config_id.0.as_ref() {
@@ -1029,19 +987,22 @@ fn handle_set_session_config_option_request(
                 return Err(agent_client_protocol::Error::invalid_params()
                     .data(format!("unsupported session mode: {}", value.0)));
             };
-            session.mode = mode;
+            store.set_mode(&request.session_id, mode)?;
         }
         SESSION_CONFIG_MODEL_ID => {
             let model = value.0.as_ref();
-            validate_session_model(session, model)?;
-            session.model = model.to_string();
+            store.with_session(&request.session_id, |session| {
+                validate_session_model(session, model)?;
+                Ok(())
+            })?;
+            store.set_model(&request.session_id, model.to_string())?;
         }
         SESSION_CONFIG_REASONING_EFFORT_ID => {
             let Some(effort) = ReasoningEffort::from_value_id(value) else {
                 return Err(agent_client_protocol::Error::invalid_params()
                     .data(format!("unsupported reasoning effort: {}", value.0)));
             };
-            session.reasoning_effort = effort;
+            store.set_reasoning_effort(&request.session_id, effort)?;
         }
         _ => {
             return Err(agent_client_protocol::Error::invalid_params().data(format!(
@@ -1051,9 +1012,9 @@ fn handle_set_session_config_option_request(
         }
     }
 
-    Ok(SetSessionConfigOptionResponse::new(session_config_options(
-        session,
-    )))
+    Ok(SetSessionConfigOptionResponse::new(
+        store.session_config_options(&request.session_id)?,
+    ))
 }
 
 fn config_value_id(
@@ -1066,7 +1027,7 @@ fn config_value_id(
 }
 
 async fn handle_prompt_request(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     llm_client: &dyn LlmClient,
     tool_registry: &dyn ToolRegistry,
     connection: Option<&dyn ToolCallRequester>,
@@ -1078,39 +1039,17 @@ async fn handle_prompt_request(
     let user_message = ChatMessage::user(user_text.clone());
     let session_id = request.session_id.clone();
     let cancellation_token = CancellationToken::new();
-    let (messages, tool_context, model, reasoning_effort) = {
-        let mut guard = state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let client_capabilities = guard.client_capabilities.clone();
-        let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("unknown session id: {}", request.session_id.0))
-        })?;
-        if session.active_turn.is_some() {
-            return Err(
-                agent_client_protocol::Error::invalid_request().data(format!(
-                    "session {} already has an active turn",
-                    request.session_id.0
-                )),
-            );
-        }
-        session.active_turn = Some(cancellation_token.clone());
 
-        let mut messages = session.history.clone();
-        messages.push(user_message.clone());
-        (
-            messages,
-            ToolContext {
-                session_id: session_id.clone(),
-                cwd: session.cwd.clone(),
-                additional_directories: session.additional_directories.clone(),
-                client_capabilities,
-            },
-            session.model.clone(),
-            session.reasoning_effort,
-        )
-    };
+    let TurnSetup {
+        messages,
+        tool_context,
+        model,
+        reasoning_effort,
+    } = store.begin_turn(
+        &request.session_id,
+        cancellation_token.clone(),
+        user_message,
+    )?;
 
     // Emit a plan derived from the user's prompt so the client can see
     // the intended execution strategy before streaming begins.
@@ -1124,7 +1063,7 @@ async fn handle_prompt_request(
 
     let result = run_prompt_turn(
         PromptTurnEnvironment {
-            state,
+            store,
             llm_client,
             tool_registry,
             connection,
@@ -1141,12 +1080,12 @@ async fn handle_prompt_request(
         &mut notify,
     )
     .await;
-    clear_active_turn(state, &session_id)?;
+    store.clear_active_turn(&session_id)?;
     result
 }
 
 struct PromptTurnEnvironment<'a> {
-    state: &'a Arc<Mutex<AdapterState>>,
+    store: &'a SessionStore,
     llm_client: &'a dyn LlmClient,
     tool_registry: &'a dyn ToolRegistry,
     connection: Option<&'a dyn ToolCallRequester>,
@@ -1170,7 +1109,7 @@ async fn run_prompt_turn(
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
     let tool_definitions = env
         .tool_registry
-        .definitions(&env.tool_context, env.state)?;
+        .definitions(&env.tool_context, env.store)?;
 
     let mut stop_reason = StopReason::MaxTurnRequests;
 
@@ -1210,7 +1149,7 @@ async fn run_prompt_turn(
             report_tool_call(&env.request.session_id, notify, tool_call, tool_kind)?;
             let tool_result = env
                 .tool_registry
-                .execute(tool_call, &env.tool_context, env.state, env.connection)
+                .execute(tool_call, &env.tool_context, env.store, env.connection)
                 .await;
             report_tool_result(&env.request.session_id, notify, tool_call, &tool_result)?;
             messages.push(ChatMessage::tool_result(
@@ -1221,18 +1160,7 @@ async fn run_prompt_turn(
     }
 
     if stop_reason != StopReason::Cancelled {
-        let mut guard = env
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&env.request.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::invalid_params()
-                    .data(format!("unknown session id: {}", env.request.session_id.0))
-            })?;
-        session.history = messages;
+        env.store.save_history(&env.request.session_id, messages)?;
     }
 
     Ok(PromptResponse::new(stop_reason))
@@ -1410,27 +1338,17 @@ impl ReasoningEffort {
 }
 
 pub(crate) async fn request_tool_permission(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     context: &ToolContext,
     call: &DeepSeekToolCall,
     kind: ToolKind,
     requester: &dyn PermissionRequester,
 ) -> Result<PermissionDecision, agent_client_protocol::Error> {
-    let posture = {
-        let guard = state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard.sessions.get(&context.session_id).ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("unknown session id: {}", context.session_id.0))
-        })?;
+    if store.is_always_allowed(&context.session_id, call.name())? {
+        return Ok(PermissionDecision::AllowAlways);
+    }
 
-        if session.permission_allow_always.contains(call.name()) {
-            return Ok(PermissionDecision::AllowAlways);
-        }
-
-        session.mode
-    };
+    let posture = store.permission_posture(&context.session_id)?;
 
     if posture.allows_without_prompt(kind) {
         return Ok(PermissionDecision::AllowByMode);
@@ -1469,16 +1387,7 @@ pub(crate) async fn request_tool_permission(
     };
 
     if decision == PermissionDecision::AllowAlways {
-        let mut guard = state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard.sessions.get_mut(&context.session_id).ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("unknown session id: {}", context.session_id.0))
-        })?;
-        session
-            .permission_allow_always
-            .insert(call.name().to_string());
+        store.add_always_allow(&context.session_id, call.name().to_string())?;
     }
 
     Ok(decision)
@@ -1559,7 +1468,7 @@ trait ToolRegistry: Send + Sync {
     fn definitions(
         &self,
         context: &ToolContext,
-        state: &Arc<Mutex<AdapterState>>,
+        store: &SessionStore,
     ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error>;
 
     /// Return the ACP kind used when displaying and gating a tool call.
@@ -1570,7 +1479,7 @@ trait ToolRegistry: Send + Sync {
         &'a self,
         call: &'a DeepSeekToolCall,
         context: &'a ToolContext,
-        state: &'a Arc<Mutex<AdapterState>>,
+        store: &'a SessionStore,
         connection: Option<&'a dyn ToolCallRequester>,
     ) -> BoxFuture<'a, ToolExecution>;
 }
@@ -1584,7 +1493,7 @@ impl ToolRegistry for EmptyToolRegistry {
     fn definitions(
         &self,
         _context: &ToolContext,
-        _state: &Arc<Mutex<AdapterState>>,
+        _store: &SessionStore,
     ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
         Ok(Vec::new())
     }
@@ -1597,7 +1506,7 @@ impl ToolRegistry for EmptyToolRegistry {
         &'a self,
         call: &'a DeepSeekToolCall,
         _context: &'a ToolContext,
-        _state: &'a Arc<Mutex<AdapterState>>,
+        _store: &'a SessionStore,
         _connection: Option<&'a dyn ToolCallRequester>,
     ) -> BoxFuture<'a, ToolExecution> {
         Box::pin(async move { ToolExecution::failed(format!("unknown tool: {}", call.name())) })
@@ -1611,7 +1520,7 @@ impl ToolRegistry for AdapterToolRegistry {
     fn definitions(
         &self,
         context: &ToolContext,
-        state: &Arc<Mutex<AdapterState>>,
+        store: &SessionStore,
     ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
         let mut definitions = vec![
             read_file_tool_definition(),
@@ -1622,7 +1531,7 @@ impl ToolRegistry for AdapterToolRegistry {
             edit_file_tool_definition(),
             run_command_tool_definition(),
         ];
-        definitions.extend(session_mcp_tool_definitions(state, &context.session_id)?);
+        definitions.extend(store.mcp_definitions(&context.session_id)?);
         Ok(definitions)
     }
 
@@ -1641,7 +1550,7 @@ impl ToolRegistry for AdapterToolRegistry {
         &'a self,
         call: &'a DeepSeekToolCall,
         context: &'a ToolContext,
-        state: &'a Arc<Mutex<AdapterState>>,
+        store: &'a SessionStore,
         connection: Option<&'a dyn ToolCallRequester>,
     ) -> BoxFuture<'a, ToolExecution> {
         Box::pin(async move {
@@ -1659,7 +1568,7 @@ impl ToolRegistry for AdapterToolRegistry {
                 "grep" => grep_tool_execution(call, context),
                 "write_file" => {
                     write_file_tool_execution(
-                        state,
+                        store,
                         call,
                         context,
                         connection.map(|requester| requester as &dyn WriteTextFileRequester),
@@ -1669,7 +1578,7 @@ impl ToolRegistry for AdapterToolRegistry {
                 }
                 "edit_file" => {
                     edit_file_tool_execution(
-                        state,
+                        store,
                         call,
                         context,
                         connection.map(|requester| requester as &dyn ReadTextFileRequester),
@@ -1680,7 +1589,7 @@ impl ToolRegistry for AdapterToolRegistry {
                 }
                 "run_command" => {
                     run_command_tool_execution(
-                        state,
+                        store,
                         call,
                         context,
                         connection.map(|requester| requester as &dyn PermissionRequester),
@@ -1689,7 +1598,7 @@ impl ToolRegistry for AdapterToolRegistry {
                     .await
                 }
                 name if name.starts_with(MCP_TOOL_PREFIX) => {
-                    mcp_tool_execution(state, call, context).await
+                    mcp_tool_execution(store, call, context).await
                 }
                 _ => ToolExecution::failed(format!("unknown tool: {}", call.name())),
             }
@@ -1743,31 +1652,12 @@ struct McpToolTarget {
     peer: Peer<RoleClient>,
 }
 
-fn session_mcp_tool_definitions(
-    state: &Arc<Mutex<AdapterState>>,
-    session_id: &SessionId,
-) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
-    let guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let session = guard.sessions.get(session_id).ok_or_else(|| {
-        agent_client_protocol::Error::invalid_params()
-            .data(format!("unknown session id: {}", session_id.0))
-    })?;
-
-    Ok(session
-        .mcp_sessions
-        .iter()
-        .flat_map(|session| session.tools.iter().map(|tool| tool.definition.clone()))
-        .collect())
-}
-
 async fn mcp_tool_execution(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
 ) -> ToolExecution {
-    let target = match find_mcp_tool_target(state, &context.session_id, call.name()) {
+    let target = match find_mcp_tool_target(store, &context.session_id, call.name()) {
         Ok(Some(target)) => target,
         Ok(None) => return ToolExecution::failed(format!("unknown MCP tool: {}", call.name())),
         Err(error) => return ToolExecution::failed(error.to_string()),
@@ -1807,31 +1697,11 @@ async fn mcp_tool_execution(
 }
 
 fn find_mcp_tool_target(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     session_id: &SessionId,
     exposed_name: &str,
 ) -> Result<Option<McpToolTarget>, agent_client_protocol::Error> {
-    let guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let session = guard.sessions.get(session_id).ok_or_else(|| {
-        agent_client_protocol::Error::invalid_params()
-            .data(format!("unknown session id: {}", session_id.0))
-    })?;
-
-    Ok(session.mcp_sessions.iter().find_map(|mcp_session| {
-        mcp_session.tools.iter().find_map(|tool| {
-            if tool.exposed_name == exposed_name {
-                Some(McpToolTarget {
-                    server_name: mcp_session.name.clone(),
-                    original_name: tool.original_name.clone(),
-                    peer: mcp_session.peer.clone(),
-                })
-            } else {
-                None
-            }
-        })
-    }))
+    store.find_mcp_target(session_id, exposed_name)
 }
 
 fn mcp_call_arguments(call: &DeepSeekToolCall) -> Result<JsonObject, String> {
@@ -2054,7 +1924,7 @@ async fn read_file_tool_execution(
 }
 
 async fn write_file_tool_execution(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
     write_connection: Option<&dyn WriteTextFileRequester>,
@@ -2068,7 +1938,7 @@ async fn write_file_tool_execution(
     };
 
     if let Err(error) =
-        require_tool_permission(state, context, call, ToolKind::Edit, permission_requester).await
+        require_tool_permission(store, context, call, ToolKind::Edit, permission_requester).await
     {
         return ToolExecution::failed(error);
     }
@@ -2113,7 +1983,7 @@ async fn write_file_tool_execution(
 }
 
 async fn edit_file_tool_execution(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
     read_connection: Option<&dyn ReadTextFileRequester>,
@@ -2172,7 +2042,7 @@ async fn edit_file_tool_execution(
     }
 
     if let Err(error) =
-        require_tool_permission(state, context, call, ToolKind::Edit, permission_requester).await
+        require_tool_permission(store, context, call, ToolKind::Edit, permission_requester).await
     {
         return ToolExecution::failed(error);
     }
@@ -2210,7 +2080,7 @@ async fn edit_file_tool_execution(
 }
 
 async fn run_command_tool_execution(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
     permission_requester: Option<&dyn PermissionRequester>,
@@ -2228,7 +2098,7 @@ async fn run_command_tool_execution(
     }
 
     if let Err(error) = require_tool_permission(
-        state,
+        store,
         context,
         call,
         ToolKind::Execute,
@@ -2381,7 +2251,7 @@ async fn run_command_via_terminal(
 }
 
 async fn require_tool_permission(
-    state: &Arc<Mutex<AdapterState>>,
+    store: &SessionStore,
     context: &ToolContext,
     call: &DeepSeekToolCall,
     kind: ToolKind,
@@ -2394,7 +2264,7 @@ async fn require_tool_permission(
         )
     })?;
 
-    match request_tool_permission(state, context, call, kind, requester).await {
+    match request_tool_permission(store, context, call, kind, requester).await {
         Ok(
             PermissionDecision::AllowOnce
             | PermissionDecision::AllowAlways
@@ -3013,50 +2883,6 @@ fn build_initialize_response(_protocol_version: ProtocolVersion) -> InitializeRe
         .agent_info(Implementation::new(ADAPTER_NAME, ADAPTER_VERSION))
 }
 
-fn record_client_capabilities(
-    state: &Arc<Mutex<AdapterState>>,
-    client_capabilities: ClientCapabilities,
-) -> Result<(), agent_client_protocol::Error> {
-    let mut guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    guard.client_capabilities = Some(client_capabilities);
-    Ok(())
-}
-
-fn handle_cancel_notification(
-    state: &Arc<Mutex<AdapterState>>,
-    notification: &CancelNotification,
-) -> Result<(), agent_client_protocol::Error> {
-    let guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-
-    if let Some(active_turn) = guard
-        .sessions
-        .get(&notification.session_id)
-        .and_then(|session| session.active_turn.as_ref())
-    {
-        active_turn.cancel();
-    }
-
-    Ok(())
-}
-
-fn clear_active_turn(
-    state: &Arc<Mutex<AdapterState>>,
-    session_id: &SessionId,
-) -> Result<(), agent_client_protocol::Error> {
-    let mut guard = state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    if let Some(session) = guard.sessions.get_mut(session_id) {
-        session.active_turn = None;
-    }
-
-    Ok(())
-}
-
 fn validate_session_paths(request: &NewSessionRequest) -> Result<(), agent_client_protocol::Error> {
     if !request.cwd.is_absolute() {
         return Err(agent_client_protocol::Error::invalid_params()
@@ -3397,6 +3223,343 @@ struct SessionRecord {
     mcp_sessions: Vec<McpSession>,
 }
 
+/// Narrow boundary around shared adapter state.
+///
+/// `SessionStore` wraps the internal `Arc<Mutex<AdapterState>>` and exposes
+/// targeted methods for session lifecycle, config, permission cache, and
+/// active-turn management. Application code uses `SessionStore` directly
+/// instead of passing raw `Arc<Mutex<AdapterState>>` through every layer.
+#[derive(Debug, Clone)]
+struct SessionStore {
+    pub(crate) state: Arc<Mutex<AdapterState>>,
+}
+
+/// Snapshot of session data needed to begin a prompt turn.
+///
+/// Returned by [`SessionStore::begin_turn`] so the caller does not need to
+/// hold the lock across model streaming.
+#[derive(Debug)]
+struct TurnSetup {
+    messages: Vec<ChatMessage>,
+    tool_context: ToolContext,
+    model: String,
+    reasoning_effort: ReasoningEffort,
+}
+
+impl SessionStore {
+    /// Wrap an existing `Arc<Mutex<AdapterState>>` in a `SessionStore`.
+    fn new(state: Arc<Mutex<AdapterState>>) -> Self {
+        Self { state }
+    }
+
+    /// Store the client capabilities reported during initialization.
+    fn record_client_capabilities(
+        &self,
+        client_capabilities: ClientCapabilities,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        guard.client_capabilities = Some(client_capabilities);
+        Ok(())
+    }
+
+    /// Return a snapshot of every session for the `session/list` handler.
+    fn list_sessions(&self) -> Result<Vec<SessionInfo>, agent_client_protocol::Error> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        Ok(guard
+            .sessions
+            .iter()
+            .map(|(session_id, record)| {
+                SessionInfo::new(session_id.clone(), record.cwd.clone())
+                    .additional_directories(record.additional_directories.clone())
+            })
+            .collect())
+    }
+
+    /// Remove a session by id. Returns `true` if the session existed.
+    fn remove_session(&self, session_id: &SessionId) -> Result<bool, agent_client_protocol::Error> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        Ok(guard.sessions.remove(session_id).is_some())
+    }
+
+    /// Insert a new session record.
+    fn insert_session(
+        &self,
+        session_id: SessionId,
+        record: SessionRecord,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        guard.sessions.insert(session_id, record);
+        Ok(())
+    }
+
+    /// Return the default model identifier for new sessions.
+    fn default_model(&self) -> Result<String, agent_client_protocol::Error> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        Ok(guard.default_model.clone())
+    }
+
+    /// Look up a session and return a read-only reference via a callback.
+    ///
+    /// The lock is held only for the duration of the callback.
+    fn with_session<T>(
+        &self,
+        session_id: &SessionId,
+        f: impl FnOnce(&SessionRecord) -> Result<T, agent_client_protocol::Error>,
+    ) -> Result<T, agent_client_protocol::Error> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let session = guard.sessions.get(session_id).ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session id: {}", session_id.0))
+        })?;
+        f(session)
+    }
+
+    /// Look up a session and invoke a callback with a mutable reference.
+    ///
+    /// The lock is held only for the duration of the callback.
+    fn with_session_mut<T>(
+        &self,
+        session_id: &SessionId,
+        f: impl FnOnce(&mut SessionRecord) -> Result<T, agent_client_protocol::Error>,
+    ) -> Result<T, agent_client_protocol::Error> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let session = guard.sessions.get_mut(session_id).ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session id: {}", session_id.0))
+        })?;
+        f(session)
+    }
+
+    /// Return the MCP tool definitions registered for a session.
+    fn mcp_definitions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+        self.with_session(session_id, |session| {
+            Ok(session
+                .mcp_sessions
+                .iter()
+                .flat_map(|mcp| mcp.tools.iter().map(|tool| tool.definition.clone()))
+                .collect())
+        })
+    }
+
+    /// Find the MCP tool target for an exposed tool name within a session.
+    fn find_mcp_target(
+        &self,
+        session_id: &SessionId,
+        exposed_name: &str,
+    ) -> Result<Option<McpToolTarget>, agent_client_protocol::Error> {
+        self.with_session(session_id, |session| {
+            Ok(session.mcp_sessions.iter().find_map(|mcp_session| {
+                mcp_session.tools.iter().find_map(|tool| {
+                    if tool.exposed_name == exposed_name {
+                        Some(McpToolTarget {
+                            server_name: mcp_session.name.clone(),
+                            original_name: tool.original_name.clone(),
+                            peer: mcp_session.peer.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+            }))
+        })
+    }
+
+    /// Check whether a tool name is in the session's allow-always cache.
+    fn is_always_allowed(
+        &self,
+        session_id: &SessionId,
+        tool_name: &str,
+    ) -> Result<bool, agent_client_protocol::Error> {
+        self.with_session(session_id, |session| {
+            Ok(session.permission_allow_always.contains(tool_name))
+        })
+    }
+
+    /// Return the current permission posture (mode) for a session.
+    fn permission_posture(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<PermissionPosture, agent_client_protocol::Error> {
+        self.with_session(session_id, |session| Ok(session.mode))
+    }
+
+    /// Insert a tool name into the session's allow-always cache.
+    fn add_always_allow(
+        &self,
+        session_id: &SessionId,
+        tool_name: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.with_session_mut(session_id, |session| {
+            session.permission_allow_always.insert(tool_name);
+            Ok(())
+        })
+    }
+
+    /// Cancel the active turn token for a session, if one exists.
+    fn cancel_active_turn(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.with_session(session_id, |session| {
+            if let Some(token) = &session.active_turn {
+                token.cancel();
+            }
+            Ok(())
+        })
+    }
+
+    /// Clear the active turn token for a session.
+    fn clear_active_turn(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.with_session_mut(session_id, |session| {
+            session.active_turn = None;
+            Ok(())
+        })
+    }
+
+    /// Set the permission posture (mode) for a session.
+    fn set_mode(
+        &self,
+        session_id: &SessionId,
+        mode: PermissionPosture,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.with_session_mut(session_id, |session| {
+            session.mode = mode;
+            Ok(())
+        })
+    }
+
+    /// Set the model for a session.
+    fn set_model(
+        &self,
+        session_id: &SessionId,
+        model: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.with_session_mut(session_id, |session| {
+            session.model = model;
+            Ok(())
+        })
+    }
+
+    /// Set the reasoning effort for a session.
+    fn set_reasoning_effort(
+        &self,
+        session_id: &SessionId,
+        effort: ReasoningEffort,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.with_session_mut(session_id, |session| {
+            session.reasoning_effort = effort;
+            Ok(())
+        })
+    }
+
+    /// Prepare a session for a new prompt turn.
+    ///
+    /// Sets the active turn token atomically and returns the messages, tool
+    /// context, model, and reasoning effort the caller needs. Returns an error
+    /// if a turn is already active.
+    fn begin_turn(
+        &self,
+        session_id: &SessionId,
+        token: CancellationToken,
+        user_message: ChatMessage,
+    ) -> Result<TurnSetup, agent_client_protocol::Error> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let client_capabilities = guard.client_capabilities.clone();
+        let session = guard.sessions.get_mut(session_id).ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session id: {}", session_id.0))
+        })?;
+
+        if session.active_turn.is_some() {
+            return Err(
+                agent_client_protocol::Error::invalid_request().data(format!(
+                    "session {} already has an active turn",
+                    session_id.0
+                )),
+            );
+        }
+        session.active_turn = Some(token);
+
+        let mut messages = session.history.clone();
+        messages.push(user_message);
+        Ok(TurnSetup {
+            messages,
+            tool_context: ToolContext {
+                session_id: session_id.clone(),
+                cwd: session.cwd.clone(),
+                additional_directories: session.additional_directories.clone(),
+                client_capabilities,
+            },
+            model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort,
+        })
+    }
+
+    /// Persist the messages as the session history after a turn completes.
+    fn save_history(
+        &self,
+        session_id: &SessionId,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.with_session_mut(session_id, |session| {
+            session.history = messages;
+            Ok(())
+        })
+    }
+
+    /// Return the session config options for a session.
+    fn session_config_options(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionConfigOption>, agent_client_protocol::Error> {
+        self.with_session(session_id, |session| Ok(session_config_options(session)))
+    }
+
+    /// Look up a session record for a new-session response.
+    fn lookup_session(&self, session_id: &SessionId) -> Result<(), agent_client_protocol::Error> {
+        self.with_session(session_id, |_session| Ok(()))
+    }
+}
+
+/// Create a `SessionStore` backed by a fresh default adapter state.
+///
+/// This is a convenience for tests that previously created
+/// `Arc<Mutex<AdapterState>>` directly.
+#[cfg(test)]
+fn test_store() -> SessionStore {
+    SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3404,17 +3567,17 @@ mod tests {
         DevSmokeResult, EmptyToolRegistry, McpSession, MockLlmClient, ModelRequestSettings,
         PendingToolCalls, PermissionDecision, PermissionPosture, PermissionRequester,
         ReadTextFileRequester, ReasoningEffort, SESSION_CONFIG_MODEL_ID,
-        SESSION_CONFIG_REASONING_EFFORT_ID, ToolCallRequester, ToolContext, ToolExecution,
-        ToolRegistry, WriteTextFileRequester, build_dev_agent, build_initialize_response,
-        connect_mcp_sessions, edit_file_tool_execution, exercise_permission_gate_smoke,
-        glob_tool_execution, grep_tool_execution, handle_authenticate_request,
-        handle_cancel_notification, handle_close_session_request, handle_initialize_request,
+        SESSION_CONFIG_REASONING_EFFORT_ID, SessionStore, ToolCallRequester, ToolContext,
+        ToolExecution, ToolRegistry, WriteTextFileRequester, build_dev_agent,
+        build_initialize_response, connect_mcp_sessions, edit_file_tool_execution,
+        exercise_permission_gate_smoke, glob_tool_execution, grep_tool_execution,
+        handle_authenticate_request, handle_close_session_request, handle_initialize_request,
         handle_list_sessions_request, handle_logout_request, handle_new_session_request,
         handle_prompt_request, handle_set_session_config_option_request,
         handle_set_session_mode_request, list_dir_tool_execution, llm_client_for_backend,
         mcp_tool_mappings, print_dev_smoke_result, read_file_tool_execution,
         request_tool_permission, run_command_tool_execution, run_smoke_flow, serve_with_transport,
-        write_file_tool_execution,
+        test_store, write_file_tool_execution,
     };
     use agent_client_protocol::schema::{McpServer, McpServerStdio};
     use agent_client_protocol::{Agent, Channel, Client};
@@ -3577,7 +3740,7 @@ mod tests {
         fn definitions(
             &self,
             _context: &ToolContext,
-            _state: &Arc<Mutex<AdapterState>>,
+            _store: &SessionStore,
         ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
             Ok(self.definitions.clone())
         }
@@ -3590,7 +3753,7 @@ mod tests {
             &'a self,
             call: &'a DeepSeekToolCall,
             _context: &'a ToolContext,
-            _state: &'a Arc<Mutex<AdapterState>>,
+            _store: &'a SessionStore,
             _connection: Option<&'a dyn ToolCallRequester>,
         ) -> BoxFuture<'a, ToolExecution> {
             Box::pin(async move {
@@ -3802,7 +3965,7 @@ mod tests {
     }
 
     type PermissionModeFixture = (
-        Arc<Mutex<AdapterState>>,
+        SessionStore,
         agent_client_protocol::schema::SessionId,
         ToolContext,
         DeepSeekToolCall,
@@ -3810,8 +3973,8 @@ mod tests {
     );
 
     fn permission_mode_fixture() -> Result<PermissionModeFixture, agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -3829,7 +3992,7 @@ mod tests {
             serde_json::json!({ "command": "echo hi" }).to_string(),
         );
 
-        Ok((state, session.session_id, context, edit_call, shell_call))
+        Ok((store, session.session_id, context, edit_call, shell_call))
     }
 
     fn select_current_value(
@@ -3996,7 +4159,7 @@ mod tests {
     #[test_log::test]
     fn initialize_handshake_records_client_capabilities() -> Result<(), agent_client_protocol::Error>
     {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let request = InitializeRequest::new(ProtocolVersion::LATEST).client_capabilities(
             ClientCapabilities::new()
                 .fs(FileSystemCapabilities::new()
@@ -4005,10 +4168,11 @@ mod tests {
                 .terminal(true),
         );
 
-        let response = handle_initialize_request(&state, request)?;
+        let response = handle_initialize_request(&store, request)?;
 
         assert_eq!(response.protocol_version, ProtocolVersion::LATEST);
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         assert_eq!(
@@ -4034,8 +4198,8 @@ mod tests {
 
     #[test_log::test]
     fn new_session_returns_id_and_mode() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let response = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         assert!(response.session_id.0.starts_with("session-"));
         let modes = response
@@ -4062,7 +4226,8 @@ mod tests {
                 .any(|mode| mode.id.0.as_ref() == "yolo")
         );
 
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         assert!(guard.sessions.contains_key(&response.session_id));
@@ -4073,8 +4238,8 @@ mod tests {
     #[test_log::test]
     fn new_session_advertises_model_and_reasoning_config_options()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let response = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let options = response
             .config_options
             .ok_or_else(agent_client_protocol::Error::internal_error)?;
@@ -4156,11 +4321,12 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn adapter_registry_exposes_and_executes_session_mcp_tools()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let response = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let mcp_session = connected_echo_mcp_session().await?;
         {
-            let mut guard = state
+            let mut guard = store
+                .state
                 .lock()
                 .map_err(agent_client_protocol::Error::into_internal_error)?;
             let session = guard
@@ -4179,7 +4345,7 @@ mod tests {
             client_capabilities: None,
         };
         let registry = AdapterToolRegistry;
-        let definitions = registry.definitions(&context, &state)?;
+        let definitions = registry.definitions(&context, &store)?;
         assert!(
             definitions
                 .iter()
@@ -4194,7 +4360,7 @@ mod tests {
                     serde_json::json!({ "message": "hello" }).to_string(),
                 ),
                 &context,
-                &state,
+                &store,
                 None,
             )
             .await;
@@ -4207,16 +4373,17 @@ mod tests {
 
     #[test_log::test]
     fn set_mode_updates_session_state() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         let response = handle_set_session_mode_request(
-            &state,
+            &store,
             &SetSessionModeRequest::new(session.session_id.clone(), "accept-edits"),
         )?;
 
         assert!(response.meta.is_none());
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
@@ -4230,11 +4397,11 @@ mod tests {
     #[test_log::test]
     fn set_config_option_updates_session_model_and_reasoning()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         let model_response = handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(
                 session.session_id.clone(),
                 SESSION_CONFIG_MODEL_ID,
@@ -4247,7 +4414,7 @@ mod tests {
         );
 
         let reasoning_response = handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(
                 session.session_id.clone(),
                 SESSION_CONFIG_REASONING_EFFORT_ID,
@@ -4262,7 +4429,8 @@ mod tests {
             "max"
         );
 
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
@@ -4276,11 +4444,11 @@ mod tests {
 
     #[test_log::test]
     fn set_config_option_rejects_unknown_option() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         let Err(error) = handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(session.session_id, "unknown", "value"),
         ) else {
             return Err(agent_client_protocol::Error::internal_error()
@@ -4295,10 +4463,10 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn prompt_uses_updated_session_model_and_reasoning()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(
                 session.session_id.clone(),
                 SESSION_CONFIG_MODEL_ID,
@@ -4306,7 +4474,7 @@ mod tests {
             ),
         )?;
         handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(
                 session.session_id.clone(),
                 SESSION_CONFIG_REASONING_EFFORT_ID,
@@ -4318,7 +4486,7 @@ mod tests {
         let requests = client.requests();
 
         let response = handle_prompt_request(
-            &state,
+            &store,
             &client,
             &EmptyToolRegistry,
             None,
@@ -4342,8 +4510,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn permission_request_prompts_and_caches_allow_always()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -4362,7 +4530,7 @@ mod tests {
         )]);
 
         let decision =
-            request_tool_permission(&state, &context, &call, ToolKind::Edit, &requester).await?;
+            request_tool_permission(&store, &context, &call, ToolKind::Edit, &requester).await?;
 
         assert_eq!(decision, PermissionDecision::AllowAlways);
         let requests = requester.requests();
@@ -4395,7 +4563,7 @@ mod tests {
 
         let second_requester = FakePermissionRequester::new(Vec::new());
         let second_decision =
-            request_tool_permission(&state, &context, &call, ToolKind::Edit, &second_requester)
+            request_tool_permission(&store, &context, &call, ToolKind::Edit, &second_requester)
                 .await?;
 
         assert_eq!(second_decision, PermissionDecision::AllowAlways);
@@ -4405,7 +4573,8 @@ mod tests {
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         assert!(second_guard.is_empty());
 
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
@@ -4419,8 +4588,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn permission_request_rejects_without_caching() -> Result<(), agent_client_protocol::Error>
     {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -4439,7 +4608,7 @@ mod tests {
         )]);
 
         let decision =
-            request_tool_permission(&state, &context, &call, ToolKind::Execute, &requester).await?;
+            request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester).await?;
 
         assert_eq!(decision, PermissionDecision::RejectOnce);
         let requests = requester.requests();
@@ -4449,7 +4618,8 @@ mod tests {
         assert_eq!(request_guard.len(), 1);
         drop(request_guard);
 
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
@@ -4463,7 +4633,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn permission_posture_ask_prompts_all_mutations()
     -> Result<(), agent_client_protocol::Error> {
-        let (state, _session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
+        let (store, _session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
         let requester = FakePermissionRequester::new(vec![
             RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
                 SelectedPermissionOutcome::new(super::PERMISSION_ALLOW_ONCE_OPTION_ID),
@@ -4474,12 +4644,12 @@ mod tests {
         ]);
 
         assert_eq!(
-            request_tool_permission(&state, &context, &edit_call, ToolKind::Edit, &requester)
+            request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester)
                 .await?,
             PermissionDecision::AllowOnce
         );
         assert_eq!(
-            request_tool_permission(&state, &context, &shell_call, ToolKind::Execute, &requester)
+            request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
                 .await?,
             PermissionDecision::AllowOnce
         );
@@ -4498,9 +4668,9 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn permission_posture_accept_edits_skips_edit_prompts()
     -> Result<(), agent_client_protocol::Error> {
-        let (state, session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
+        let (store, session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
         handle_set_session_mode_request(
-            &state,
+            &store,
             &SetSessionModeRequest::new(session_id.clone(), "accept-edits"),
         )?;
         let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
@@ -4510,12 +4680,12 @@ mod tests {
         )]);
 
         assert_eq!(
-            request_tool_permission(&state, &context, &edit_call, ToolKind::Edit, &requester)
+            request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester)
                 .await?,
             PermissionDecision::AllowByMode
         );
         assert_eq!(
-            request_tool_permission(&state, &context, &shell_call, ToolKind::Execute, &requester)
+            request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
                 .await?,
             PermissionDecision::AllowOnce
         );
@@ -4528,7 +4698,8 @@ mod tests {
             1
         );
 
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let stored = guard.sessions.get(&session_id).ok_or_else(|| {
@@ -4542,17 +4713,17 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn permission_posture_yolo_auto_allows_all_mutations()
     -> Result<(), agent_client_protocol::Error> {
-        let (state, session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
-        handle_set_session_mode_request(&state, &SetSessionModeRequest::new(session_id, "yolo"))?;
+        let (store, session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
+        handle_set_session_mode_request(&store, &SetSessionModeRequest::new(session_id, "yolo"))?;
         let requester = FakePermissionRequester::new(Vec::new());
 
         assert_eq!(
-            request_tool_permission(&state, &context, &edit_call, ToolKind::Edit, &requester)
+            request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester)
                 .await?,
             PermissionDecision::AllowByMode
         );
         assert_eq!(
-            request_tool_permission(&state, &context, &shell_call, ToolKind::Execute, &requester)
+            request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
                 .await?,
             PermissionDecision::AllowByMode
         );
@@ -4570,8 +4741,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_protocol::Error>
     {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let client = FakeLlmClient::new(vec![
             Ok(StreamEvent::Thought("thinking".to_string())),
             Ok(StreamEvent::Message("hello".to_string())),
@@ -4582,7 +4753,7 @@ mod tests {
         let mut notifications = Vec::new();
 
         let response = handle_prompt_request(
-            &state,
+            &store,
             &client,
             &EmptyToolRegistry,
             None,
@@ -4618,7 +4789,8 @@ mod tests {
         assert_eq!(request_guard[0].messages()[0].content(), "hi");
         drop(request_guard);
 
-        let state_guard = state
+        let state_guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let stored = state_guard
@@ -4636,8 +4808,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let session_id = session.session_id.clone();
         let client = Arc::new(FakeLlmClient::with_steps(vec![
             FakeStreamStep::Event(Ok(StreamEvent::Message("partial".to_string()))),
@@ -4646,12 +4818,12 @@ mod tests {
         let (notification_tx, mut notification_rx) =
             tokio::sync::mpsc::unbounded_channel::<SessionNotification>();
 
-        let prompt_state = Arc::clone(&state);
+        let prompt_store = store.clone();
         let prompt_session_id = session_id.clone();
         let prompt_client = Arc::clone(&client);
         let prompt_task = tokio::spawn(async move {
             handle_prompt_request(
-                &prompt_state,
+                &prompt_store,
                 prompt_client.as_ref(),
                 &EmptyToolRegistry,
                 None,
@@ -4687,13 +4859,14 @@ mod tests {
         };
         assert_eq!(text.text, "partial");
 
-        handle_cancel_notification(&state, &CancelNotification::new(session_id.clone()))?;
+        store.cancel_active_turn(&CancelNotification::new(session_id.clone()).session_id)?;
         let response = prompt_task
             .await
             .map_err(agent_client_protocol::Error::into_internal_error)??;
 
         assert_eq!(response.stop_reason, StopReason::Cancelled);
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let session = guard.sessions.get(&session_id).ok_or_else(|| {
@@ -4753,8 +4926,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn prompt_executes_tool_calls_and_replays_results()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let client = FakeLlmClient::with_streams(vec![
             vec![
                 FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
@@ -4782,7 +4955,7 @@ mod tests {
         let mut notifications = Vec::new();
 
         let response = handle_prompt_request(
-            &state,
+            &store,
             &client,
             &registry,
             None,
@@ -4844,8 +5017,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn prompt_tool_loop_stops_at_max_turn_requests()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let limit = DEFAULT_MAX_TURN_REQUESTS.get();
         let mut streams = (0..limit)
             .map(|index| {
@@ -4869,7 +5042,7 @@ mod tests {
         let registry = FakeToolRegistry::new();
 
         let response = handle_prompt_request(
-            &state,
+            &store,
             &client,
             &registry,
             None,
@@ -4886,7 +5059,8 @@ mod tests {
         assert_eq!(request_guard.len(), limit);
         drop(request_guard);
 
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let record = guard.sessions.get(&session.session_id).ok_or_else(|| {
@@ -4899,14 +5073,14 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let first_client = FakeLlmClient::new(vec![
             Ok(StreamEvent::Message("first answer".to_string())),
             Ok(StreamEvent::Finished(FinishReason::EndTurn)),
         ]);
         handle_prompt_request(
-            &state,
+            &store,
             &first_client,
             &EmptyToolRegistry,
             None,
@@ -4923,7 +5097,7 @@ mod tests {
             FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::MaxTokens))]);
         let second_requests = second_client.requests();
         let response = handle_prompt_request(
-            &state,
+            &store,
             &second_client,
             &EmptyToolRegistry,
             None,
@@ -5212,8 +5386,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_root)
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: temp_root.clone(),
@@ -5242,7 +5416,7 @@ mod tests {
         );
 
         let result = write_file_tool_execution(
-            &state,
+            &store,
             &call,
             &context,
             Some(&write_requester as &dyn WriteTextFileRequester),
@@ -5276,8 +5450,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_root)
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: temp_root.clone(),
@@ -5311,7 +5485,7 @@ mod tests {
         );
 
         let result = edit_file_tool_execution(
-            &state,
+            &store,
             &call,
             &context,
             Some(&read_requester as &dyn ReadTextFileRequester),
@@ -5351,8 +5525,8 @@ mod tests {
             std::env::temp_dir().join(format!("deepseek-acp-adapter-write-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root)
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: temp_root.clone(),
@@ -5376,7 +5550,7 @@ mod tests {
         );
 
         let write_result =
-            write_file_tool_execution(&state, &write_call, &context, None, Some(&write_requester))
+            write_file_tool_execution(&store, &write_call, &context, None, Some(&write_requester))
                 .await;
 
         assert!(write_result.success);
@@ -5404,7 +5578,7 @@ mod tests {
         );
 
         let edit_result = edit_file_tool_execution(
-            &state,
+            &store,
             &edit_call,
             &context,
             None,
@@ -5432,8 +5606,8 @@ mod tests {
             std::env::temp_dir().join(format!("deepseek-acp-adapter-command-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root)
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: temp_root,
@@ -5452,7 +5626,7 @@ mod tests {
         );
 
         let result =
-            run_command_tool_execution(&state, &call, &context, Some(&requester), None).await;
+            run_command_tool_execution(&store, &call, &context, Some(&requester), None).await;
 
         assert!(result.success);
         assert!(result.content.contains("stdout:"));
@@ -5489,7 +5663,7 @@ mod tests {
             additional_directories: Vec::new(),
             client_capabilities: None,
         };
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let registry = AdapterToolRegistry;
 
         let list_result = registry
@@ -5500,7 +5674,7 @@ mod tests {
                     serde_json::json!({ "path": "." }).to_string(),
                 ),
                 &context,
-                &state,
+                &store,
                 None,
             )
             .await;
@@ -5519,7 +5693,7 @@ mod tests {
                     serde_json::json!({ "pattern": "**/*.rs" }).to_string(),
                 ),
                 &context,
-                &state,
+                &store,
                 None,
             )
             .await;
@@ -5556,7 +5730,7 @@ mod tests {
             additional_directories: Vec::new(),
             client_capabilities: None,
         };
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let registry = AdapterToolRegistry;
 
         let result = registry
@@ -5567,7 +5741,7 @@ mod tests {
                     serde_json::json!({ "pattern": "needle" }).to_string(),
                 ),
                 &context,
-                &state,
+                &store,
                 None,
             )
             .await;
@@ -5584,11 +5758,11 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn dev_smoke_flow_runs_initialize_new_and_prompt()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
         let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
         let (client_transport, server_transport) = Channel::duplex();
-        let server_state = Arc::clone(&state);
+        let server_state = Arc::clone(&store.state);
         let server_client = Arc::clone(&llm_client);
         let server_tools = Arc::clone(&tool_registry);
 
@@ -5738,7 +5912,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn request_permission_handles_unknown_session_and_cancelled()
     -> Result<(), agent_client_protocol::Error> {
-        let missing_state = Arc::new(Mutex::new(AdapterState::default()));
+        let missing_store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())));
         let missing_context = ToolContext {
             session_id: agent_client_protocol::schema::SessionId::new("missing-session"),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -5753,7 +5927,7 @@ mod tests {
         let missing_requester = FakePermissionRequester::new(Vec::new());
 
         let Err(error) = request_tool_permission(
-            &missing_state,
+            &missing_store,
             &missing_context,
             &missing_call,
             ToolKind::Edit,
@@ -5766,8 +5940,8 @@ mod tests {
         };
         assert!(error.to_string().contains("unknown session id"));
 
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -5784,7 +5958,7 @@ mod tests {
         )]);
 
         assert_eq!(
-            request_tool_permission(&state, &context, &call, ToolKind::Execute, &requester).await?,
+            request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester).await?,
             PermissionDecision::Cancelled
         );
 
@@ -5967,10 +6141,11 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn prompt_request_rejects_active_turn() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         {
-            let mut guard = state
+            let mut guard = store
+                .state
                 .lock()
                 .map_err(agent_client_protocol::Error::into_internal_error)?;
             let record = guard.sessions.get_mut(&session.session_id).ok_or_else(|| {
@@ -5980,7 +6155,7 @@ mod tests {
         }
 
         let Err(error) = handle_prompt_request(
-            &state,
+            &store,
             &MockLlmClient,
             &EmptyToolRegistry,
             None,
@@ -6175,11 +6350,11 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn serve_with_transport_handles_authenticate_and_mode_updates()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
         let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
         let (client_transport, server_transport) = Channel::duplex();
-        let server_state = Arc::clone(&state);
+        let server_state = Arc::clone(&store.state);
         let server_client = Arc::clone(&llm_client);
         let server_tools = Arc::clone(&tool_registry);
 
@@ -6242,13 +6417,13 @@ mod tests {
             additional_directories: Vec::new(),
             client_capabilities: None,
         };
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
 
         let empty_result = EmptyToolRegistry
             .execute(
                 &DeepSeekToolCall::new("empty", "anything", "{}"),
                 &context,
-                &state,
+                &store,
                 None,
             )
             .await;
@@ -6259,7 +6434,7 @@ mod tests {
             .execute(
                 &DeepSeekToolCall::new("read-only", "bogus", "{}"),
                 &context,
-                &state,
+                &store,
                 None,
             )
             .await;
@@ -6287,11 +6462,11 @@ mod tests {
     #[test_log::test]
     fn handle_set_session_mode_request_rejects_invalid_inputs()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         let Err(error) = handle_set_session_mode_request(
-            &state,
+            &store,
             &SetSessionModeRequest::new(session.session_id.clone(), "bogus"),
         ) else {
             return Err(agent_client_protocol::Error::internal_error()
@@ -6300,7 +6475,7 @@ mod tests {
         assert!(error.to_string().contains("unsupported session mode"));
 
         let Err(error) = handle_set_session_mode_request(
-            &state,
+            &store,
             &SetSessionModeRequest::new(
                 agent_client_protocol::schema::SessionId::new("missing"),
                 "ask",
@@ -6317,9 +6492,9 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn handle_prompt_request_rejects_unknown_session()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let Err(error) = handle_prompt_request(
-            &state,
+            &store,
             &MockLlmClient,
             &EmptyToolRegistry,
             None,
@@ -6343,8 +6518,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn request_permission_rejects_unknown_option() -> Result<(), agent_client_protocol::Error>
     {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -6361,7 +6536,7 @@ mod tests {
         )]);
 
         let Err(error) =
-            request_tool_permission(&state, &context, &call, ToolKind::Edit, &requester).await
+            request_tool_permission(&store, &context, &call, ToolKind::Edit, &requester).await
         else {
             return Err(agent_client_protocol::Error::internal_error()
                 .data("expected unknown permission option to fail"));
@@ -6377,8 +6552,8 @@ mod tests {
 
     #[test]
     fn list_sessions_returns_empty_when_no_sessions() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let response = handle_list_sessions_request(&state, &ListSessionsRequest::new())?;
+        let store = test_store();
+        let response = handle_list_sessions_request(&store, &ListSessionsRequest::new())?;
 
         assert!(response.sessions.is_empty());
         Ok(())
@@ -6386,11 +6561,11 @@ mod tests {
 
     #[test]
     fn list_sessions_returns_active_sessions() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session1 = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
-        let session2 = handle_new_session_request(&state, &NewSessionRequest::new("/home"))?;
+        let store = test_store();
+        let session1 = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let session2 = handle_new_session_request(&store, &NewSessionRequest::new("/home"))?;
 
-        let response = handle_list_sessions_request(&state, &ListSessionsRequest::new())?;
+        let response = handle_list_sessions_request(&store, &ListSessionsRequest::new())?;
 
         assert_eq!(response.sessions.len(), 2);
         let ids: Vec<_> = response
@@ -6405,11 +6580,11 @@ mod tests {
 
     #[test]
     fn close_session_removes_session() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         let close_response = handle_close_session_request(
-            &state,
+            &store,
             &CloseSessionRequest::new(session.session_id.clone()),
         )?;
 
@@ -6419,18 +6594,18 @@ mod tests {
             serde_json::json!({})
         );
 
-        let list_response = handle_list_sessions_request(&state, &ListSessionsRequest::new())?;
+        let list_response = handle_list_sessions_request(&store, &ListSessionsRequest::new())?;
         assert!(list_response.sessions.is_empty());
         Ok(())
     }
 
     #[test]
     fn close_session_rejects_unknown_session() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let unknown_id = agent_client_protocol::schema::SessionId::new("nonexistent");
 
         let Err(error) =
-            handle_close_session_request(&state, &CloseSessionRequest::new(unknown_id))
+            handle_close_session_request(&store, &CloseSessionRequest::new(unknown_id))
         else {
             return Err(agent_client_protocol::Error::internal_error()
                 .data("expected unknown session id to fail"));
@@ -6594,9 +6769,10 @@ mod tests {
 
     #[test]
     fn validate_session_model_accepts_known_models() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
-        let guard = state
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let record = guard.sessions.get(&session.session_id).ok_or_else(|| {
@@ -6612,9 +6788,10 @@ mod tests {
 
     #[test]
     fn validate_session_model_rejects_unknown_models() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
-        let guard = state
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let record = guard.sessions.get(&session.session_id).ok_or_else(|| {
@@ -6686,11 +6863,11 @@ mod tests {
     #[test]
     fn new_session_with_mcp_servers_rejected_synchronously()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let request = NewSessionRequest::new("/tmp").mcp_servers(vec![McpServer::Stdio(
             McpServerStdio::new("test", "/usr/bin/true"),
         )]);
-        let Err(error) = handle_new_session_request(&state, &request) else {
+        let Err(error) = handle_new_session_request(&store, &request) else {
             return Err(agent_client_protocol::Error::internal_error()
                 .data("expected MCP session request to be rejected"));
         };
@@ -6706,8 +6883,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn require_tool_permission_rejects() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -6726,7 +6903,7 @@ mod tests {
         )]);
 
         let Err(error) = super::require_tool_permission(
-            &state,
+            &store,
             &context,
             &call,
             ToolKind::Execute,
@@ -6742,8 +6919,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -6760,7 +6937,7 @@ mod tests {
         )]);
 
         let Err(error) = super::require_tool_permission(
-            &state,
+            &store,
             &context,
             &call,
             ToolKind::Execute,
@@ -6778,7 +6955,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn require_tool_permission_missing_requester() {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let context = ToolContext {
             session_id: agent_client_protocol::schema::SessionId::new("no-connection"),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -6787,7 +6964,7 @@ mod tests {
         };
         let call = DeepSeekToolCall::new("id", "tool", "{}");
         let Err(error) =
-            super::require_tool_permission(&state, &context, &call, ToolKind::Edit, None).await
+            super::require_tool_permission(&store, &context, &call, ToolKind::Edit, None).await
         else {
             return;
         };
@@ -6843,11 +7020,11 @@ mod tests {
 
     #[test]
     fn set_config_option_updates_mode() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         let response = handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(
                 session.session_id.clone(),
                 super::SESSION_CONFIG_MODE_ID,
@@ -6860,7 +7037,8 @@ mod tests {
             "yolo"
         );
 
-        let guard = state
+        let guard = store
+            .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
@@ -6872,11 +7050,11 @@ mod tests {
 
     #[test]
     fn set_config_option_rejects_invalid_mode() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         let Err(error) = handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(
                 session.session_id,
                 super::SESSION_CONFIG_MODE_ID,
@@ -6893,11 +7071,11 @@ mod tests {
     #[test]
     fn set_config_option_rejects_invalid_reasoning_effort()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
 
         let Err(error) = handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(
                 session.session_id,
                 super::SESSION_CONFIG_REASONING_EFFORT_ID,
@@ -6915,7 +7093,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn run_command_rejects_empty_command() {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let context = ToolContext {
             session_id: agent_client_protocol::schema::SessionId::new("empty-cmd"),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -6927,7 +7105,7 @@ mod tests {
             "run_command",
             serde_json::json!({ "command": "   " }).to_string(),
         );
-        let result = run_command_tool_execution(&state, &call, &context, None, None).await;
+        let result = run_command_tool_execution(&store, &call, &context, None, None).await;
         assert!(!result.success);
         assert!(result.content.contains("command must not be empty"));
     }
@@ -6988,8 +7166,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn mcp_tool_execution_unknown_tool() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -6997,7 +7175,7 @@ mod tests {
             client_capabilities: None,
         };
         let call = DeepSeekToolCall::new("mcp-unknown", "mcp__nonexistent__tool", "{}");
-        let result = super::mcp_tool_execution(&state, &call, &context).await;
+        let result = super::mcp_tool_execution(&store, &call, &context).await;
         assert!(!result.success);
         assert!(result.content.contains("unknown MCP tool"));
         Ok(())
@@ -7098,9 +7276,9 @@ mod tests {
 
     #[test]
     fn set_config_option_rejects_unknown_session() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let Err(error) = handle_set_session_config_option_request(
-            &state,
+            &store,
             &SetSessionConfigOptionRequest::new(
                 agent_client_protocol::schema::SessionId::new("missing"),
                 super::SESSION_CONFIG_MODEL_ID,
@@ -7118,9 +7296,9 @@ mod tests {
 
     #[test]
     fn set_mode_rejects_unknown_session() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let Err(error) = handle_set_session_mode_request(
-            &state,
+            &store,
             &SetSessionModeRequest::new(
                 agent_client_protocol::schema::SessionId::new("missing"),
                 "ask",
@@ -7393,7 +7571,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn edit_file_rejects_empty_old_text() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let temp_root = std::env::temp_dir().join(format!(
             "deepseek-acp-adapter-edit-empty-{}",
             Uuid::new_v4()
@@ -7403,7 +7581,7 @@ mod tests {
         std::fs::write(temp_root.join("f.txt"), "content")
             .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: temp_root.clone(),
@@ -7421,7 +7599,7 @@ mod tests {
             .to_string(),
         );
 
-        let result = edit_file_tool_execution(&state, &call, &context, None, None, None).await;
+        let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
         assert!(!result.success);
         assert!(result.content.contains("old_text must not be empty"));
         Ok(())
@@ -7429,7 +7607,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn edit_file_rejects_old_text_not_found() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let temp_root =
             std::env::temp_dir().join(format!("deepseek-acp-adapter-edit-nf-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root)
@@ -7437,7 +7615,7 @@ mod tests {
         std::fs::write(temp_root.join("f.txt"), "content")
             .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: temp_root.clone(),
@@ -7455,7 +7633,7 @@ mod tests {
             .to_string(),
         );
 
-        let result = edit_file_tool_execution(&state, &call, &context, None, None, None).await;
+        let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
         assert!(!result.success);
         assert!(result.content.contains("could not find old_text"));
         Ok(())
@@ -7463,7 +7641,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn edit_file_rejects_multiple_matches() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let temp_root = std::env::temp_dir().join(format!(
             "deepseek-acp-adapter-edit-multi-{}",
             Uuid::new_v4()
@@ -7473,7 +7651,7 @@ mod tests {
         std::fs::write(temp_root.join("f.txt"), "dup dup")
             .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: temp_root.clone(),
@@ -7491,7 +7669,7 @@ mod tests {
             .to_string(),
         );
 
-        let result = edit_file_tool_execution(&state, &call, &context, None, None, None).await;
+        let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
         assert!(!result.success);
         assert!(result.content.contains("found old_text"));
         assert!(result.content.contains("2 times"));
@@ -7502,8 +7680,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn write_file_rejects_invalid_arguments() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -7512,7 +7690,7 @@ mod tests {
         };
         let call = DeepSeekToolCall::new("write-invalid", "write_file", "not json");
 
-        let result = write_file_tool_execution(&state, &call, &context, None, None).await;
+        let result = write_file_tool_execution(&store, &call, &context, None, None).await;
         assert!(!result.success);
         assert!(result.content.contains("invalid write_file arguments"));
         Ok(())
@@ -7522,8 +7700,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn run_command_rejects_invalid_arguments() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -7532,7 +7710,7 @@ mod tests {
         };
         let call = DeepSeekToolCall::new("run-invalid", "run_command", "not json");
 
-        let result = run_command_tool_execution(&state, &call, &context, None, None).await;
+        let result = run_command_tool_execution(&store, &call, &context, None, None).await;
         assert!(!result.success);
         assert!(result.content.contains("invalid run_command arguments"));
         Ok(())
@@ -7542,8 +7720,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn edit_file_rejects_invalid_arguments() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let context = ToolContext {
             session_id: session.session_id.clone(),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -7552,7 +7730,7 @@ mod tests {
         };
         let call = DeepSeekToolCall::new("edit-invalid", "edit_file", "not json");
 
-        let result = edit_file_tool_execution(&state, &call, &context, None, None, None).await;
+        let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
         assert!(!result.success);
         assert!(result.content.contains("invalid edit_file arguments"));
         Ok(())
@@ -7653,10 +7831,10 @@ mod tests {
 
     #[test]
     fn set_mode_rejects_invalid_mode_id() -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let Err(error) = handle_set_session_mode_request(
-            &state,
+            &store,
             &SetSessionModeRequest::new(session.session_id, "bogus"),
         ) else {
             return Err(agent_client_protocol::Error::internal_error()
@@ -7865,9 +8043,9 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn new_session_connected_async_path_creates_session()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let response =
-            super::handle_new_session_request_connected(&state, &NewSessionRequest::new("/tmp"))
+            super::handle_new_session_request_connected(&store, &NewSessionRequest::new("/tmp"))
                 .await?;
         assert!(response.session_id.0.starts_with("session-"));
         Ok(())
@@ -7878,11 +8056,11 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn serve_with_transport_exercises_list_close_and_logout()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
         let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
         let (client_transport, server_transport) = Channel::duplex();
-        let server_state = Arc::clone(&state);
+        let server_state = Arc::clone(&store.state);
         let server_client = Arc::clone(&llm_client);
         let server_tools = Arc::clone(&tool_registry);
 
@@ -7948,8 +8126,8 @@ mod tests {
         std::fs::create_dir_all(&temp_root)
             .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-        let state = Arc::new(Mutex::new(AdapterState::default()));
-        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let context = ToolContext {
             session_id: session.session_id,
             cwd: temp_root,
@@ -7967,7 +8145,7 @@ mod tests {
                     serde_json::json!({ "path": "out.txt", "content": "data" }).to_string(),
                 ),
                 &context,
-                &state,
+                &store,
                 None,
             )
             .await;
@@ -7981,7 +8159,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn request_permission_unknown_session_error_path()
     -> Result<(), agent_client_protocol::Error> {
-        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let store = test_store();
         let context = ToolContext {
             session_id: agent_client_protocol::schema::SessionId::new("no-such-session"),
             cwd: std::path::PathBuf::from("/tmp"),
@@ -7992,7 +8170,7 @@ mod tests {
         let requester = FakePermissionRequester::new(Vec::new());
 
         let Err(error) =
-            request_tool_permission(&state, &context, &call, ToolKind::Edit, &requester).await
+            request_tool_permission(&store, &context, &call, ToolKind::Edit, &requester).await
         else {
             return Err(agent_client_protocol::Error::internal_error()
                 .data("expected unknown session error"));
