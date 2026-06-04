@@ -16,6 +16,63 @@
 //! The adapter proper still needs the ACP session layer, but the DeepSeek-side
 //! seam lives here so it can be tested in isolation and reused by the later
 //! protocol wiring.
+//!
+//! # Overview
+//!
+//! The [`deepseek`] module exposes:
+//! - request primitives such as [`deepseek::ChatMessage`] and [`deepseek::ChatRequest`]
+//! - tool advertisement types such as [`deepseek::ToolDefinition`]
+//! - streamed response events via [`deepseek::StreamEvent`]
+//! - an HTTP-backed client via [`deepseek::DeepSeekClient`]
+//!
+//! # Examples
+//!
+//! Create a simple streaming request:
+//!
+//! ```rust,no_run
+//! use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, DeepSeekClient, LlmClient};
+//! use futures_util::StreamExt;
+//! use tokio_util::sync::CancellationToken;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let client = DeepSeekClient::from_env()?;
+//!     let request = ChatRequest::new(vec![
+//!         ChatMessage::system("You are a concise coding assistant."),
+//!         ChatMessage::user("Explain what this adapter crate does."),
+//!     ]);
+//!
+//!     let mut stream = client.stream_chat(request, CancellationToken::new())?;
+//!     while let Some(event) = stream.next().await {
+//!         println!("{:?}", event?);
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Build a tool-enabled request:
+//!
+//! ```rust
+//! use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, ToolDefinition};
+//!
+//! let request = ChatRequest::new(vec![ChatMessage::user("Read src/lib.rs")]).with_tools(vec![
+//!     ToolDefinition::new(
+//!         "read_file",
+//!         "Read a UTF-8 text file",
+//!         serde_json::json!({
+//!             "type": "object",
+//!             "properties": {
+//!                 "path": { "type": "string" }
+//!             },
+//!             "required": ["path"],
+//!             "additionalProperties": false
+//!         }),
+//!     ),
+//! ]);
+//!
+//! assert_eq!(request.tools()[0].name(), "read_file");
+//! ```
 
 /// `DeepSeek` client primitives and streaming SSE adapter.
 pub mod deepseek {
@@ -84,6 +141,23 @@ pub mod deepseek {
     }
 
     /// A single chat message passed to `DeepSeek`.
+    ///
+    /// Use constructor helpers such as [`ChatMessage::system`] and
+    /// [`ChatMessage::tool_result`] to keep role-specific fields consistent.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use deepseek_acp_adapter::deepseek::{ChatMessage, MessageRole, ToolCall};
+    ///
+    /// let assistant = ChatMessage::assistant_with_tool_calls(
+    ///     "I need to inspect a file first.",
+    ///     vec![ToolCall::new("call-1", "read_file", r#"{"path":"src/lib.rs"}"#)],
+    /// );
+    ///
+    /// assert_eq!(assistant.role(), MessageRole::Assistant);
+    /// assert_eq!(assistant.tool_calls()[0].name(), "read_file");
+    /// ```
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ChatMessage {
         role: MessageRole,
@@ -198,6 +272,30 @@ pub mod deepseek {
     }
 
     /// A callable function advertised to `DeepSeek`.
+    ///
+    /// The `parameters` value should be a JSON Schema object describing the
+    /// expected argument shape.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use deepseek_acp_adapter::deepseek::ToolDefinition;
+    ///
+    /// let tool = ToolDefinition::new(
+    ///     "grep",
+    ///     "Search files for a regular expression",
+    ///     serde_json::json!({
+    ///         "type": "object",
+    ///         "properties": {
+    ///             "pattern": { "type": "string" }
+    ///         },
+    ///         "required": ["pattern"],
+    ///         "additionalProperties": false
+    ///     }),
+    /// );
+    ///
+    /// assert_eq!(tool.name(), "grep");
+    /// ```
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ToolDefinition {
         name: String,
@@ -240,6 +338,21 @@ pub mod deepseek {
     }
 
     /// A complete tool call requested by the model.
+    ///
+    /// Instances of this type usually come from accumulated streamed
+    /// [`ToolCallDelta`] fragments once the model has finished emitting a tool
+    /// request.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use deepseek_acp_adapter::deepseek::ToolCall;
+    ///
+    /// let call = ToolCall::new("call-1", "read_file", r#"{"path":"Cargo.toml"}"#);
+    ///
+    /// assert_eq!(call.id(), "call-1");
+    /// assert_eq!(call.arguments(), r#"{"path":"Cargo.toml"}"#);
+    /// ```
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ToolCall {
         id: String,
@@ -334,6 +447,22 @@ pub mod deepseek {
     }
 
     /// A chat-completions request that can be streamed from `DeepSeek`.
+    ///
+    /// Requests are immutable builder values: start with [`ChatRequest::new`]
+    /// and then add optional tools, model overrides, or reasoning effort.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest};
+    ///
+    /// let request = ChatRequest::new(vec![ChatMessage::user("Summarize the diff")])
+    ///     .with_model("deepseek-v4-flash")
+    ///     .with_reasoning_effort("high");
+    ///
+    /// assert_eq!(request.model(), Some("deepseek-v4-flash"));
+    /// assert_eq!(request.reasoning_effort(), Some("high"));
+    /// ```
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ChatRequest {
         messages: Vec<ChatMessage>,
@@ -412,6 +541,9 @@ pub mod deepseek {
     }
 
     /// A normalized update emitted while streaming a `DeepSeek` response.
+    ///
+    /// This flattens provider wire chunks into events the adapter can consume
+    /// incrementally without exposing the raw SSE schema.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum StreamEvent {
         /// A chunk of model reasoning.
@@ -425,6 +557,10 @@ pub mod deepseek {
     }
 
     /// A partial streamed tool call.
+    ///
+    /// The provider may emit tool call metadata and JSON arguments across many
+    /// chunks. Callers typically buffer deltas by [`ToolCallDelta::index`]
+    /// until a full tool call can be reconstructed.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ToolCallDelta {
         index: usize,
@@ -476,6 +612,9 @@ pub mod deepseek {
     }
 
     /// Terminal finish reasons returned by `DeepSeek`.
+    ///
+    /// These are normalized from provider-specific strings and can be mapped to
+    /// the adapter's higher-level stop reasons.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum FinishReason {
         /// The turn ended normally.
@@ -503,6 +642,24 @@ pub mod deepseek {
     }
 
     /// Configuration for the `DeepSeek` client.
+    ///
+    /// Values can be provided explicitly with [`DeepSeekConfig::new`] or loaded
+    /// from the process environment with [`DeepSeekConfig::from_env`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use deepseek_acp_adapter::deepseek::DeepSeekConfig;
+    ///
+    /// let config = DeepSeekConfig::new(
+    ///     "test-key",
+    ///     "https://api.deepseek.com",
+    ///     "deepseek-v4-pro",
+    /// );
+    ///
+    /// assert_eq!(config.base_url(), "https://api.deepseek.com");
+    /// assert_eq!(config.model(), "deepseek-v4-pro");
+    /// ```
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct DeepSeekConfig {
         api_key: String,
@@ -535,6 +692,16 @@ pub mod deepseek {
         /// # Errors
         ///
         /// Returns `MissingApiKey` when the API key is absent or empty.
+        ///
+        /// # Examples
+        ///
+        /// ```rust,no_run
+        /// use deepseek_acp_adapter::deepseek::DeepSeekConfig;
+        ///
+        /// let config = DeepSeekConfig::from_env()?;
+        /// assert!(!config.model().is_empty());
+        /// # Ok::<(), deepseek_acp_adapter::deepseek::DeepSeekError>(())
+        /// ```
         pub fn from_env() -> Result<Self, DeepSeekError> {
             Self::from_environment(&SystemEnvironment)
         }
@@ -582,6 +749,23 @@ pub mod deepseek {
     }
 
     /// A `DeepSeek` chat-completions client.
+    ///
+    /// The client implements [`LlmClient`] and streams normalized
+    /// [`StreamEvent`] values from `DeepSeek`'s OpenAI-compatible chat endpoint.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use deepseek_acp_adapter::deepseek::{DeepSeekClient, DeepSeekConfig};
+    ///
+    /// let client = DeepSeekClient::new(DeepSeekConfig::new(
+    ///     "test-key",
+    ///     "https://api.deepseek.com",
+    ///     "deepseek-v4-pro",
+    /// ));
+    ///
+    /// assert_eq!(client.config().model(), "deepseek-v4-pro");
+    /// ```
     #[derive(Debug, Clone)]
     pub struct DeepSeekClient {
         http: HttpClient,
@@ -603,6 +787,16 @@ pub mod deepseek {
         /// # Errors
         ///
         /// Returns `MissingApiKey` when the required key is absent or empty.
+        ///
+        /// # Examples
+        ///
+        /// ```rust,no_run
+        /// use deepseek_acp_adapter::deepseek::DeepSeekClient;
+        ///
+        /// let client = DeepSeekClient::from_env()?;
+        /// assert!(!client.config().base_url().is_empty());
+        /// # Ok::<(), deepseek_acp_adapter::deepseek::DeepSeekError>(())
+        /// ```
         pub fn from_env() -> Result<Self, DeepSeekError> {
             Ok(Self::new(DeepSeekConfig::from_env()?))
         }
@@ -623,6 +817,27 @@ pub mod deepseek {
         /// # Errors
         ///
         /// Returns an error if the request cannot be constructed or the transport fails.
+        ///
+        /// # Examples
+        ///
+        /// ```rust,no_run
+        /// use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, DeepSeekClient, LlmClient};
+        /// use futures_util::StreamExt;
+        /// use tokio_util::sync::CancellationToken;
+        ///
+        /// #[tokio::main]
+        /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        ///     let client = DeepSeekClient::from_env()?;
+        ///     let request = ChatRequest::new(vec![ChatMessage::user("Say hello")]);
+        ///     let mut stream = client.stream_chat(request, CancellationToken::new())?;
+        ///
+        ///     while let Some(event) = stream.next().await {
+        ///         let _ = event?;
+        ///     }
+        ///
+        ///     Ok(())
+        /// }
+        /// ```
         fn stream_chat(
             &self,
             request: ChatRequest,
