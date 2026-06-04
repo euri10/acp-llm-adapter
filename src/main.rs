@@ -36,7 +36,7 @@ use agent_client_protocol::schema::{
     SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
     SetSessionModeResponse, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectTo, SessionMessage, Stdio};
@@ -894,9 +894,19 @@ trait ReadTextFileRequester: Send + Sync {
     ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>>;
 }
 
-trait ToolCallRequester: ReadTextFileRequester + PermissionRequester {}
+trait WriteTextFileRequester: Send + Sync {
+    fn write_text_file(
+        &self,
+        request: WriteTextFileRequest,
+    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>>;
+}
 
-impl<T> ToolCallRequester for T where T: ReadTextFileRequester + PermissionRequester + ?Sized {}
+trait ToolCallRequester: ReadTextFileRequester + WriteTextFileRequester + PermissionRequester {}
+
+impl<T> ToolCallRequester for T where
+    T: ReadTextFileRequester + WriteTextFileRequester + PermissionRequester + ?Sized
+{
+}
 
 pub(crate) trait PermissionRequester: Send + Sync {
     fn request_permission(
@@ -919,6 +929,24 @@ impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: ReadTextFileRequest,
     ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn write_text_file(
+        &self,
+        request: WriteTextFileRequest,
+    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn write_text_file(
+        &self,
+        request: WriteTextFileRequest,
+    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
         Box::pin(async move { self.send_request(request).block_task().await })
     }
 }
@@ -1280,6 +1308,7 @@ impl ToolRegistry for AdapterToolRegistry {
                         state,
                         call,
                         context,
+                        connection.map(|requester| requester as &dyn WriteTextFileRequester),
                         connection.map(|requester| requester as &dyn PermissionRequester),
                     )
                     .await
@@ -1289,6 +1318,8 @@ impl ToolRegistry for AdapterToolRegistry {
                         state,
                         call,
                         context,
+                        connection.map(|requester| requester as &dyn ReadTextFileRequester),
+                        connection.map(|requester| requester as &dyn WriteTextFileRequester),
                         connection.map(|requester| requester as &dyn PermissionRequester),
                     )
                     .await
@@ -1671,6 +1702,7 @@ async fn write_file_tool_execution(
     state: &Arc<Mutex<AdapterState>>,
     call: &DeepSeekToolCall,
     context: &ToolContext,
+    write_connection: Option<&dyn WriteTextFileRequester>,
     permission_requester: Option<&dyn PermissionRequester>,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<WriteFileArguments>(call.arguments()) {
@@ -1687,7 +1719,28 @@ async fn write_file_tool_execution(
     }
 
     let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
-    match fs::write(&resolved_path, parsed_arguments.content.as_bytes()) {
+    let use_client_write = context
+        .client_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.fs.write_text_file);
+    let write_result = if use_client_write {
+        match write_connection {
+            Some(connection) => {
+                write_file_to_client(
+                    connection,
+                    &context.session_id,
+                    &resolved_path,
+                    &parsed_arguments.content,
+                )
+                .await
+            }
+            None => Err("write_file needs a client connection for fs/write_text_file".to_owned()),
+        }
+    } else {
+        write_file_to_local(&resolved_path, &parsed_arguments.content)
+    };
+
+    match write_result {
         Ok(()) => {
             let byte_count = parsed_arguments.content.len();
             ToolExecution {
@@ -1695,14 +1748,12 @@ async fn write_file_tool_execution(
                 raw_output: serde_json::json!({
                     "path": resolved_path,
                     "bytes": byte_count,
+                    "source": if use_client_write { "client" } else { "local" },
                 }),
                 success: true,
             }
         }
-        Err(error) => ToolExecution::failed(format!(
-            "failed to write {}: {error}",
-            resolved_path.display()
-        )),
+        Err(error) => ToolExecution::failed(error),
     }
 }
 
@@ -1710,6 +1761,8 @@ async fn edit_file_tool_execution(
     state: &Arc<Mutex<AdapterState>>,
     call: &DeepSeekToolCall,
     context: &ToolContext,
+    read_connection: Option<&dyn ReadTextFileRequester>,
+    write_connection: Option<&dyn WriteTextFileRequester>,
     permission_requester: Option<&dyn PermissionRequester>,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<EditFileArguments>(call.arguments()) {
@@ -1724,14 +1777,29 @@ async fn edit_file_tool_execution(
     }
 
     let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
-    let original = match fs::read_to_string(&resolved_path) {
-        Ok(file_text) => file_text,
-        Err(error) => {
-            return ToolExecution::failed(format!(
+    let use_client_read = context
+        .client_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.fs.read_text_file);
+    let original_result = if use_client_read {
+        match read_connection {
+            Some(connection) => {
+                read_full_file_from_client(connection, &context.session_id, &resolved_path).await
+            }
+            None => Err("edit_file needs a client connection for fs/read_text_file".to_owned()),
+        }
+    } else {
+        fs::read_to_string(&resolved_path).map_err(|error| {
+            format!(
                 "failed to read {} before editing: {error}",
                 resolved_path.display()
-            ));
-        }
+            )
+        })
+    };
+
+    let original = match original_result {
+        Ok(file_text) => file_text,
+        Err(error) => return ToolExecution::failed(error),
     };
 
     let matches = original.matches(&parsed_arguments.old_text).count();
@@ -1755,19 +1823,34 @@ async fn edit_file_tool_execution(
     }
 
     let updated = original.replacen(&parsed_arguments.old_text, &parsed_arguments.new_text, 1);
-    match fs::write(&resolved_path, updated.as_bytes()) {
+    let use_client_write = context
+        .client_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.fs.write_text_file);
+    let write_result = if use_client_write {
+        match write_connection {
+            Some(connection) => {
+                write_file_to_client(connection, &context.session_id, &resolved_path, &updated)
+                    .await
+            }
+            None => Err("edit_file needs a client connection for fs/write_text_file".to_owned()),
+        }
+    } else {
+        write_file_to_local(&resolved_path, &updated)
+    };
+
+    match write_result {
         Ok(()) => ToolExecution {
             content: format!("edited {}", resolved_path.display()),
             raw_output: serde_json::json!({
                 "path": resolved_path,
                 "replacements": 1,
+                "read_source": if use_client_read { "client" } else { "local" },
+                "write_source": if use_client_write { "client" } else { "local" },
             }),
             success: true,
         },
-        Err(error) => ToolExecution::failed(format!(
-            "failed to write edited {}: {error}",
-            resolved_path.display()
-        )),
+        Err(error) => ToolExecution::failed(error),
     }
 }
 
@@ -2119,6 +2202,50 @@ async fn read_file_from_client(
         .map_err(|error| read_file_client_error(path, &error.to_string()))?;
 
     Ok(response.content)
+}
+
+async fn read_full_file_from_client(
+    connection: &dyn ReadTextFileRequester,
+    session_id: &SessionId,
+    path: &Path,
+) -> Result<String, String> {
+    let response = connection
+        .read_text_file(ReadTextFileRequest::new(
+            session_id.clone(),
+            path.to_path_buf(),
+        ))
+        .await
+        .map_err(|error| read_file_client_error(path, &error.to_string()))?;
+
+    Ok(response.content)
+}
+
+async fn write_file_to_client(
+    connection: &dyn WriteTextFileRequester,
+    session_id: &SessionId,
+    path: &Path,
+    content: &str,
+) -> Result<(), String> {
+    connection
+        .write_text_file(WriteTextFileRequest::new(
+            session_id.clone(),
+            path.to_path_buf(),
+            content.to_owned(),
+        ))
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to write {} through client fs/write_text_file: {error}",
+                path.display()
+            )
+        })?;
+
+    Ok(())
+}
+
+fn write_file_to_local(path: &Path, content: &str) -> Result<(), String> {
+    fs::write(path, content.as_bytes())
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
 fn read_file_from_local(path: &Path, line: u32, limit: u32) -> Result<String, String> {
@@ -2810,14 +2937,15 @@ mod tests {
         PendingToolCalls, PermissionDecision, PermissionPosture, PermissionRequester,
         ReadTextFileRequester, ReasoningEffort, SESSION_CONFIG_MODEL_ID,
         SESSION_CONFIG_REASONING_EFFORT_ID, ToolCallRequester, ToolContext, ToolExecution,
-        ToolRegistry, build_dev_agent, build_initialize_response, connect_mcp_sessions,
-        edit_file_tool_execution, exercise_permission_gate_smoke, glob_tool_execution,
-        grep_tool_execution, handle_authenticate_request, handle_cancel_notification,
-        handle_initialize_request, handle_new_session_request, handle_prompt_request,
-        handle_set_session_config_option_request, handle_set_session_mode_request,
-        list_dir_tool_execution, llm_client_for_backend, mcp_tool_mappings, print_dev_smoke_result,
-        read_file_tool_execution, request_tool_permission, run_command_tool_execution,
-        run_smoke_flow, serve_with_transport, write_file_tool_execution,
+        ToolRegistry, WriteTextFileRequester, build_dev_agent, build_initialize_response,
+        connect_mcp_sessions, edit_file_tool_execution, exercise_permission_gate_smoke,
+        glob_tool_execution, grep_tool_execution, handle_authenticate_request,
+        handle_cancel_notification, handle_initialize_request, handle_new_session_request,
+        handle_prompt_request, handle_set_session_config_option_request,
+        handle_set_session_mode_request, list_dir_tool_execution, llm_client_for_backend,
+        mcp_tool_mappings, print_dev_smoke_result, read_file_tool_execution,
+        request_tool_permission, run_command_tool_execution, run_smoke_flow, serve_with_transport,
+        write_file_tool_execution,
     };
     use agent_client_protocol::schema::{McpServer, McpServerStdio};
     use agent_client_protocol::{Agent, Channel, Client};
@@ -2845,6 +2973,7 @@ mod tests {
         SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
         SessionConfigOptionCategory, SessionModeId, SessionNotification, SessionUpdate,
         SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, ToolKind,
+        WriteTextFileRequest, WriteTextFileResponse,
     };
     use clap::Parser;
     use futures_util::StreamExt;
@@ -3123,6 +3252,36 @@ mod tests {
                 Err(agent_client_protocol::Error::internal_error()
                     .data("stream did not contain valid UTF-8"))
             })
+        }
+    }
+
+    struct RecordingWriteTextFileRequester {
+        requests: Arc<Mutex<Vec<WriteTextFileRequest>>>,
+    }
+
+    impl RecordingWriteTextFileRequester {
+        fn new() -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Arc<Mutex<Vec<WriteTextFileRequest>>> {
+            Arc::clone(&self.requests)
+        }
+    }
+
+    impl WriteTextFileRequester for RecordingWriteTextFileRequester {
+        fn write_text_file(
+            &self,
+            request: WriteTextFileRequest,
+        ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
+            self.requests
+                .lock()
+                .map(|mut requests| requests.push(request))
+                .ok();
+
+            Box::pin(async move { Ok(WriteTextFileResponse::new()) })
         }
     }
 
@@ -4514,6 +4673,147 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn write_file_tool_routes_to_client_fs_write() -> Result<(), agent_client_protocol::Error>
+    {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-write-client-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
+            ),
+        };
+
+        let permission_requester =
+            FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    super::PERMISSION_ALLOW_ONCE_OPTION_ID,
+                )),
+            )]);
+        let write_requester = RecordingWriteTextFileRequester::new();
+        let requests = write_requester.requests();
+        let call = DeepSeekToolCall::new(
+            "write-client-call",
+            "write_file",
+            serde_json::json!({
+                "path": "note.txt",
+                "content": "alpha beta gamma",
+            })
+            .to_string(),
+        );
+
+        let result = write_file_tool_execution(
+            &state,
+            &call,
+            &context,
+            Some(&write_requester as &dyn WriteTextFileRequester),
+            Some(&permission_requester),
+        )
+        .await;
+
+        assert!(result.success);
+        assert_eq!(result.raw_output["source"], "client");
+        assert!(!temp_root.join("note.txt").exists());
+
+        let requests_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let request = requests_guard.first().ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing write_text_file request")
+        })?;
+        assert_eq!(request.session_id, session.session_id);
+        assert_eq!(request.path, temp_root.join("note.txt"));
+        assert_eq!(request.content, "alpha beta gamma");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn edit_file_tool_routes_to_client_fs_read_and_write()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-edit-client-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true)),
+            ),
+        };
+
+        let permission_requester =
+            FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    super::PERMISSION_ALLOW_ONCE_OPTION_ID,
+                )),
+            )]);
+        let read_requester = CountingReadTextFileRequester::new();
+        let read_calls = read_requester.calls();
+        let write_requester = RecordingWriteTextFileRequester::new();
+        let write_requests = write_requester.requests();
+        let call = DeepSeekToolCall::new(
+            "edit-client-call",
+            "edit_file",
+            serde_json::json!({
+                "path": "note.txt",
+                "old_text": "content",
+                "new_text": "buffer",
+            })
+            .to_string(),
+        );
+
+        let result = edit_file_tool_execution(
+            &state,
+            &call,
+            &context,
+            Some(&read_requester as &dyn ReadTextFileRequester),
+            Some(&write_requester as &dyn WriteTextFileRequester),
+            Some(&permission_requester),
+        )
+        .await;
+
+        assert!(result.success);
+        assert_eq!(result.raw_output["read_source"], "client");
+        assert_eq!(result.raw_output["write_source"], "client");
+        assert!(!temp_root.join("note.txt").exists());
+        assert_eq!(
+            *read_calls
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?,
+            1
+        );
+
+        let write_requests_guard = write_requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let request = write_requests_guard.first().ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing write_text_file request")
+        })?;
+        assert_eq!(request.session_id, session.session_id);
+        assert_eq!(request.path, temp_root.join("note.txt"));
+        assert_eq!(request.content, "client buffer");
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
     async fn write_and_edit_file_tools_modify_local_files_after_permission()
     -> Result<(), agent_client_protocol::Error> {
         let temp_root =
@@ -4545,9 +4845,11 @@ mod tests {
         );
 
         let write_result =
-            write_file_tool_execution(&state, &write_call, &context, Some(&write_requester)).await;
+            write_file_tool_execution(&state, &write_call, &context, None, Some(&write_requester))
+                .await;
 
         assert!(write_result.success);
+        assert_eq!(write_result.raw_output["source"], "local");
         assert_eq!(
             std::fs::read_to_string(temp_root.join("note.txt"))
                 .map_err(agent_client_protocol::Error::into_internal_error)?,
@@ -4570,10 +4872,19 @@ mod tests {
             .to_string(),
         );
 
-        let edit_result =
-            edit_file_tool_execution(&state, &edit_call, &context, Some(&edit_requester)).await;
+        let edit_result = edit_file_tool_execution(
+            &state,
+            &edit_call,
+            &context,
+            None,
+            None,
+            Some(&edit_requester),
+        )
+        .await;
 
         assert!(edit_result.success);
+        assert_eq!(edit_result.raw_output["read_source"], "local");
+        assert_eq!(edit_result.raw_output["write_source"], "local");
         assert_eq!(
             std::fs::read_to_string(temp_root.join("note.txt"))
                 .map_err(agent_client_protocol::Error::into_internal_error)?,
