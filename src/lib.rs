@@ -630,6 +630,75 @@ pub mod deepseek {
         ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError>;
     }
 
+    enum StreamAttemptOutcome {
+        Complete,
+        Cancelled,
+        ShouldRetry,
+    }
+
+    async fn run_stream_attempt(
+        mut event_source: EventSource,
+        tx: &mpsc::UnboundedSender<Result<StreamEvent, DeepSeekError>>,
+        cancellation_token: &CancellationToken,
+        attempt: u32,
+        max_retries: u32,
+    ) -> StreamAttemptOutcome {
+        let mut saw_finish = false;
+        let mut events_sent: u32 = 0;
+
+        loop {
+            let event = tokio::select! {
+                () = cancellation_token.cancelled() => return StreamAttemptOutcome::Cancelled,
+                event = event_source.next() => event,
+            };
+
+            let Some(event) = event else { break; };
+
+            match event {
+                Ok(Event::Open) => {}
+                Ok(Event::Message(message)) => {
+                    if message.data.trim() == "[DONE]" {
+                        break;
+                    }
+                    match parse_chat_completion_chunk(&message.data) {
+                        Ok(updates) => {
+                            for update in updates {
+                                if matches!(update, StreamEvent::Finished(_)) {
+                                    saw_finish = true;
+                                }
+                                events_sent += 1;
+                                if tx.send(Ok(update)).is_err() {
+                                    return StreamAttemptOutcome::Cancelled;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Err(error));
+                            return StreamAttemptOutcome::Cancelled;
+                        }
+                    }
+                }
+                Err(error) => {
+                    if events_sent == 0
+                        && attempt < max_retries
+                        && is_retryable_transport_error(&error)
+                    {
+                        return StreamAttemptOutcome::ShouldRetry;
+                    }
+                    let _ = tx.send(Err(error.into()));
+                    return StreamAttemptOutcome::Cancelled;
+                }
+            }
+        }
+
+        if !saw_finish && !cancellation_token.is_cancelled() {
+            let _ = tx.send(Err(DeepSeekError::InvalidResponse(
+                "stream ended before a finish reason was received".to_string(),
+            )));
+        }
+        StreamAttemptOutcome::Complete
+    }
+
     impl LlmClient for DeepSeekClient {
         fn stream_chat(
             &self,
@@ -652,67 +721,45 @@ pub mod deepseek {
                 reasoning_effort,
             };
 
-            let request = self
-                .http
-                .post(format!(
-                    "{}/chat/completions",
-                    self.config.base_url.trim_end_matches('/')
-                ))
-                .bearer_auth(&self.config.api_key)
-                .json(&body);
+            let http = self.http.clone();
+            let url = format!(
+                "{}/chat/completions",
+                self.config.base_url.trim_end_matches('/')
+            );
+            let api_key = self.config.api_key.clone();
 
-            let mut event_source = EventSource::new(request)?;
             let (tx, rx) = mpsc::unbounded_channel::<Result<StreamEvent, DeepSeekError>>();
 
             tokio::spawn(async move {
-                let mut saw_finish = false;
+                const MAX_RETRIES: u32 = 3;
 
-                loop {
-                    let event = tokio::select! {
-                        () = cancellation_token.cancelled() => return,
-                        event = event_source.next() => event,
-                    };
+                for attempt in 0..=MAX_RETRIES {
+                    if attempt > 0 {
+                        let delay_ms = 100u64 * (1u64 << (attempt - 1));
+                        tracing::warn!(
+                            attempt,
+                            delay_ms,
+                            "retrying DeepSeek SSE stream after retryable transport error"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
 
-                    let Some(event) = event else {
-                        break;
-                    };
+                    let request = http.post(&url).bearer_auth(&api_key).json(&body);
 
-                    match event {
-                        Ok(Event::Open) => {}
-                        Ok(Event::Message(message)) => {
-                            if message.data.trim() == "[DONE]" {
-                                break;
-                            }
-
-                            match parse_chat_completion_chunk(&message.data) {
-                                Ok(updates) => {
-                                    for update in updates {
-                                        if matches!(update, StreamEvent::Finished(_)) {
-                                            saw_finish = true;
-                                        }
-
-                                        if tx.send(Ok(update)).is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    let _ = tx.send(Err(error));
-                                    return;
-                                }
-                            }
-                        }
+                    let event_source = match EventSource::new(request) {
+                        Ok(es) => es,
                         Err(error) => {
-                            let _ = tx.send(Err(error.into()));
+                            let _ = tx.send(Err(DeepSeekError::from(error)));
                             return;
                         }
-                    }
-                }
+                    };
 
-                if !saw_finish && !cancellation_token.is_cancelled() {
-                    let _ = tx.send(Err(DeepSeekError::InvalidResponse(
-                        "stream ended before a finish reason was received".to_string(),
-                    )));
+                    if !matches!(
+                        run_stream_attempt(event_source, &tx, &cancellation_token, attempt, MAX_RETRIES).await,
+                        StreamAttemptOutcome::ShouldRetry
+                    ) {
+                        return;
+                    }
                 }
             });
 
@@ -721,6 +768,51 @@ pub mod deepseek {
             })
             .boxed())
         }
+    }
+
+    /// Returns true when a transport error is safe to retry before any events are emitted.
+    ///
+    /// Only `Transport`-variant errors carrying network-level conditions qualify — these
+    /// arise from stale pooled connections, server-side shutdowns, and TCP disconnects.
+    /// Parse errors, status errors, and redirect loops are not retryable.
+    ///
+    /// Two broad categories are accepted:
+    /// - `is_connect()` / `is_request()`: server dropped the connection before any HTTP
+    ///   response arrived (e.g. `hyper::Error(IncompleteMessage)` on a stale pool reuse).
+    /// - Body/decode errors whose source chain contains a retryable IO kind
+    ///   (`BrokenPipe`, `ConnectionReset`, `UnexpectedEof`, `ConnectionAborted`): TCP dropped
+    ///   mid-stream, which is safe to restart only while `events_sent == 0` (guarded by
+    ///   the caller).
+    fn is_retryable_transport_error(error: &reqwest_eventsource::Error) -> bool {
+        use std::error::Error as StdError;
+
+        let reqwest_eventsource::Error::Transport(ref reqwest_error) = *error else {
+            return false;
+        };
+
+        // Connection and request-level failures mean no HTTP response was received at
+        // all — always safe to retry (no risk of duplicate events).
+        if reqwest_error.is_connect() || reqwest_error.is_request() {
+            return true;
+        }
+
+        // Body or decode errors can arise from a mid-stream TCP disconnection.  Walk
+        // the source chain for a retryable IO condition.
+        let mut current: Option<&(dyn StdError + 'static)> =
+            (reqwest_error as &dyn StdError).source();
+        while let Some(err) = current {
+            if let Some(io) = err.downcast_ref::<std::io::Error>() {
+                return matches!(
+                    io.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionAborted
+                );
+            }
+            current = err.source();
+        }
+        false
     }
 
     trait Environment {
@@ -832,7 +924,7 @@ pub mod deepseek {
         use super::{
             ChatMessage, ChatRequest, DeepSeekClient, DeepSeekConfig, DeepSeekError, Environment,
             FinishReason, LlmClient, MessageRole, StreamEvent, ToolCall, ToolCallDelta,
-            ToolDefinition, parse_chat_completion_chunk,
+            ToolDefinition, is_retryable_transport_error, parse_chat_completion_chunk,
         };
 
         use futures_util::StreamExt;
@@ -1279,6 +1371,95 @@ pub mod deepseek {
                 error.to_string(),
                 "`DeepSeek` SSE transport error: Stream ended"
             );
+        }
+
+        #[test_log::test]
+        fn is_retryable_transport_error_returns_false_for_non_transport_errors() {
+            assert!(!is_retryable_transport_error(
+                &reqwest_eventsource::Error::StreamEnded
+            ));
+            // 0xFF is not valid UTF-8 so from_utf8 always returns Err here.
+            let Err(utf8_error) = String::from_utf8(vec![0xFF_u8]) else {
+                return; // unreachable: 0xFF is invalid UTF-8
+            };
+            assert!(!is_retryable_transport_error(
+                &reqwest_eventsource::Error::Utf8(utf8_error)
+            ));
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn retries_stream_on_connection_drop_before_events() -> Result<(), DeepSeekError> {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| DeepSeekError::InvalidResponse(e.to_string()))?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| DeepSeekError::InvalidResponse(e.to_string()))?;
+
+            let response_body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string();
+
+            let server = tokio::spawn(async move {
+                // First connection: accept then immediately close to simulate a stale
+                // pooled connection that the server has already shut down.
+                let _ = listener.accept().await.map_err(|e| e.to_string())?;
+
+                // Second connection: serve a valid SSE response.
+                let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+                let mut buf = [0u8; 4096];
+                let mut received = Vec::new();
+                loop {
+                    let n = socket.read(&mut buf).await.map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&buf[..n]);
+                    if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                socket.shutdown().await.map_err(|e| e.to_string())?;
+                Ok::<(), String>(())
+            });
+
+            let client = DeepSeekClient::new(DeepSeekConfig::new(
+                "secret",
+                format!("http://{addr}"),
+                "mock-model",
+            ));
+            let mut stream = client.stream_chat(
+                ChatRequest::new(vec![ChatMessage::user("hello")]),
+                CancellationToken::new(),
+            )?;
+
+            let event = stream.next().await.ok_or_else(|| {
+                DeepSeekError::InvalidResponse("expected message event".to_string())
+            })??;
+            assert_eq!(event, StreamEvent::Message("hello".to_string()));
+
+            let event = stream.next().await.ok_or_else(|| {
+                DeepSeekError::InvalidResponse("expected finish event".to_string())
+            })??;
+            assert_eq!(event, StreamEvent::Finished(FinishReason::EndTurn));
+
+            server
+                .await
+                .map_err(|e| DeepSeekError::InvalidResponse(e.to_string()))?
+                .map_err(DeepSeekError::InvalidResponse)?;
+
+            Ok(())
         }
 
         #[test_log::test]
