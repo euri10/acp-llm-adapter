@@ -27,21 +27,23 @@ use std::{error::Error, process::ExitCode};
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
-    ClientCapabilities, ContentBlock, ContentChunk, CreateTerminalRequest, CreateTerminalResponse,
-    Implementation, InitializeRequest, InitializeResponse, McpServer, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
-    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
+    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
+    CreateTerminalRequest, CreateTerminalResponse, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LogoutCapabilities,
+    LogoutRequest, LogoutResponse, McpServer, McpServerStdio, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-    SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TerminalOutputRequest, TerminalOutputResponse, ToolCall as AcpToolCall, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    SessionConfigValueId, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
+    SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, TerminalOutputRequest, TerminalOutputResponse,
+    ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind, UnstructuredCommandInput, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectTo, SessionMessage, Stdio};
@@ -667,7 +669,29 @@ impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: WriteTextFileRequest,
     ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { self.send_request(request).block_task().await })
+        Box::pin(async move {
+            self.send_request(request)
+                .block_task()
+                .await
+                .or_else(|err| {
+                    // Clients conforming to an older convention may return JSON null
+                    // for this void response instead of `{}`. Serde cannot deserialize
+                    // null into a struct, so we detect that specific failure and treat
+                    // it as a successful empty response.
+                    let is_null_payload_deser_failure = err.code
+                        == agent_client_protocol::ErrorCode::ParseError
+                        && err.data.as_ref().is_some_and(|d| {
+                            d.get("json").is_some_and(serde_json::Value::is_null)
+                                && d.get("phase").and_then(serde_json::Value::as_str)
+                                    == Some("deserialization")
+                        });
+                    if is_null_payload_deser_failure {
+                        Ok(WriteTextFileResponse::new())
+                    } else {
+                        Err(err)
+                    }
+                })
+        })
     }
 }
 
@@ -689,6 +713,12 @@ impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
     }
 }
 
+/// Run the ACP stdio server with the given transport, state, LLM client, and tool
+/// registry.
+///
+/// The builder pattern with many request handler registrations unavoidably spans
+/// many lines. Each handler is factored into a separate function for testability.
+#[allow(clippy::too_many_lines)]
 async fn serve_with_transport(
     transport: impl ConnectTo<Agent> + 'static,
     state: Arc<Mutex<AdapterState>>,
@@ -703,6 +733,8 @@ async fn serve_with_transport(
     let prompt_client = Arc::clone(&llm_client);
     let prompt_tools = Arc::clone(&tool_registry);
     let cancel_state = Arc::clone(&state);
+    let list_sessions_state = Arc::clone(&state);
+    let close_session_state = Arc::clone(&state);
 
     Agent
         .builder()
@@ -789,6 +821,30 @@ async fn serve_with_transport(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            async move |request: ListSessionsRequest, responder, _cx| {
+                responder.respond(handle_list_sessions_request(
+                    &list_sessions_state,
+                    &request,
+                )?)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: CloseSessionRequest, responder, _cx| {
+                responder.respond(handle_close_session_request(
+                    &close_session_state,
+                    &request,
+                )?)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_request: LogoutRequest, responder, _cx| {
+                responder.respond(handle_logout_request())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_notification(
             async move |notification: CancelNotification, _cx| {
                 handle_cancel_notification(&cancel_state, &notification)
@@ -809,6 +865,49 @@ fn handle_initialize_request(
 
 fn handle_authenticate_request() -> AuthenticateResponse {
     AuthenticateResponse::new()
+}
+
+fn handle_list_sessions_request(
+    state: &Arc<Mutex<AdapterState>>,
+    _request: &ListSessionsRequest,
+) -> Result<ListSessionsResponse, agent_client_protocol::Error> {
+    let guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    let sessions: Vec<SessionInfo> = guard
+        .sessions
+        .iter()
+        .map(|(session_id, record)| {
+            SessionInfo::new(session_id.clone(), record.cwd.clone())
+                .additional_directories(record.additional_directories.clone())
+        })
+        .collect();
+
+    Ok(ListSessionsResponse::new(sessions))
+}
+
+fn handle_close_session_request(
+    state: &Arc<Mutex<AdapterState>>,
+    request: &CloseSessionRequest,
+) -> Result<CloseSessionResponse, agent_client_protocol::Error> {
+    let mut guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    if guard.sessions.remove(&request.session_id).is_none() {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data(format!("unknown session id: {}", request.session_id.0)));
+    }
+
+    Ok(CloseSessionResponse::new())
+}
+
+/// Handle a `logout` request.
+///
+/// This adapter has no persistent auth state, so logout is a no-op.
+fn handle_logout_request() -> LogoutResponse {
+    LogoutResponse::new()
 }
 
 fn handle_new_session_request(
@@ -2881,7 +2980,12 @@ fn build_initialize_response(_protocol_version: ProtocolVersion) -> InitializeRe
             AgentCapabilities::new()
                 .load_session(false)
                 .prompt_capabilities(PromptCapabilities::new())
-                .auth(AgentAuthCapabilities::new()),
+                .session_capabilities(
+                    SessionCapabilities::new()
+                        .list(SessionListCapabilities::new())
+                        .close(SessionCloseCapabilities::new()),
+                )
+                .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new())),
         )
         .agent_info(Implementation::new(ADAPTER_NAME, ADAPTER_VERSION))
 }
@@ -3281,7 +3385,8 @@ mod tests {
         ToolRegistry, WriteTextFileRequester, build_dev_agent, build_initialize_response,
         connect_mcp_sessions, edit_file_tool_execution, exercise_permission_gate_smoke,
         glob_tool_execution, grep_tool_execution, handle_authenticate_request,
-        handle_cancel_notification, handle_initialize_request, handle_new_session_request,
+        handle_cancel_notification, handle_close_session_request, handle_initialize_request,
+        handle_list_sessions_request, handle_logout_request, handle_new_session_request,
         handle_prompt_request, handle_set_session_config_option_request,
         handle_set_session_mode_request, list_dir_tool_execution, llm_client_for_backend,
         mcp_tool_mappings, print_dev_smoke_result, read_file_tool_execution,
@@ -3307,8 +3412,9 @@ mod tests {
     use uuid::Uuid;
 
     use agent_client_protocol::schema::{
-        CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, ImageContent,
-        Implementation, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
+        CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock,
+        FileSystemCapabilities, ImageContent, Implementation, InitializeRequest,
+        ListSessionsRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
         ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
         RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
         SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
@@ -3804,6 +3910,40 @@ mod tests {
                 .prompt_capabilities
                 .embedded_context
         );
+        // session/list capability is advertised.
+        assert!(
+            response
+                .agent_capabilities
+                .session_capabilities
+                .list
+                .is_some()
+        );
+        // session/close capability is advertised.
+        assert!(
+            response
+                .agent_capabilities
+                .session_capabilities
+                .close
+                .is_some()
+        );
+        // session/resume is NOT advertised (no persistence).
+        assert!(
+            response
+                .agent_capabilities
+                .session_capabilities
+                .resume
+                .is_none()
+        );
+        // additionalDirectories is NOT advertised here (covered by daa-ud0).
+        assert!(
+            response
+                .agent_capabilities
+                .session_capabilities
+                .additional_directories
+                .is_none()
+        );
+        // logout capability is advertised.
+        assert!(response.agent_capabilities.auth.logout.is_some());
         assert!(response.auth_methods.is_empty());
     }
 
@@ -6174,6 +6314,82 @@ mod tests {
                 .contains("unknown permission option selected")
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_returns_empty_when_no_sessions() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let response = handle_list_sessions_request(&state, &ListSessionsRequest::new())?;
+
+        assert!(response.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_returns_active_sessions() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session1 = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let session2 = handle_new_session_request(&state, &NewSessionRequest::new("/home"))?;
+
+        let response = handle_list_sessions_request(&state, &ListSessionsRequest::new())?;
+
+        assert_eq!(response.sessions.len(), 2);
+        let ids: Vec<_> = response
+            .sessions
+            .iter()
+            .map(|info| info.session_id.clone())
+            .collect();
+        assert!(ids.contains(&session1.session_id));
+        assert!(ids.contains(&session2.session_id));
+        Ok(())
+    }
+
+    #[test]
+    fn close_session_removes_session() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+
+        let close_response = handle_close_session_request(
+            &state,
+            &CloseSessionRequest::new(session.session_id.clone()),
+        )?;
+
+        assert_eq!(
+            serde_json::to_value(&close_response)
+                .map_err(agent_client_protocol::Error::into_internal_error)?,
+            serde_json::json!({})
+        );
+
+        let list_response =
+            handle_list_sessions_request(&state, &ListSessionsRequest::new())?;
+        assert!(list_response.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn close_session_rejects_unknown_session() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let unknown_id = agent_client_protocol::schema::SessionId::new("nonexistent");
+
+        let Err(error) =
+            handle_close_session_request(&state, &CloseSessionRequest::new(unknown_id))
+        else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected unknown session id to fail"));
+        };
+        assert!(error.to_string().contains("unknown session id"));
+        Ok(())
+    }
+
+    #[test]
+    fn logout_request_returns_ok() -> Result<(), agent_client_protocol::Error> {
+        let response = handle_logout_request();
+        assert_eq!(
+            serde_json::to_value(&response)
+                .map_err(agent_client_protocol::Error::into_internal_error)?,
+            serde_json::json!({})
+        );
         Ok(())
     }
 }
