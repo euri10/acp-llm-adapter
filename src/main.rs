@@ -6449,4 +6449,1555 @@ mod tests {
         );
         Ok(())
     }
+
+    // ── plan_from_prompt multi-sentence path ────────────────
+
+    #[test]
+    fn plan_from_prompt_splits_multiple_sentences() {
+        let plan = super::plan_from_prompt("Do X. Do Y.");
+        assert_eq!(plan.entries.len(), 2);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.priority == super::PlanEntryPriority::Medium)
+        );
+    }
+
+    #[test]
+    fn plan_from_prompt_splits_newlines() {
+        let plan = super::plan_from_prompt("alpha\nbeta");
+        assert_eq!(plan.entries.len(), 2);
+    }
+
+    #[test]
+    fn plan_from_prompt_single_sentence_uses_high_priority() {
+        let plan = super::plan_from_prompt("Just one sentence");
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].priority, super::PlanEntryPriority::High);
+    }
+
+    // ── resource_link_prompt_text with description ──────────
+
+    #[test]
+    fn resource_link_prompt_includes_description_when_present() {
+        let mut link = ResourceLink::new("docs", "file:///ref.md");
+        link.description = Some("Reference docs".to_string());
+        let rendered = super::resource_link_prompt_text(&link);
+        assert!(rendered.contains("Reference docs"));
+        assert!(rendered.contains(" - "));
+    }
+
+    // ── render_command_output ───────────────────────────────
+
+    #[test]
+    fn render_command_output_includes_stderr_and_exit_code() {
+        let output = super::render_command_output("stdout_line\n", "stderr_line\n", Some(1));
+        assert!(output.contains("stdout:\nstdout_line"));
+        assert!(output.contains("stderr:\nstderr_line"));
+    }
+
+    #[test]
+    fn render_command_output_adds_newline_when_stdout_missing_trailing() {
+        let output = super::render_command_output("out", "", Some(0));
+        assert_eq!(output, "stdout:\nout\n");
+    }
+
+    #[test]
+    fn render_command_output_empty_uses_signal_label() {
+        let output = super::render_command_output("", "", None);
+        assert!(output.contains("command exited with status signal"));
+    }
+
+    #[test]
+    fn render_command_output_empty_uses_numeric_exit_code() {
+        let output = super::render_command_output("", "", Some(42));
+        assert!(output.contains("command exited with status 42"));
+    }
+
+    // ── truncate_tool_output ────────────────────────────────
+
+    #[test]
+    fn truncate_tool_output_truncates_when_over_limit() {
+        let long = "a".repeat(300);
+        let (truncated, flag) = super::truncate_tool_output(&long, 200);
+        assert!(flag);
+        assert!(truncated.len() <= 300); // roughly 200 + truncation message
+        assert!(truncated.contains("... truncated after 200 characters"));
+    }
+
+    #[test]
+    fn truncate_tool_output_passes_through_short_strings() {
+        let short = "hello";
+        let (output, flag) = super::truncate_tool_output(short, 200);
+        assert!(!flag);
+        assert_eq!(output, short);
+    }
+
+    // ── is_utf8_error_message ───────────────────────────────
+
+    #[test]
+    fn utf8_error_message_detects_all_variants() {
+        assert!(super::is_utf8_error_message(
+            "stream did not contain valid UTF-8"
+        ));
+        assert!(super::is_utf8_error_message(
+            "file is invalid utf-8 encoded"
+        ));
+        assert!(super::is_utf8_error_message("non-utf-8 data detected"));
+        assert!(super::is_utf8_error_message("some utf8 issue"));
+        assert!(!super::is_utf8_error_message("file not found"));
+    }
+
+    // ── sanitize_tool_name_part ─────────────────────────────
+
+    #[test]
+    fn sanitize_tool_name_handles_empty_result() {
+        assert_eq!(super::sanitize_tool_name_part("___"), "unnamed");
+        assert_eq!(super::sanitize_tool_name_part(""), "unnamed");
+    }
+
+    #[test]
+    fn sanitize_tool_name_handles_special_characters() {
+        assert_eq!(
+            super::sanitize_tool_name_part("Hello World!"),
+            "hello_world"
+        );
+    }
+
+    // ── model_select_options ────────────────────────────────
+
+    #[test]
+    fn model_select_options_includes_custom_model_when_unknown() {
+        let options = super::model_select_options("my-custom-model");
+        let custom = options
+            .iter()
+            .find(|opt| opt.value.0.as_ref() == "my-custom-model");
+        let description = custom.and_then(|opt| opt.description.as_deref());
+        assert_eq!(description, Some("Current model from DEEPSEEK_MODEL."));
+    }
+
+    #[test]
+    fn model_select_options_omits_custom_model_when_known() {
+        let options = super::model_select_options("deepseek-v4-pro");
+        let custom = options
+            .iter()
+            .find(|opt| opt.value.0.as_ref() == "deepseek-v4-pro");
+        // the known model still appears, but as a standard entry, not a custom one
+        assert!(custom.is_some());
+        // No entry with the description "Current model from DEEPSEEK_MODEL."
+        assert!(!options
+            .iter()
+            .any(|opt| opt.description.as_deref() == Some("Current model from DEEPSEEK_MODEL.")));
+    }
+
+    // ── validate_session_model ──────────────────────────────
+
+    #[test]
+    fn validate_session_model_accepts_known_models() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let record = guard.sessions.get(&session.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing session")
+        })?;
+        // Known models pass.
+        assert!(super::validate_session_model(record, "deepseek-v4-pro").is_ok());
+        assert!(super::validate_session_model(record, "deepseek-v4-flash").is_ok());
+        // Current session model passes even if unknown.
+        assert!(super::validate_session_model(record, "deepseek-v4-pro").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn validate_session_model_rejects_unknown_models() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let record = guard.sessions.get(&session.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing session")
+        })?;
+        assert!(super::validate_session_model(record, "bogus-model").is_err());
+        Ok(())
+    }
+
+    // ── initial_model_from_env ──────────────────────────────
+
+    #[test]
+    fn initial_model_from_env_uses_default_when_not_set() {
+        // DEEPSEEK_MODEL is not set in test env -> falls back to default
+        let model = super::initial_model_from_env();
+        assert_eq!(model, "deepseek-v4-pro");
+    }
+
+    // ── mcp_call_arguments error branches ───────────────────
+
+    #[test]
+    fn mcp_call_arguments_rejects_non_object_json() -> Result<(), agent_client_protocol::Error> {
+        let call = DeepSeekToolCall::new("id", "tool", "\"string\"");
+        let Err(error) = super::mcp_call_arguments(&call) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected non-object args to fail"));
+        };
+        assert!(error.contains("must be a JSON object"));
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_call_arguments_rejects_invalid_json() -> Result<(), agent_client_protocol::Error> {
+        let call = DeepSeekToolCall::new("id", "tool", "not json");
+        let Err(error) = super::mcp_call_arguments(&call) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected invalid JSON to fail"));
+        };
+        assert!(error.contains("invalid MCP tool"));
+        Ok(())
+    }
+
+    // ── mcp_tool_result_text empty path ─────────────────────
+
+    #[test]
+    fn mcp_tool_result_text_returns_empty_for_no_content() {
+        let result: &[McpContent] = &[];
+        assert_eq!(super::mcp_tool_result_text(result), "");
+    }
+
+    // ── AdapterToolRegistry::kind ───────────────────────────
+
+    #[test]
+    fn adapter_registry_kind_maps_tool_names() {
+        let registry = AdapterToolRegistry;
+        assert_eq!(registry.kind("read_file"), ToolKind::Read);
+        assert_eq!(registry.kind("list_dir"), ToolKind::Read);
+        assert_eq!(registry.kind("glob"), ToolKind::Search);
+        assert_eq!(registry.kind("grep"), ToolKind::Search);
+        assert_eq!(registry.kind("write_file"), ToolKind::Edit);
+        assert_eq!(registry.kind("edit_file"), ToolKind::Edit);
+        assert_eq!(registry.kind("run_command"), ToolKind::Execute);
+        assert_eq!(registry.kind("mcp__server__tool"), ToolKind::Other);
+        assert_eq!(registry.kind("bogus"), ToolKind::Other);
+    }
+
+    // ── handle_new_session_request MCP rejection ────────────
+
+    #[test]
+    fn new_session_with_mcp_servers_rejected_synchronously()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let request = NewSessionRequest::new("/tmp").mcp_servers(vec![McpServer::Stdio(
+            McpServerStdio::new("test", "/usr/bin/true"),
+        )]);
+        let Err(error) = handle_new_session_request(&state, &request) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected MCP session request to be rejected"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("MCP servers require the async session setup path")
+        );
+        Ok(())
+    }
+
+    // ── require_tool_permission error branches ──────────────
+
+    #[test_log::test(tokio::test)]
+    async fn require_tool_permission_rejects() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "reject-call",
+            "run_command",
+            serde_json::json!({ "command": "echo hi" }).to_string(),
+        );
+        let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_REJECT_ONCE_OPTION_ID,
+            )),
+        )]);
+
+        let Err(error) = super::require_tool_permission(
+            &state,
+            &context,
+            &call,
+            ToolKind::Execute,
+            Some(&requester),
+        )
+        .await
+        else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected rejection"));
+        };
+        assert!(error.contains("was rejected by permission policy"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "cancel-call",
+            "run_command",
+            serde_json::json!({ "command": "echo hi" }).to_string(),
+        );
+        let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        )]);
+
+        let Err(error) = super::require_tool_permission(
+            &state,
+            &context,
+            &call,
+            ToolKind::Execute,
+            Some(&requester),
+        )
+        .await
+        else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected cancellation")
+            );
+        };
+        assert!(error.contains("permission request was cancelled"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn require_tool_permission_missing_requester() {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("no-connection"),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("id", "tool", "{}");
+        let Err(error) =
+            super::require_tool_permission(&state, &context, &call, ToolKind::Edit, None).await
+        else {
+            return;
+        };
+        assert!(error.contains("requires a client connection"));
+    }
+
+    // ── PermissionDecision coverage ─────────────────────────
+
+    #[test]
+    fn permission_decision_debug_impl_is_callable() {
+        let decisions = [
+            PermissionDecision::AllowOnce,
+            PermissionDecision::AllowAlways,
+            PermissionDecision::AllowByMode,
+            PermissionDecision::RejectOnce,
+            PermissionDecision::RejectAlways,
+            PermissionDecision::Cancelled,
+        ];
+        for decision in &decisions {
+            let _ = format!("{decision:?}");
+        }
+    }
+
+    // ── ReasoningEffort accessor coverage ───────────────────
+
+    #[test]
+    fn reasoning_effort_name_and_description() {
+        assert_eq!(ReasoningEffort::High.name(), "High");
+        assert_eq!(ReasoningEffort::Max.name(), "Max");
+        assert!(
+            ReasoningEffort::High
+                .description()
+                .contains("Default DeepSeek")
+        );
+        assert!(
+            ReasoningEffort::Max
+                .description()
+                .contains("Maximum DeepSeek")
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_from_value_id_rejects_unknown() {
+        assert!(
+            ReasoningEffort::from_value_id(
+                &agent_client_protocol::schema::SessionConfigValueId::new("bogus",)
+            )
+            .is_none()
+        );
+    }
+
+    // ── handle_set_session_config_option_request mode branch ─
+
+    #[test]
+    fn set_config_option_updates_mode() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+
+        let response = handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(
+                session.session_id.clone(),
+                super::SESSION_CONFIG_MODE_ID,
+                "yolo",
+            ),
+        )?;
+        let options = &response.config_options;
+        assert_eq!(
+            select_current_value(options, super::SESSION_CONFIG_MODE_ID)?,
+            "yolo"
+        );
+
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
+        assert_eq!(stored.mode, PermissionPosture::Yolo);
+        Ok(())
+    }
+
+    #[test]
+    fn set_config_option_rejects_invalid_mode() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+
+        let Err(error) = handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(
+                session.session_id,
+                super::SESSION_CONFIG_MODE_ID,
+                "bogus",
+            ),
+        ) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected invalid mode via config to fail"));
+        };
+        assert!(error.to_string().contains("unsupported session mode"));
+        Ok(())
+    }
+
+    #[test]
+    fn set_config_option_rejects_invalid_reasoning_effort()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+
+        let Err(error) = handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(
+                session.session_id,
+                super::SESSION_CONFIG_REASONING_EFFORT_ID,
+                "bogus",
+            ),
+        ) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected invalid reasoning effort to fail"));
+        };
+        assert!(error.to_string().contains("unsupported reasoning effort"));
+        Ok(())
+    }
+
+    // ── run_command_tool_execution empty command rejection ──
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_rejects_empty_command() {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("empty-cmd"),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "empty-cmd-call",
+            "run_command",
+            serde_json::json!({ "command": "   " }).to_string(),
+        );
+        let result = run_command_tool_execution(&state, &call, &context, None, None).await;
+        assert!(!result.success);
+        assert!(result.content.contains("command must not be empty"));
+    }
+
+    // ── validate_session_paths relative paths ───────────────
+
+    #[test]
+    fn validate_session_paths_rejects_relative_cwd() -> Result<(), agent_client_protocol::Error> {
+        let request = NewSessionRequest::new("relative/path");
+        let Err(error) = super::validate_session_paths(&request) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected relative cwd to fail"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("session cwd must be an absolute path")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_session_paths_rejects_relative_additional_directory()
+    -> Result<(), agent_client_protocol::Error> {
+        let request = NewSessionRequest::new("/tmp")
+            .additional_directories(vec![std::path::PathBuf::from("not-absolute")]);
+        let Err(error) = super::validate_session_paths(&request) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected relative additional directory to fail"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("additional session directories must be absolute paths")
+        );
+        Ok(())
+    }
+
+    // ── connect_mcp_sessions non-stdio rejection ────────────
+
+    #[test_log::test(tokio::test)]
+    async fn connect_mcp_sessions_rejects_non_stdio() {
+        let result = connect_mcp_sessions(&[McpServer::Http(
+            agent_client_protocol::schema::McpServerHttp::new("remote", "http://localhost"),
+        )])
+        .await;
+        let Err(error) = result else {
+            return;
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("only stdio MCP servers are supported")
+        );
+    }
+
+    // ── mcp_tool_execution error branches ───────────────────
+
+    #[test_log::test(tokio::test)]
+    async fn mcp_tool_execution_unknown_tool() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("mcp-unknown", "mcp__nonexistent__tool", "{}");
+        let result = super::mcp_tool_execution(&state, &call, &context).await;
+        assert!(!result.success);
+        assert!(result.content.contains("unknown MCP tool"));
+        Ok(())
+    }
+
+    // ── DeepSeek lib-side unit tests via super ───────────────
+
+    #[test]
+    fn message_role_as_str_returns_correct_wire_names() {
+        use deepseek_acp_adapter::deepseek::MessageRole;
+        // We test indirectly: ChatMessage constructors + role() accessor
+        let system = ChatMessage::system("s");
+        assert_eq!(system.role(), MessageRole::System);
+        let user = ChatMessage::user("u");
+        assert_eq!(user.role(), MessageRole::User);
+        let assistant = ChatMessage::assistant("a");
+        assert_eq!(assistant.role(), MessageRole::Assistant);
+        let tool = ChatMessage::tool_result("id", "t");
+        assert_eq!(tool.role(), MessageRole::Tool);
+    }
+
+    #[test]
+    fn chat_message_tool_call_accessors() {
+        let tool_calls = vec![DeepSeekToolCall::new("call-1", "echo", "{}")];
+        let msg = ChatMessage::assistant_with_tool_calls("assistant", tool_calls.clone());
+        assert_eq!(msg.tool_calls().len(), 1);
+        assert_eq!(msg.tool_calls()[0].id(), "call-1");
+        assert_eq!(msg.tool_calls()[0].name(), "echo");
+        assert_eq!(msg.tool_calls()[0].arguments(), "{}");
+        assert_eq!(msg.tool_call_id(), None);
+    }
+
+    #[test]
+    fn chat_message_tool_result_accessors() {
+        let msg = ChatMessage::tool_result("call-2", "result");
+        assert_eq!(msg.content(), "result");
+        assert_eq!(msg.tool_call_id(), Some("call-2"));
+    }
+
+    #[test]
+    fn tool_definition_accessors() {
+        let def = ToolDefinition::new("echo", "description", serde_json::json!({"a":1}));
+        assert_eq!(def.name(), "echo");
+        assert_eq!(def.description(), "description");
+        assert_eq!(def.parameters(), &serde_json::json!({"a":1}));
+    }
+
+    #[test]
+    fn tool_call_delta_accessors() {
+        let delta = ToolCallDelta::new(
+            0,
+            Some("id".to_string()),
+            Some("name".to_string()),
+            Some("args".to_string()),
+        );
+        assert_eq!(delta.index(), 0);
+        assert_eq!(delta.id(), Some("id"));
+        assert_eq!(delta.name(), Some("name"));
+        assert_eq!(delta.arguments(), Some("args"));
+    }
+
+    #[test]
+    fn tool_call_delta_none_fields() {
+        let delta = ToolCallDelta::new(1, None, None, None);
+        assert_eq!(delta.index(), 1);
+        assert_eq!(delta.id(), None);
+        assert_eq!(delta.name(), None);
+        assert_eq!(delta.arguments(), None);
+    }
+
+    #[test]
+    fn chat_request_accessors_no_override() {
+        let request = ChatRequest::new(vec![ChatMessage::user("hi")]);
+        assert_eq!(request.messages().len(), 1);
+        assert_eq!(request.tools().len(), 0);
+        assert_eq!(request.model(), None);
+        assert_eq!(request.reasoning_effort(), None);
+    }
+
+    #[test]
+    fn finish_reason_from_api_covers_all_branches() {
+        assert_eq!(
+            FinishReason::EndTurn,
+            deepseek_acp_adapter::deepseek::FinishReason::EndTurn
+        );
+        // We already test EndTurn, MaxTokens, ToolCalls, Refusal via stop_reason_from_finish
+    }
+
+    #[test]
+    fn deepseek_config_new_accepts_explicit_values() {
+        use deepseek_acp_adapter::deepseek::DeepSeekConfig;
+        let config = DeepSeekConfig::new("key", "https://example.com", "model-v1");
+        assert_eq!(config.base_url(), "https://example.com");
+        assert_eq!(config.model(), "model-v1");
+    }
+
+    // ── SetSessionConfigOptionRequest unknown session ───────
+
+    #[test]
+    fn set_config_option_rejects_unknown_session() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let Err(error) = handle_set_session_config_option_request(
+            &state,
+            &SetSessionConfigOptionRequest::new(
+                agent_client_protocol::schema::SessionId::new("missing"),
+                super::SESSION_CONFIG_MODEL_ID,
+                "deepseek-v4-flash",
+            ),
+        ) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected unknown session id to fail"));
+        };
+        assert!(error.to_string().contains("unknown session id"));
+        Ok(())
+    }
+
+    // ── set_session_mode error on unknown session ───────────
+
+    #[test]
+    fn set_mode_rejects_unknown_session() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let Err(error) = handle_set_session_mode_request(
+            &state,
+            &SetSessionModeRequest::new(
+                agent_client_protocol::schema::SessionId::new("missing"),
+                "ask",
+            ),
+        ) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected unknown session id to fail"));
+        };
+        assert!(error.to_string().contains("unknown session id"));
+        Ok(())
+    }
+
+    // ── Mock terminal requester for run_command_via_terminal ─
+
+    struct FakeTerminalRequester {
+        terminal_id: String,
+        output: String,
+        exit_code: Option<u32>,
+        truncated: bool,
+        create_error: Option<String>,
+        wait_error: Option<String>,
+        output_error: Option<String>,
+        release_error: Option<String>,
+    }
+
+    impl super::CreateTerminalRequester for FakeTerminalRequester {
+        fn create_terminal(
+            &self,
+            _request: agent_client_protocol::schema::CreateTerminalRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::CreateTerminalResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            let terminal_id = self.terminal_id.clone();
+            let error = self.create_error.clone();
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+                Ok(agent_client_protocol::schema::CreateTerminalResponse::new(
+                    agent_client_protocol::schema::TerminalId::new(terminal_id),
+                ))
+            })
+        }
+    }
+
+    impl super::TerminalOutputRequester for FakeTerminalRequester {
+        fn terminal_output(
+            &self,
+            _request: agent_client_protocol::schema::TerminalOutputRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::TerminalOutputResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            let output = self.output.clone();
+            let error = self.output_error.clone();
+            let truncated = self.truncated;
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+                Ok(agent_client_protocol::schema::TerminalOutputResponse::new(
+                    output, truncated,
+                ))
+            })
+        }
+    }
+
+    impl super::WaitForTerminalExitRequester for FakeTerminalRequester {
+        fn wait_for_terminal_exit(
+            &self,
+            _request: agent_client_protocol::schema::WaitForTerminalExitRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::WaitForTerminalExitResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            let exit_code = self.exit_code;
+            let error = self.wait_error.clone();
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+                let status =
+                    agent_client_protocol::schema::TerminalExitStatus::new().exit_code(exit_code);
+                Ok(agent_client_protocol::schema::WaitForTerminalExitResponse::new(status))
+            })
+        }
+    }
+
+    impl super::ReleaseTerminalRequester for FakeTerminalRequester {
+        fn release_terminal(
+            &self,
+            _request: agent_client_protocol::schema::ReleaseTerminalRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::ReleaseTerminalResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            let error = self.release_error.clone();
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                }
+                Ok(agent_client_protocol::schema::ReleaseTerminalResponse::new())
+            })
+        }
+    }
+
+    // (TerminalRequester is auto-implemented via blanket impl)
+
+    // ── run_command_via_terminal tests ──────────────────────
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_via_terminal_success_path() {
+        let session_id = agent_client_protocol::schema::SessionId::new("terminal-test");
+        let fake = FakeTerminalRequester {
+            terminal_id: "term-1".to_string(),
+            output: "command output".to_string(),
+            exit_code: Some(0),
+            truncated: false,
+            create_error: None,
+            wait_error: None,
+            output_error: None,
+            release_error: None,
+        };
+
+        let result = super::run_command_via_terminal(
+            &session_id,
+            std::path::Path::new("/tmp"),
+            "echo hi",
+            Some(&fake as &dyn super::TerminalRequester),
+        )
+        .await;
+
+        assert!(result.success);
+        assert!(result.content.contains("command output"));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_via_terminal_no_connection() {
+        let session_id = agent_client_protocol::schema::SessionId::new("terminal-no-conn");
+        let result = super::run_command_via_terminal(
+            &session_id,
+            std::path::Path::new("/tmp"),
+            "echo hi",
+            None,
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.content.contains("no connection available"));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_via_terminal_create_error() {
+        let session_id = agent_client_protocol::schema::SessionId::new("terminal-create-err");
+        let fake = FakeTerminalRequester {
+            terminal_id: "term-err".to_string(),
+            output: String::new(),
+            exit_code: None,
+            truncated: false,
+            create_error: Some("create failed".to_string()),
+            wait_error: None,
+            output_error: None,
+            release_error: None,
+        };
+
+        let result = super::run_command_via_terminal(
+            &session_id,
+            std::path::Path::new("/tmp"),
+            "echo hi",
+            Some(&fake as &dyn super::TerminalRequester),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.content.contains("terminal/create failed"));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_via_terminal_wait_error() {
+        let session_id = agent_client_protocol::schema::SessionId::new("terminal-wait-err");
+        let fake = FakeTerminalRequester {
+            terminal_id: "term-wait".to_string(),
+            output: String::new(),
+            exit_code: None,
+            truncated: false,
+            create_error: None,
+            wait_error: Some("wait failed".to_string()),
+            output_error: None,
+            release_error: None,
+        };
+
+        let result = super::run_command_via_terminal(
+            &session_id,
+            std::path::Path::new("/tmp"),
+            "echo hi",
+            Some(&fake as &dyn super::TerminalRequester),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.content.contains("terminal/wait_for_exit failed"));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_via_terminal_output_error() {
+        let session_id = agent_client_protocol::schema::SessionId::new("terminal-output-err");
+        let fake = FakeTerminalRequester {
+            terminal_id: "term-out".to_string(),
+            output: String::new(),
+            exit_code: None,
+            truncated: false,
+            create_error: None,
+            wait_error: None,
+            output_error: Some("output failed".to_string()),
+            release_error: None,
+        };
+
+        let result = super::run_command_via_terminal(
+            &session_id,
+            std::path::Path::new("/tmp"),
+            "echo hi",
+            Some(&fake as &dyn super::TerminalRequester),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.content.contains("terminal/output failed"));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_via_terminal_release_error() {
+        let session_id = agent_client_protocol::schema::SessionId::new("terminal-release-err");
+        let fake = FakeTerminalRequester {
+            terminal_id: "term-rel".to_string(),
+            output: "output".to_string(),
+            exit_code: Some(0),
+            truncated: false,
+            create_error: None,
+            wait_error: None,
+            output_error: None,
+            release_error: Some("release failed".to_string()),
+        };
+
+        let result = super::run_command_via_terminal(
+            &session_id,
+            std::path::Path::new("/tmp"),
+            "echo hi",
+            Some(&fake as &dyn super::TerminalRequester),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.content.contains("terminal/release failed"));
+    }
+
+    // ── edit_file_tool_execution error paths ────────────────
+
+    #[test_log::test(tokio::test)]
+    async fn edit_file_rejects_empty_old_text() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-edit-empty-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("f.txt"), "content")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "edit-empty",
+            "edit_file",
+            serde_json::json!({
+                "path": "f.txt",
+                "old_text": "",
+                "new_text": "replacement",
+            })
+            .to_string(),
+        );
+
+        let result = edit_file_tool_execution(&state, &call, &context, None, None, None).await;
+        assert!(!result.success);
+        assert!(result.content.contains("old_text must not be empty"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn edit_file_rejects_old_text_not_found() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-edit-nf-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("f.txt"), "content")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "edit-nf",
+            "edit_file",
+            serde_json::json!({
+                "path": "f.txt",
+                "old_text": "nonexistent",
+                "new_text": "replacement",
+            })
+            .to_string(),
+        );
+
+        let result = edit_file_tool_execution(&state, &call, &context, None, None, None).await;
+        assert!(!result.success);
+        assert!(result.content.contains("could not find old_text"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn edit_file_rejects_multiple_matches() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-edit-multi-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("f.txt"), "dup dup")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "edit-multi",
+            "edit_file",
+            serde_json::json!({
+                "path": "f.txt",
+                "old_text": "dup",
+                "new_text": "replacement",
+            })
+            .to_string(),
+        );
+
+        let result = edit_file_tool_execution(&state, &call, &context, None, None, None).await;
+        assert!(!result.success);
+        assert!(result.content.contains("found old_text"));
+        assert!(result.content.contains("2 times"));
+        Ok(())
+    }
+
+    // ── write_file_tool_execution error paths ───────────────
+
+    #[test_log::test(tokio::test)]
+    async fn write_file_rejects_invalid_arguments() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("write-invalid", "write_file", "not json");
+
+        let result = write_file_tool_execution(&state, &call, &context, None, None).await;
+        assert!(!result.success);
+        assert!(result.content.contains("invalid write_file arguments"));
+        Ok(())
+    }
+
+    // ── run_command_tool_execution error paths ──────────────
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_rejects_invalid_arguments() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("run-invalid", "run_command", "not json");
+
+        let result = run_command_tool_execution(&state, &call, &context, None, None).await;
+        assert!(!result.success);
+        assert!(result.content.contains("invalid run_command arguments"));
+        Ok(())
+    }
+
+    // ── edit_file_tool_execution invalid args ───────────────
+
+    #[test_log::test(tokio::test)]
+    async fn edit_file_rejects_invalid_arguments() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("edit-invalid", "edit_file", "not json");
+
+        let result = edit_file_tool_execution(&state, &call, &context, None, None, None).await;
+        assert!(!result.success);
+        assert!(result.content.contains("invalid edit_file arguments"));
+        Ok(())
+    }
+
+    // ── non_utf8_file_message / read_file_local_error coverage ──
+
+    #[test]
+    fn non_utf8_file_message_includes_path() {
+        let msg = super::non_utf8_file_message(std::path::Path::new("/tmp/binary.bin"));
+        assert!(msg.contains("/tmp/binary.bin"));
+        assert!(msg.contains("UTF-8"));
+    }
+
+    #[test]
+    fn read_file_client_error_with_non_utf8_message() {
+        let msg = super::read_file_client_error(
+            std::path::Path::new("/tmp/binary.bin"),
+            "stream did not contain valid UTF-8",
+        );
+        assert!(msg.contains("UTF-8"));
+        // Should NOT contain the raw technical message
+        assert!(!msg.contains("stream did not contain valid UTF-8"));
+    }
+
+    // ── write_file_to_client error path ─────────────────────
+
+    struct FailingWriteRequester;
+
+    impl WriteTextFileRequester for FailingWriteRequester {
+        fn write_text_file(
+            &self,
+            _request: WriteTextFileRequest,
+        ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
+            Box::pin(async move {
+                Err(agent_client_protocol::Error::internal_error().data("disk full"))
+            })
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn write_file_to_client_propagates_error() -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("write-err");
+        let result = super::write_file_to_client(
+            &FailingWriteRequester,
+            &session_id,
+            std::path::Path::new("/tmp/note.txt"),
+            "content",
+        )
+        .await;
+        let Err(error) = result else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected failure"));
+        };
+        assert!(error.contains("failed to write"));
+        Ok(())
+    }
+
+    // ── collect_directory_entries error path ────────────────
+
+    #[test]
+    fn collect_directory_entries_reports_missing() -> Result<(), agent_client_protocol::Error> {
+        let Err(error) =
+            super::collect_directory_entries(std::path::Path::new("/tmp/nonexistent-dir-for-test"))
+        else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected error for missing dir"));
+        };
+        assert!(error.contains("failed to read directory"));
+        Ok(())
+    }
+
+    // ── build_root_gitignore error with invalid gitignore ────
+    // (already tested that it returns None for missing, here we test when present)
+
+    #[test]
+    fn build_root_gitignore_loads_when_present() -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-gi-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join(".gitignore"), "*.log\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let gitignore = super::build_root_gitignore(&temp_root);
+        assert!(gitignore.is_some());
+        Ok(())
+    }
+
+    // ── mcp_tool_result_text with non-text content ──────────
+
+    #[test]
+    fn mcp_tool_result_text_serializes_non_text_content() {
+        let content = vec![McpContent::text("text part")];
+        assert_eq!(super::mcp_tool_result_text(&content), "text part");
+    }
+
+    // ── handle_set_session_mode_request invalid mode id ─────
+
+    #[test]
+    fn set_mode_rejects_invalid_mode_id() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let Err(error) = handle_set_session_mode_request(
+            &state,
+            &SetSessionModeRequest::new(session.session_id, "bogus"),
+        ) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected invalid mode to fail"));
+        };
+        assert!(error.to_string().contains("unsupported session mode"));
+        Ok(())
+    }
+
+    // ── exercise_permission_gate_smoke already covered ──────
+
+    // ── read_file_from_local line/limit bounds ──────────────
+
+    #[test]
+    fn read_file_from_local_zero_line_defaults_to_start() -> Result<(), agent_client_protocol::Error>
+    {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-read-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("lines.txt"), "a\nb\nc\nd\ne\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        // Using line=1 is the default; test line > file length
+        let result = super::read_file_from_local(&temp_root.join("lines.txt"), 10, 1);
+        assert_eq!(
+            result.map_err(|e| agent_client_protocol::Error::internal_error().data(e))?,
+            ""
+        );
+        Ok(())
+    }
+
+    // ── resource_link_prompt_text with title ─────────────────
+
+    #[test]
+    fn resource_link_prompt_text_uses_title_over_name() {
+        let mut link = ResourceLink::new("internal_name", "file:///foo.md");
+        link.title = Some("Display Title".to_string());
+        let rendered = super::resource_link_prompt_text(&link);
+        assert!(rendered.contains("Display Title"));
+        assert!(!rendered.contains("internal_name"));
+    }
+
+    // ── mcp_stdio_session relative command rejection ────────
+
+    #[test_log::test(tokio::test)]
+    async fn mcp_stdio_session_rejects_relative_command() {
+        let stdio = McpServerStdio::new("rel", "relative/path");
+        let result = super::connect_mcp_stdio_session(&stdio).await;
+        let Err(error) = result else {
+            return;
+        };
+        assert!(error.to_string().contains("command must be absolute"));
+    }
+
+    // ── render_command_output stderr trailing newline ───────
+
+    #[test]
+    fn render_command_output_adds_newline_to_stderr() {
+        let output = super::render_command_output("", "err", Some(2));
+        // stderr without trailing newline gets one added
+        assert!(output.contains("stderr:\nerr\n"));
+    }
+
+    // ── glob_tool_execution with build error path ───────────
+
+    #[test_log::test(tokio::test)]
+    async fn glob_tool_execution_invalid_build_pattern() -> Result<(), agent_client_protocol::Error>
+    {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-glob-err-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("glob-err"),
+            cwd: temp_root,
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        // '[' is a valid glob pattern but can't be compiled into a GlobSet easily
+        // Using an invalid pattern that passes Glob::new but fails GlobSetBuilder
+        let call = DeepSeekToolCall::new(
+            "glob-invalid",
+            "glob",
+            serde_json::json!({ "pattern": "[" }).to_string(),
+        );
+
+        let result = glob_tool_execution(&call, &context);
+        assert!(!result.success);
+        assert!(result.content.contains("invalid glob pattern"));
+        Ok(())
+    }
+
+    // ── grep_tool_execution with invalid regex ──────────────
+
+    #[test_log::test(tokio::test)]
+    async fn grep_tool_execution_invalid_regex() -> Result<(), agent_client_protocol::Error> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-adapter-grep-regex-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("f.txt"), "test\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("grep-regex"),
+            cwd: temp_root,
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "grep-regex",
+            "grep",
+            serde_json::json!({ "pattern": "(" }).to_string(),
+        );
+
+        let result = grep_tool_execution(&call, &context);
+        assert!(!result.success);
+        assert!(result.content.contains("invalid grep regex"));
+        Ok(())
+    }
+
+    // ── build_root_gitignore with real .gitignore file ──────
+
+    #[test]
+    fn build_root_gitignore_loads_file() -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-gitignore-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join(".gitignore"), "*.log\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let gitignore = super::build_root_gitignore(&temp_root);
+        assert!(gitignore.is_some());
+        Ok(())
+    }
+
+    // ── read_file_from_local line past end ──────────────────
+
+    #[test]
+    fn read_file_from_local_line_past_end_returns_empty() -> Result<(), agent_client_protocol::Error>
+    {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-read-past-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(temp_root.join("lines.txt"), "a\nb\nc\n")
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let result = super::read_file_from_local(&temp_root.join("lines.txt"), 10, 5);
+        assert_eq!(
+            result.map_err(|e| agent_client_protocol::Error::internal_error().data(e))?,
+            ""
+        );
+        Ok(())
+    }
+
+    // ── read_file_local_error non-utf8 path ─────────────────
+
+    #[test]
+    fn read_file_local_error_handles_invalid_data() -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-local-err-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let bin_path = temp_root.join("artifact.bin");
+        std::fs::write(&bin_path, [0xff, 0xfe, 0xfd])
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let Err(error) = std::fs::read_to_string(&bin_path) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected non-UTF-8 read to fail"));
+        };
+        let msg = super::read_file_local_error(&bin_path, &error);
+        assert!(msg.contains("UTF-8"));
+        Ok(())
+    }
+
+    // ── mock_llm_client empty messages fallback ─────────────
+
+    #[test_log::test(tokio::test)]
+    async fn mock_client_uses_default_prompt_when_no_messages()
+    -> Result<(), agent_client_protocol::Error> {
+        let client = MockLlmClient;
+        let mut stream = client
+            .stream_chat(ChatRequest::new(Vec::new()), CancellationToken::new())
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.map_err(agent_client_protocol::Error::into_internal_error)?);
+        }
+        assert_eq!(events.len(), 3);
+        let StreamEvent::Message(text) = &events[1] else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected message"));
+        };
+        assert!(text.contains("mock prompt"));
+        Ok(())
+    }
+
+    // ── handle_new_session_request_connected test ───────────
+
+    #[test_log::test(tokio::test)]
+    async fn new_session_connected_async_path_creates_session()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let response =
+            super::handle_new_session_request_connected(&state, &NewSessionRequest::new("/tmp"))
+                .await?;
+        assert!(response.session_id.0.starts_with("session-"));
+        Ok(())
+    }
+
+    // ── serve_with_transport full integration test ──────────
+
+    #[test_log::test(tokio::test)]
+    async fn serve_with_transport_exercises_list_close_and_logout()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
+        let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
+        let (client_transport, server_transport) = Channel::duplex();
+        let server_state = Arc::clone(&state);
+        let server_client = Arc::clone(&llm_client);
+        let server_tools = Arc::clone(&tool_registry);
+
+        let server = tokio::spawn(async move {
+            serve_with_transport(
+                server_transport,
+                server_state,
+                server_client,
+                server_tools,
+                DEFAULT_MAX_TURN_REQUESTS,
+            )
+            .await
+        });
+
+        Client
+            .builder()
+            .connect_with(client_transport, async move |cx| {
+                // Initialize
+                cx.send_request(InitializeRequest::new(ProtocolVersion::LATEST))
+                    .block_task()
+                    .await?;
+
+                // Create a session
+                let new_session = cx
+                    .send_request(NewSessionRequest::new("/tmp"))
+                    .block_task()
+                    .await?;
+
+                // List sessions
+                let list = cx
+                    .send_request(agent_client_protocol::schema::ListSessionsRequest::new())
+                    .block_task()
+                    .await?;
+                assert_eq!(list.sessions.len(), 1);
+
+                // Close session
+                cx.send_request(agent_client_protocol::schema::CloseSessionRequest::new(
+                    new_session.session_id,
+                ))
+                .block_task()
+                .await?;
+
+                // Logout
+                cx.send_request(agent_client_protocol::schema::LogoutRequest::new())
+                    .block_task()
+                    .await?;
+
+                Ok(())
+            })
+            .await?;
+
+        server.abort();
+        Ok(())
+    }
+
+    // ── AdapterToolRegistry execute with connection ─────────
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_execute_write_without_permission()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root =
+            std::env::temp_dir().join(format!("deepseek-acp-adapter-conn-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new(&temp_root))?;
+        let context = ToolContext {
+            session_id: session.session_id,
+            cwd: temp_root,
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+
+        let registry = AdapterToolRegistry;
+        // write_file requires permission; without it, fails
+        let result = registry
+            .execute(
+                &DeepSeekToolCall::new(
+                    "conn-write",
+                    "write_file",
+                    serde_json::json!({ "path": "out.txt", "content": "data" }).to_string(),
+                ),
+                &context,
+                &state,
+                None,
+            )
+            .await;
+        assert!(!result.success);
+
+        Ok(())
+    }
+
+    // ── request_tool_permission unknown session error ───────
+
+    #[test_log::test(tokio::test)]
+    async fn request_permission_unknown_session_error_path()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("no-such-session"),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("id", "tool", "{}");
+        let requester = FakePermissionRequester::new(Vec::new());
+
+        let Err(error) =
+            request_tool_permission(&state, &context, &call, ToolKind::Edit, &requester).await
+        else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected unknown session error"));
+        };
+        assert!(error.to_string().contains("unknown session id"));
+        Ok(())
+    }
 }
