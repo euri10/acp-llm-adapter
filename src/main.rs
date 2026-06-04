@@ -15,7 +15,7 @@
 // `#[must_use]` on every internal binary helper is noise at this stage.
 #![allow(clippy::must_use_candidate)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,11 +26,12 @@ use std::{error::Error, process::ExitCode};
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionMode, SessionModeState, SessionNotification,
-    SessionUpdate, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
+    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
+    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::util::MatchDispatch;
@@ -57,6 +58,13 @@ use uuid::Uuid;
 
 type AdapterResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 const MAX_TURN_REQUESTS: usize = 25;
+const PERMISSION_ALLOW_ONCE_OPTION_ID: &str = "allow_once";
+const PERMISSION_ALLOW_ALWAYS_OPTION_ID: &str = "allow_always";
+const PERMISSION_REJECT_ONCE_OPTION_ID: &str = "reject_once";
+const PERMISSION_REJECT_ALWAYS_OPTION_ID: &str = "reject_always";
+const SESSION_MODE_ASK_ID: &str = "ask";
+const SESSION_MODE_ACCEPT_EDITS_ID: &str = "accept-edits";
+const SESSION_MODE_YOLO_ID: &str = "yolo";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -151,6 +159,52 @@ async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protoc
     )?;
     let result = run_smoke_flow(agent, prompt).await?;
     print_dev_smoke_result(&result);
+    exercise_permission_gate_smoke().await?;
+    Ok(())
+}
+
+async fn exercise_permission_gate_smoke() -> Result<(), agent_client_protocol::Error> {
+    let state = Arc::new(Mutex::new(AdapterState::default()));
+    let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+    let context = ToolContext {
+        session_id: session.session_id.clone(),
+        cwd: std::env::current_dir().map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to get current directory: {error}"))
+        })?,
+        additional_directories: Vec::new(),
+        client_capabilities: None,
+    };
+    let call = DeepSeekToolCall::new(
+        "dev-permission-call",
+        "write_file",
+        serde_json::json!({ "path": "smoke.txt" }).to_string(),
+    );
+    let decision = request_tool_permission(
+        &state,
+        &context,
+        &call,
+        ToolKind::Edit,
+        &MockPermissionRequester,
+    )
+    .await?;
+
+    if !matches!(decision, PermissionDecision::AllowAlways) {
+        return Err(agent_client_protocol::Error::internal_error()
+            .data("permission gate smoke check did not allow always"));
+    }
+
+    let guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing permission smoke session")
+    })?;
+    if !stored.permission_allow_always.contains("write_file") {
+        return Err(agent_client_protocol::Error::internal_error()
+            .data("permission gate smoke check did not cache allow_always"));
+    }
+
     Ok(())
 }
 
@@ -311,6 +365,28 @@ impl LlmClient for MockLlmClient {
     }
 }
 
+#[derive(Debug, Default)]
+struct MockPermissionRequester;
+
+impl PermissionRequester for MockPermissionRequester {
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+        let outcome = request
+            .options
+            .iter()
+            .find(|option| option.kind == PermissionOptionKind::AllowAlways)
+            .map_or(RequestPermissionOutcome::Cancelled, |option| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    option.option_id.clone(),
+                ))
+            });
+
+        Box::pin(async move { Ok(RequestPermissionResponse::new(outcome)) })
+    }
+}
+
 async fn serve_with_transport(
     transport: impl ConnectTo<Agent> + 'static,
     state: Arc<Mutex<AdapterState>>,
@@ -319,6 +395,7 @@ async fn serve_with_transport(
 ) -> Result<(), agent_client_protocol::Error> {
     let initialize_state = Arc::clone(&state);
     let new_session_state = Arc::clone(&state);
+    let set_mode_state = Arc::clone(&state);
     let prompt_state = Arc::clone(&state);
     let prompt_client = Arc::clone(&llm_client);
     let prompt_tools = Arc::clone(&tool_registry);
@@ -342,6 +419,12 @@ async fn serve_with_transport(
         .on_receive_request(
             async move |request: NewSessionRequest, responder, _cx| {
                 responder.respond(handle_new_session_request(&new_session_state, &request)?)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: SetSessionModeRequest, responder, _cx| {
+                responder.respond(handle_set_session_mode_request(&set_mode_state, &request)?)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -410,10 +493,33 @@ fn handle_new_session_request(
             additional_directories: request.additional_directories.clone(),
             history: Vec::new(),
             active_turn: None,
+            mode: PermissionPosture::Ask,
+            permission_allow_always: HashSet::new(),
         },
     );
 
     Ok(NewSessionResponse::new(session_id).modes(default_session_modes()))
+}
+
+fn handle_set_session_mode_request(
+    state: &Arc<Mutex<AdapterState>>,
+    request: &SetSessionModeRequest,
+) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
+    let Some(mode) = PermissionPosture::from_mode_id(&request.mode_id) else {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data(format!("unsupported session mode: {}", request.mode_id.0)));
+    };
+
+    let mut guard = state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let session = guard.sessions.get_mut(&request.session_id).ok_or_else(|| {
+        agent_client_protocol::Error::invalid_params()
+            .data(format!("unknown session id: {}", request.session_id.0))
+    })?;
+    session.mode = mode;
+
+    Ok(SetSessionModeResponse::new())
 }
 
 async fn handle_prompt_request(
@@ -653,6 +759,13 @@ trait ReadTextFileRequester: Send + Sync {
     ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>>;
 }
 
+pub(crate) trait PermissionRequester: Send + Sync {
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>>;
+}
+
 impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn read_text_file(
         &self,
@@ -669,6 +782,172 @@ impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
     ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
         Box::pin(async move { self.send_request(request).block_task().await })
     }
+}
+
+impl PermissionRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionDecision {
+    AllowOnce,
+    AllowAlways,
+    AllowByMode,
+    RejectOnce,
+    RejectAlways,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PermissionPosture {
+    #[default]
+    Ask,
+    AcceptEdits,
+    Yolo,
+}
+
+impl PermissionPosture {
+    fn mode_id(self) -> SessionModeId {
+        match self {
+            Self::Ask => SessionModeId::new(SESSION_MODE_ASK_ID),
+            Self::AcceptEdits => SessionModeId::new(SESSION_MODE_ACCEPT_EDITS_ID),
+            Self::Yolo => SessionModeId::new(SESSION_MODE_YOLO_ID),
+        }
+    }
+
+    const fn allows_without_prompt(self, kind: ToolKind) -> bool {
+        match self {
+            Self::Ask => false,
+            Self::AcceptEdits => matches!(kind, ToolKind::Edit),
+            Self::Yolo => !matches!(
+                kind,
+                ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch
+            ),
+        }
+    }
+
+    fn from_mode_id(mode_id: &SessionModeId) -> Option<Self> {
+        match mode_id.0.as_ref() {
+            SESSION_MODE_ASK_ID => Some(Self::Ask),
+            SESSION_MODE_ACCEPT_EDITS_ID => Some(Self::AcceptEdits),
+            SESSION_MODE_YOLO_ID => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) async fn request_tool_permission(
+    state: &Arc<Mutex<AdapterState>>,
+    context: &ToolContext,
+    call: &DeepSeekToolCall,
+    kind: ToolKind,
+    requester: &dyn PermissionRequester,
+) -> Result<PermissionDecision, agent_client_protocol::Error> {
+    let posture = {
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let session = guard.sessions.get(&context.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session id: {}", context.session_id.0))
+        })?;
+
+        if session.permission_allow_always.contains(call.name()) {
+            return Ok(PermissionDecision::AllowAlways);
+        }
+
+        session.mode
+    };
+
+    if posture.allows_without_prompt(kind) {
+        return Ok(PermissionDecision::AllowByMode);
+    }
+
+    let request = RequestPermissionRequest::new(
+        context.session_id.clone(),
+        ToolCallUpdate::new(
+            call.id().to_string(),
+            ToolCallUpdateFields::new()
+                .kind(kind)
+                .status(ToolCallStatus::Pending)
+                .title(call.name().to_string())
+                .raw_input(tool_raw_input(call)),
+        ),
+        permission_options(),
+    );
+
+    let response = requester.request_permission(request).await?;
+    let decision = match response.outcome {
+        RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
+        RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
+            PERMISSION_ALLOW_ONCE_OPTION_ID => PermissionDecision::AllowOnce,
+            PERMISSION_ALLOW_ALWAYS_OPTION_ID => PermissionDecision::AllowAlways,
+            PERMISSION_REJECT_ONCE_OPTION_ID => PermissionDecision::RejectOnce,
+            PERMISSION_REJECT_ALWAYS_OPTION_ID => PermissionDecision::RejectAlways,
+            other => {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data(format!("unknown permission option selected: {other}")));
+            }
+        },
+        _ => {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("unsupported permission outcome variant"));
+        }
+    };
+
+    if decision == PermissionDecision::AllowAlways {
+        let mut guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let session = guard.sessions.get_mut(&context.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session id: {}", context.session_id.0))
+        })?;
+        session
+            .permission_allow_always
+            .insert(call.name().to_string());
+    }
+
+    Ok(decision)
+}
+
+fn permission_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption::new(
+            PERMISSION_ALLOW_ONCE_OPTION_ID,
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            PERMISSION_ALLOW_ALWAYS_OPTION_ID,
+            "Allow always",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new(
+            PERMISSION_REJECT_ONCE_OPTION_ID,
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        ),
+        PermissionOption::new(
+            PERMISSION_REJECT_ALWAYS_OPTION_ID,
+            "Reject always",
+            PermissionOptionKind::RejectAlways,
+        ),
+    ]
 }
 
 #[derive(Debug, Deserialize)]
@@ -1464,7 +1743,14 @@ fn validate_session_paths(request: &NewSessionRequest) -> Result<(), agent_clien
 }
 
 fn default_session_modes() -> SessionModeState {
-    SessionModeState::new("chat", vec![SessionMode::new("chat", "Chat")])
+    SessionModeState::new(
+        PermissionPosture::Ask.mode_id(),
+        vec![
+            SessionMode::new(PermissionPosture::Ask.mode_id(), "Ask"),
+            SessionMode::new(PermissionPosture::AcceptEdits.mode_id(), "Accept edits"),
+            SessionMode::new(PermissionPosture::Yolo.mode_id(), "Yolo"),
+        ],
+    )
 }
 
 fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_protocol::Error> {
@@ -1517,16 +1803,20 @@ struct SessionRecord {
     additional_directories: Vec<PathBuf>,
     history: Vec<ChatMessage>,
     active_turn: Option<CancellationToken>,
+    mode: PermissionPosture,
+    permission_allow_always: HashSet<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AdapterState, Backend, Cli, Command, EmptyToolRegistry, MAX_TURN_REQUESTS, MockLlmClient,
-        ReadOnlyToolRegistry, ReadTextFileRequester, ToolContext, ToolExecution, ToolRegistry,
-        build_dev_agent, build_initialize_response, handle_authenticate_request,
-        handle_cancel_notification, handle_initialize_request, handle_new_session_request,
-        handle_prompt_request, read_file_tool_execution, run_smoke_flow, serve_with_transport,
+        PermissionDecision, PermissionPosture, PermissionRequester, ReadOnlyToolRegistry,
+        ReadTextFileRequester, ToolContext, ToolExecution, ToolRegistry, build_dev_agent,
+        build_initialize_response, handle_authenticate_request, handle_cancel_notification,
+        handle_initialize_request, handle_new_session_request, handle_prompt_request,
+        handle_set_session_mode_request, read_file_tool_execution, request_tool_permission,
+        run_smoke_flow, serve_with_transport,
     };
     use agent_client_protocol::schema::McpServer;
     use agent_client_protocol::{Agent, Channel, Client};
@@ -1542,8 +1832,10 @@ mod tests {
 
     use agent_client_protocol::schema::{
         CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-        InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion, ReadTextFileRequest,
-        ReadTextFileResponse, SessionNotification, SessionUpdate, StopReason,
+        InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+        ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+        SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason, ToolKind,
     };
     use clap::Parser;
     use tokio_util::sync::CancellationToken;
@@ -1665,6 +1957,83 @@ mod tests {
                 self.result.clone()
             })
         }
+    }
+
+    struct FakePermissionRequester {
+        requests: Arc<Mutex<Vec<RequestPermissionRequest>>>,
+        responses: Mutex<VecDeque<RequestPermissionResponse>>,
+    }
+
+    impl FakePermissionRequester {
+        fn new(responses: Vec<RequestPermissionResponse>) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+
+        fn requests(&self) -> Arc<Mutex<Vec<RequestPermissionRequest>>> {
+            Arc::clone(&self.requests)
+        }
+    }
+
+    impl PermissionRequester for FakePermissionRequester {
+        fn request_permission(
+            &self,
+            request: RequestPermissionRequest,
+        ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>>
+        {
+            self.requests
+                .lock()
+                .map(|mut requests| requests.push(request))
+                .ok();
+
+            let response = self
+                .responses
+                .lock()
+                .map_err(|error| {
+                    agent_client_protocol::Error::internal_error().data(error.to_string())
+                })
+                .and_then(|mut responses| {
+                    responses.pop_front().ok_or_else(|| {
+                        agent_client_protocol::Error::internal_error()
+                            .data("fake permission requester was exhausted")
+                    })
+                });
+
+            Box::pin(async move { response })
+        }
+    }
+
+    type PermissionModeFixture = (
+        Arc<Mutex<AdapterState>>,
+        agent_client_protocol::schema::SessionId,
+        ToolContext,
+        DeepSeekToolCall,
+        DeepSeekToolCall,
+    );
+
+    fn permission_mode_fixture() -> Result<PermissionModeFixture, agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let edit_call = DeepSeekToolCall::new(
+            "call-edit",
+            "write_file",
+            serde_json::json!({ "path": "file.txt" }).to_string(),
+        );
+        let shell_call = DeepSeekToolCall::new(
+            "call-shell",
+            "run_command",
+            serde_json::json!({ "command": "echo hi" }).to_string(),
+        );
+
+        Ok((state, session.session_id, context, edit_call, shell_call))
     }
 
     #[test_log::test]
@@ -1791,13 +2160,281 @@ mod tests {
         let modes = response
             .modes
             .ok_or_else(agent_client_protocol::Error::internal_error)?;
-        assert_eq!(modes.current_mode_id.0.as_ref(), "chat");
-        assert_eq!(modes.available_modes.len(), 1);
+        assert_eq!(modes.current_mode_id.0.as_ref(), "ask");
+        assert_eq!(modes.available_modes.len(), 3);
+        assert!(
+            modes
+                .available_modes
+                .iter()
+                .any(|mode| mode.id.0.as_ref() == "ask")
+        );
+        assert!(
+            modes
+                .available_modes
+                .iter()
+                .any(|mode| mode.id.0.as_ref() == "accept-edits")
+        );
+        assert!(
+            modes
+                .available_modes
+                .iter()
+                .any(|mode| mode.id.0.as_ref() == "yolo")
+        );
 
         let guard = state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         assert!(guard.sessions.contains_key(&response.session_id));
+
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn set_mode_updates_session_state() -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+
+        let response = handle_set_session_mode_request(
+            &state,
+            &SetSessionModeRequest::new(session.session_id.clone(), "accept-edits"),
+        )?;
+
+        assert!(response.meta.is_none());
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
+        assert_eq!(stored.mode, PermissionPosture::AcceptEdits);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn permission_request_prompts_and_caches_allow_always()
+    -> Result<(), agent_client_protocol::Error> {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "call-1",
+            "write_file",
+            serde_json::json!({ "path": "file.txt" }).to_string(),
+        );
+        let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_ALLOW_ALWAYS_OPTION_ID,
+            )),
+        )]);
+
+        let decision =
+            request_tool_permission(&state, &context, &call, ToolKind::Edit, &requester).await?;
+
+        assert_eq!(decision, PermissionDecision::AllowAlways);
+        let requests = requester.requests();
+        {
+            let request_guard = requests
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            assert_eq!(request_guard.len(), 1);
+            let request = &request_guard[0];
+            assert_eq!(request.session_id, session.session_id);
+            assert_eq!(request.options.len(), 4);
+            assert_eq!(
+                request
+                    .options
+                    .iter()
+                    .map(|option| option.kind)
+                    .collect::<Vec<_>>(),
+                vec![
+                    PermissionOptionKind::AllowOnce,
+                    PermissionOptionKind::AllowAlways,
+                    PermissionOptionKind::RejectOnce,
+                    PermissionOptionKind::RejectAlways,
+                ]
+            );
+            assert_eq!(
+                request.tool_call.fields.raw_input,
+                Some(serde_json::json!({ "path": "file.txt" }))
+            );
+        }
+
+        let second_requester = FakePermissionRequester::new(Vec::new());
+        let second_decision =
+            request_tool_permission(&state, &context, &call, ToolKind::Edit, &second_requester)
+                .await?;
+
+        assert_eq!(second_decision, PermissionDecision::AllowAlways);
+        let second_requests = second_requester.requests();
+        let second_guard = second_requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert!(second_guard.is_empty());
+
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
+        assert!(stored.permission_allow_always.contains("write_file"));
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn permission_request_rejects_without_caching() -> Result<(), agent_client_protocol::Error>
+    {
+        let state = Arc::new(Mutex::new(AdapterState::default()));
+        let session = handle_new_session_request(&state, &NewSessionRequest::new("/tmp"))?;
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new(
+            "call-2",
+            "run_command",
+            serde_json::json!({ "command": "echo hi" }).to_string(),
+        );
+        let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_REJECT_ONCE_OPTION_ID,
+            )),
+        )]);
+
+        let decision =
+            request_tool_permission(&state, &context, &call, ToolKind::Execute, &requester).await?;
+
+        assert_eq!(decision, PermissionDecision::RejectOnce);
+        let requests = requester.requests();
+        let request_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(request_guard.len(), 1);
+        drop(request_guard);
+
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
+        assert!(!stored.permission_allow_always.contains("run_command"));
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn permission_posture_ask_prompts_all_mutations()
+    -> Result<(), agent_client_protocol::Error> {
+        let (state, _session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
+        let requester = FakePermissionRequester::new(vec![
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new(super::PERMISSION_ALLOW_ONCE_OPTION_ID),
+            )),
+            RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                SelectedPermissionOutcome::new(super::PERMISSION_ALLOW_ONCE_OPTION_ID),
+            )),
+        ]);
+
+        assert_eq!(
+            request_tool_permission(&state, &context, &edit_call, ToolKind::Edit, &requester)
+                .await?,
+            PermissionDecision::AllowOnce
+        );
+        assert_eq!(
+            request_tool_permission(&state, &context, &shell_call, ToolKind::Execute, &requester)
+                .await?,
+            PermissionDecision::AllowOnce
+        );
+        assert_eq!(
+            requester
+                .requests()
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?
+                .len(),
+            2
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn permission_posture_accept_edits_skips_edit_prompts()
+    -> Result<(), agent_client_protocol::Error> {
+        let (state, session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
+        handle_set_session_mode_request(
+            &state,
+            &SetSessionModeRequest::new(session_id.clone(), "accept-edits"),
+        )?;
+        let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_ALLOW_ONCE_OPTION_ID,
+            )),
+        )]);
+
+        assert_eq!(
+            request_tool_permission(&state, &context, &edit_call, ToolKind::Edit, &requester)
+                .await?,
+            PermissionDecision::AllowByMode
+        );
+        assert_eq!(
+            request_tool_permission(&state, &context, &shell_call, ToolKind::Execute, &requester)
+                .await?,
+            PermissionDecision::AllowOnce
+        );
+        assert_eq!(
+            requester
+                .requests()
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?
+                .len(),
+            1
+        );
+
+        let guard = state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let stored = guard.sessions.get(&session_id).ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
+        assert_eq!(stored.mode, PermissionPosture::AcceptEdits);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn permission_posture_yolo_auto_allows_all_mutations()
+    -> Result<(), agent_client_protocol::Error> {
+        let (state, session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
+        handle_set_session_mode_request(&state, &SetSessionModeRequest::new(session_id, "yolo"))?;
+        let requester = FakePermissionRequester::new(Vec::new());
+
+        assert_eq!(
+            request_tool_permission(&state, &context, &edit_call, ToolKind::Edit, &requester)
+                .await?,
+            PermissionDecision::AllowByMode
+        );
+        assert_eq!(
+            request_tool_permission(&state, &context, &shell_call, ToolKind::Execute, &requester)
+                .await?,
+            PermissionDecision::AllowByMode
+        );
+        assert!(
+            requester
+                .requests()
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?
+                .is_empty()
+        );
 
         Ok(())
     }
