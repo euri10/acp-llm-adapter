@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    ContentBlock, ContentChunk, CreateTerminalRequest, CreateTerminalResponse, Implementation,
-    InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
-    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, CreateTerminalRequest, CreateTerminalResponse,
+    CurrentModeUpdate, Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
+    KillTerminalResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
+    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionRequest, RequestPermissionResponse, SessionAdditionalDirectoriesCapabilities,
     SessionCapabilities, SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
     SessionId, SessionListCapabilities, SessionNotification, SessionUpdate,
@@ -391,16 +391,23 @@ pub(crate) async fn serve_with_transport(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: SetSessionModeRequest, responder, _cx| {
-                responder.respond(handle_set_session_mode_request(&set_mode_store, &request)?)
+            async move |request: SetSessionModeRequest, responder, cx| {
+                let connection = cx.clone();
+                responder.respond(handle_set_session_mode_request_notifying(
+                    &set_mode_store,
+                    &request,
+                    |notification| connection.send_notification(notification),
+                )?)
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: SetSessionConfigOptionRequest, responder, _cx| {
-                responder.respond(handle_set_session_config_option_request(
+            async move |request: SetSessionConfigOptionRequest, responder, cx| {
+                let connection = cx.clone();
+                responder.respond(handle_set_session_config_option_request_notifying(
                     &set_config_store,
                     &request,
+                    |notification| connection.send_notification(notification),
                 )?)
             },
             agent_client_protocol::on_receive_request!(),
@@ -670,9 +677,18 @@ fn tool_result_content(tool_call_id: &str, history: &[ChatMessage]) -> Option<St
     })
 }
 
+#[cfg(test)]
 pub(crate) fn handle_set_session_mode_request(
     store: &SessionStore,
     request: &SetSessionModeRequest,
+) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
+    handle_set_session_mode_request_notifying(store, request, |_| Ok(()))
+}
+
+pub(crate) fn handle_set_session_mode_request_notifying(
+    store: &SessionStore,
+    request: &SetSessionModeRequest,
+    mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
     let Some(mode) = PermissionPosture::from_mode_id(&request.mode_id) else {
         return Err(agent_client_protocol::Error::invalid_params()
@@ -680,12 +696,25 @@ pub(crate) fn handle_set_session_mode_request(
     };
 
     store.set_mode(&request.session_id, mode)?;
+    notify(session_notification(
+        request.session_id.clone(),
+        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(request.mode_id.clone())),
+    ))?;
     Ok(SetSessionModeResponse::new())
 }
 
+#[cfg(test)]
 pub(crate) fn handle_set_session_config_option_request(
     store: &SessionStore,
     request: &SetSessionConfigOptionRequest,
+) -> Result<SetSessionConfigOptionResponse, agent_client_protocol::Error> {
+    handle_set_session_config_option_request_notifying(store, request, |_| Ok(()))
+}
+
+pub(crate) fn handle_set_session_config_option_request_notifying(
+    store: &SessionStore,
+    request: &SetSessionConfigOptionRequest,
+    mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<SetSessionConfigOptionResponse, agent_client_protocol::Error> {
     let value = config_value_id(&request.value)?;
 
@@ -721,9 +750,12 @@ pub(crate) fn handle_set_session_config_option_request(
         }
     }
 
-    Ok(SetSessionConfigOptionResponse::new(
-        store.session_config_options(&request.session_id)?,
-    ))
+    let config_options = store.session_config_options(&request.session_id)?;
+    notify(session_notification(
+        request.session_id.clone(),
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options.clone())),
+    ))?;
+    Ok(SetSessionConfigOptionResponse::new(config_options))
 }
 
 fn config_value_id(

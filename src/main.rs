@@ -59,7 +59,8 @@ pub(crate) use acp::{
     handle_authenticate_request, handle_close_session_request, handle_initialize_request,
     handle_list_sessions_request, handle_load_session_request, handle_logout_request,
     handle_new_session_request_connected, handle_prompt_request,
-    handle_set_session_config_option_request, handle_set_session_mode_request,
+    handle_set_session_config_option_request, handle_set_session_config_option_request_notifying,
+    handle_set_session_mode_request, handle_set_session_mode_request_notifying,
     validate_session_paths,
 };
 pub(crate) use acp::{
@@ -1388,10 +1389,12 @@ mod tests {
         grep_tool_execution, handle_authenticate_request, handle_close_session_request,
         handle_initialize_request, handle_list_sessions_request, handle_load_session_request,
         handle_logout_request, handle_new_session_request, handle_prompt_request,
-        handle_set_session_config_option_request, handle_set_session_mode_request,
-        list_dir_tool_execution, llm_client_for_backend, print_dev_smoke_result,
-        read_file_tool_execution, request_tool_permission, run_command_tool_execution,
-        run_smoke_flow, serve_with_transport, test_store, write_file_tool_execution,
+        handle_set_session_config_option_request,
+        handle_set_session_config_option_request_notifying, handle_set_session_mode_request,
+        handle_set_session_mode_request_notifying, list_dir_tool_execution, llm_client_for_backend,
+        print_dev_smoke_result, read_file_tool_execution, request_tool_permission,
+        run_command_tool_execution, run_smoke_flow, serve_with_transport, test_store,
+        write_file_tool_execution,
     };
     use agent_client_protocol::{Agent, Channel, Client};
     use deepseek_acp_adapter::deepseek::{
@@ -1879,6 +1882,32 @@ mod tests {
     }
 
     #[test_log::test]
+    fn set_mode_emits_current_mode_update() -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let mut notifications = Vec::new();
+
+        handle_set_session_mode_request_notifying(
+            &store,
+            &SetSessionModeRequest::new(session.session_id.clone(), "yolo"),
+            |notification| {
+                notifications.push(notification);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].session_id, session.session_id);
+        let SessionUpdate::CurrentModeUpdate(update) = &notifications[0].update else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected current mode update notification"));
+        };
+        assert_eq!(update.current_mode_id.0.as_ref(), "yolo");
+
+        Ok(())
+    }
+
+    #[test_log::test]
     fn set_config_option_updates_session_model_and_reasoning()
     -> Result<(), agent_client_protocol::Error> {
         let store = test_store();
@@ -1940,6 +1969,40 @@ mod tests {
         };
 
         assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn set_config_option_emits_config_option_update() -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let mut notifications = Vec::new();
+
+        let response = handle_set_session_config_option_request_notifying(
+            &store,
+            &SetSessionConfigOptionRequest::new(
+                session.session_id.clone(),
+                SESSION_CONFIG_REASONING_EFFORT_ID,
+                "max",
+            ),
+            |notification| {
+                notifications.push(notification);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].session_id, session.session_id);
+        let SessionUpdate::ConfigOptionUpdate(update) = &notifications[0].update else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected config option update notification"));
+        };
+        assert_eq!(
+            select_current_value(&update.config_options, SESSION_CONFIG_REASONING_EFFORT_ID,)?,
+            "max"
+        );
+        assert_eq!(update.config_options, response.config_options);
 
         Ok(())
     }
