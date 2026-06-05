@@ -7,7 +7,7 @@
 #   • cargo doc --no-deps
 #   • cargo audit (dependency vulnerabilities)
 #
-# MSRV: 1.85  (stable toolchain, edition 2024)
+# MSRV: 1.95  (stable toolchain, edition 2024)
 
 name: CI
 
@@ -20,7 +20,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Pin the exact same Rust version declared in Cargo.toml [package].rust-version
-  RUST_VERSION: "1.85"
+  RUST_VERSION: "1.95"
 
 jobs:
   check:
@@ -90,4 +90,3 @@ jobs:
 
       - name: cargo audit
         run: cargo audit
-
