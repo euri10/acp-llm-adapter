@@ -3,6 +3,10 @@ name = "deepseek-acp-adapter"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+description = "ACP adapter server that exposes DeepSeek as an agent to ACP-capable editors (Zed, Neovim, etc.)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/euri10/deepseek-acp-adapter"
+readme = "README.md"
 
 [workspace]
 resolver = "3"
