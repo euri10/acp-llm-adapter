@@ -2,10 +2,23 @@
 
 `deepseek-acp-adapter` is a headless ACP server that exposes DeepSeek as an agent to ACP-capable editors.
 
+> [!WARNING]
+> This is alpha software. Expect breaking changes, incomplete ACP coverage, and rough edges while the adapter is still being shaped.
+
 ## Installation
 
 ```bash
 cargo install deepseek-acp-adapter
+```
+
+## Debugging
+
+For debugging prefer the included [`debug-adapter.sh`](debug-adapter.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending the adapter's stderr stream to `/tmp/acp-debug.log`.
+
+Point your editor's ACP command at `./debug-adapter.sh` when you need startup errors, protocol diagnostics, or panic output without breaking the stdio transport and get the logs with:
+
+```bash
+tail -f /tmp/acp-debug.log
 ```
 
 ## Architecture
@@ -229,6 +242,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-
 
 
