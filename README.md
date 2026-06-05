@@ -2,6 +2,62 @@
 
 `deepseek-acp-adapter` is a headless ACP server that exposes DeepSeek as an agent to ACP-capable editors.
 
+## Architecture
+
+The adapter bridges two independent channels:
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                         deepseek-acp-adapter                                           │
+│                                                                                        │
+│  Editor ──ACP/stdio──▶ ┌─────────────────┐  ┌─────────────────┐                        │
+│  (Zed,      JSON-RPC   │  acp.rs         │  │  deepseek/*     │                        │
+│   Neovim,   frames  ◀──│  ACP transport  │  │  HTTPS + SSE    │──▶ DeepSeek API        │
+│   ...)                 │  + request      │  │  client, types, │  │  api.deepseek.com   │
+│                        │  handlers       │  │  stream parser  │  │ /chat/completions   │
+│                        └─────────┬───────┘  └────────┬────────┘                        │
+│                                  │                   │                                 │
+│                           ┌──────▼───────────────────▼──────────────────┐              │
+│                           │ · turn.rs           · tools.rs     · mcp.rs │              │
+│                           │ · Session state     · tool loop    · MCP    │              │
+│                           │ · Permission gating · cancellation          │              │
+│                           └───────────────────┬─────────────────────────┘              │
+│                                               │                                        │
+│                                   ┌───────────▼───────────┐                            │
+│                                   │   session_store.rs    │                            │
+│                                   │   JSONL persistence   │                            │
+│                                   └───────────────────────┘                            │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Left side** — the adapter speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio as JSON-RPC 2.0 frames. The `agent-client-protocol` crate handles the wire protocol; [`acp.rs`](src/acp.rs) registers request handlers and translates between ACP schema types and the adapter's internal types.
+
+**Right side** — the adapter speaks HTTPS + Server-Sent Events to DeepSeek's OpenAI-compatible `/chat/completions` endpoint via a thin client owned by this crate in [`src/deepseek/`](src/deepseek/). A [`LlmClient`](src/deepseek/client.rs) trait provides the mock seam for testing without a live API key.
+
+**Middle** — the adapter is the translator *and* the agent harness. [`turn.rs`](src/turn.rs) orchestrates the prompt→tool-call→execute→feed-back loop. [`tools.rs`](src/tools.rs) registers built-in tools (read/write/edit files, glob, grep, shell commands) and routes execution to the right backend. [`mcp.rs`](src/mcp.rs) connects to external MCP servers and exposes their tools through the same loop. [`session_store.rs`](src/session_store.rs) provides optional filesystem persistence so sessions survive process restarts.
+
+### Module Map
+
+| Module | Responsibility |
+|--------|---------------|
+| [`acp.rs`](src/acp.rs) | ACP transport registration, request handler dispatch, response builders |
+| [`turn.rs`](src/turn.rs) | Prompt-turn lifecycle: LLM streaming, tool-call accumulation, loop control, cancellation, history updates |
+| [`tools.rs`](src/tools.rs) | Built-in tool definitions, argument parsing, execution (read/list/write/edit/grep/glob/command), output truncation |
+| [`mcp.rs`](src/mcp.rs) | MCP server connection (stdio + HTTP streamable), tool-name mapping, invocation, result rendering |
+| [`session_store.rs`](src/session_store.rs) | Filesystem-backed session metadata and JSONL chat-history persistence |
+| [`deepseek/types.rs`](src/deepseek/types.rs) | Chat message, request, tool definition, and stream-event types (public facade) |
+| [`deepseek/client.rs`](src/deepseek/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `DeepSeekClient` impl |
+| [`deepseek/stream.rs`](src/deepseek/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping |
+| [`deepseek/config.rs`](src/deepseek/config.rs) | Environment-driven config (`DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`) |
+| [`deepseek/error.rs`](src/deepseek/error.rs) | Typed error enum (config, HTTP, SSE, JSON, transport) |
+
+### Design Principles
+
+- **Translation boundary**: ACP and HTTP types stay at their respective edges. Business logic in the adapter core (`turn`, `tools`, `session_store`) depends only on the adapter's own types — not on `agent-client-protocol` schema types or raw HTTP types.
+- **Testable seams**: The `LlmClient` trait lets prompt-turn tests run against canned SSE fixtures without a network. The `ToolRegistry` trait lets tool-loop tests inject fake tools. ACP handler tests use in-memory fake client connections.
+- **Single async runtime**: Tokio multi-thread throughout. No lock is held across `.await`. No mixing of async runtimes.
+- **No unsafe code**: `#![forbid(unsafe_code)]` at every crate root.
+
 ## Requirements
 
 - Rust stable
@@ -181,3 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+
+
+
