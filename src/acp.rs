@@ -761,7 +761,9 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
         .agent_capabilities(
             AgentCapabilities::new()
                 .load_session(true)
-                .prompt_capabilities(agent_client_protocol::schema::PromptCapabilities::new())
+                .prompt_capabilities(
+                    agent_client_protocol::schema::PromptCapabilities::new().embedded_context(true),
+                )
                 .session_capabilities(
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new())

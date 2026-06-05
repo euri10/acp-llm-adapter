@@ -24,13 +24,14 @@ use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::schema::{
     AvailableCommand, AvailableCommandInput, ClientCapabilities, ContentBlock, ContentChunk,
-    InitializeRequest, InitializeResponse, McpServer, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionInfo, SessionMode,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, StopReason,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    EmbeddedResourceResource, InitializeRequest, InitializeResponse, McpServer, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
+    SessionInfo, SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    StopReason, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UnstructuredCommandInput,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Client, ConnectTo, SessionMessage, Stdio};
@@ -840,9 +841,23 @@ fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_prot
         match block {
             ContentBlock::Text(content) => text.push_str(&content.text),
             ContentBlock::ResourceLink(link) => text.push_str(&resource_link_prompt_text(link)),
+            ContentBlock::Resource(resource) => match &resource.resource {
+                EmbeddedResourceResource::TextResourceContents(contents) => {
+                    text.push_str(&resource_text_prompt_text(contents));
+                }
+                EmbeddedResourceResource::BlobResourceContents(_) => {
+                    return Err(agent_client_protocol::Error::invalid_params()
+                        .data("binary resource prompt blocks are not supported"));
+                }
+                _ => {
+                    return Err(agent_client_protocol::Error::invalid_params()
+                        .data("unsupported embedded resource prompt block"));
+                }
+            },
             _ => {
-                return Err(agent_client_protocol::Error::invalid_params()
-                    .data("only text and resource link prompt blocks are supported"));
+                return Err(agent_client_protocol::Error::invalid_params().data(
+                    "only text, resource link, and text resource prompt blocks are supported",
+                ));
             }
         }
     }
@@ -869,6 +884,17 @@ fn resource_link_prompt_text(link: &agent_client_protocol::schema::ResourceLink)
         rendered.push_str(description);
     }
 
+    rendered
+}
+
+fn resource_text_prompt_text(
+    contents: &agent_client_protocol::schema::TextResourceContents,
+) -> String {
+    let mut rendered = String::new();
+    rendered.push_str("[resource] <");
+    rendered.push_str(&contents.uri);
+    rendered.push_str(">\n");
+    rendered.push_str(&contents.text);
     rendered
 }
 
@@ -1379,15 +1405,16 @@ mod tests {
     use uuid::Uuid;
 
     use agent_client_protocol::schema::{
-        ClientCapabilities, CloseSessionRequest, ContentBlock, FileSystemCapabilities,
-        ImageContent, Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
-        McpServer, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
+        BlobResourceContents, ClientCapabilities, CloseSessionRequest, ContentBlock,
+        EmbeddedResource, EmbeddedResourceResource, FileSystemCapabilities, ImageContent,
+        Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, McpServer,
+        NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
         ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
         RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
         SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
         SessionConfigOptionCategory, SessionModeId, SessionUpdate, SetSessionConfigOptionRequest,
-        SetSessionModeRequest, StopReason, ToolCallStatus, ToolKind, WriteTextFileRequest,
-        WriteTextFileResponse,
+        SetSessionModeRequest, StopReason, TextResourceContents, ToolCallStatus, ToolKind,
+        WriteTextFileRequest, WriteTextFileResponse,
     };
     use clap::Parser;
     use futures_util::StreamExt;
@@ -1653,7 +1680,7 @@ mod tests {
         assert!(!response.agent_capabilities.prompt_capabilities.image);
         assert!(!response.agent_capabilities.prompt_capabilities.audio);
         assert!(
-            !response
+            response
                 .agent_capabilities
                 .prompt_capabilities
                 .embedded_context
@@ -3042,6 +3069,33 @@ mod tests {
             "[resource] docs <file:///docs/reference.md>"
         );
 
+        let text_resource_prompt = vec![ContentBlock::Resource(EmbeddedResource::new(
+            EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                "context body",
+                "file:///docs/context.md",
+            )),
+        ))];
+        assert_eq!(
+            super::text_from_prompt(&text_resource_prompt)?,
+            "[resource] <file:///docs/context.md>\ncontext body"
+        );
+
+        let blob_resource_prompt = vec![ContentBlock::Resource(EmbeddedResource::new(
+            EmbeddedResourceResource::BlobResourceContents(BlobResourceContents::new(
+                "aGVsbG8=",
+                "file:///docs/context.bin",
+            )),
+        ))];
+        let Err(error) = super::text_from_prompt(&blob_resource_prompt) else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected binary resource prompt to fail"));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("binary resource prompt blocks are not supported")
+        );
+
         let image_prompt = vec![ContentBlock::Image(ImageContent::new(
             "aGVsbG8=",
             "image/png",
@@ -3051,9 +3105,9 @@ mod tests {
                 .data("expected image prompt to fail"));
         };
         assert!(
-            error
-                .to_string()
-                .contains("only text and resource link prompt blocks are supported")
+            error.to_string().contains(
+                "only text, resource link, and text resource prompt blocks are supported"
+            )
         );
 
         let Err(error) = super::text_from_prompt(&[]) else {
