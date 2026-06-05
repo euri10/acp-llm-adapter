@@ -8,16 +8,17 @@ use agent_client_protocol::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     CreateTerminalRequest, CreateTerminalResponse, Implementation, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LogoutCapabilities,
-    LogoutRequest, LogoutResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
-    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionRequest,
-    RequestPermissionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId, SessionId,
-    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    TerminalOutputRequest, TerminalOutputResponse, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    InitializeResponse, KillTerminalRequest, KillTerminalResponse, ListSessionsRequest,
+    ListSessionsResponse, LogoutCapabilities, LogoutRequest, LogoutResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
+    SessionId, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, TerminalOutputRequest, TerminalOutputResponse,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo};
 use deepseek_acp_adapter::deepseek::LlmClient;
@@ -82,12 +83,22 @@ pub(crate) trait ReleaseTerminalRequester: Send + Sync {
     ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>>;
 }
 
+/// Trait for killing a terminal command via ACP client `terminal/kill`.
+pub(crate) trait KillTerminalRequester: Send + Sync {
+    /// Kill a terminal's running command without releasing the terminal.
+    fn kill_terminal(
+        &self,
+        request: KillTerminalRequest,
+    ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>>;
+}
+
 /// Combined trait for all terminal operations.
 pub(crate) trait TerminalRequester:
     CreateTerminalRequester
     + TerminalOutputRequester
     + WaitForTerminalExitRequester
     + ReleaseTerminalRequester
+    + KillTerminalRequester
 {
 }
 
@@ -96,6 +107,7 @@ impl<T> TerminalRequester for T where
         + TerminalOutputRequester
         + WaitForTerminalExitRequester
         + ReleaseTerminalRequester
+        + KillTerminalRequester
         + ?Sized
 {
 }
@@ -168,6 +180,24 @@ impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
         &self,
         request: ReleaseTerminalRequest,
     ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl KillTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
+    fn kill_terminal(
+        &self,
+        request: KillTerminalRequest,
+    ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>> {
+        Box::pin(async move { self.send_request(request).block_task().await })
+    }
+}
+
+impl KillTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
+    fn kill_terminal(
+        &self,
+        request: KillTerminalRequest,
+    ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>> {
         Box::pin(async move { self.send_request(request).block_task().await })
     }
 }

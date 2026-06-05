@@ -51,12 +51,12 @@ mod turn;
 
 #[cfg(test)]
 pub(crate) use acp::{
-    CreateTerminalRequester, ReleaseTerminalRequester, TerminalOutputRequester,
-    WaitForTerminalExitRequester, build_initialize_response, handle_authenticate_request,
-    handle_close_session_request, handle_initialize_request, handle_list_sessions_request,
-    handle_logout_request, handle_new_session_request_connected, handle_prompt_request,
-    handle_set_session_config_option_request, handle_set_session_mode_request,
-    validate_session_paths,
+    CreateTerminalRequester, KillTerminalRequester, ReleaseTerminalRequester,
+    TerminalOutputRequester, WaitForTerminalExitRequester, build_initialize_response,
+    handle_authenticate_request, handle_close_session_request, handle_initialize_request,
+    handle_list_sessions_request, handle_logout_request, handle_new_session_request_connected,
+    handle_prompt_request, handle_set_session_config_option_request,
+    handle_set_session_mode_request, validate_session_paths,
 };
 pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
@@ -1278,6 +1278,7 @@ mod tests {
     };
     use futures_util::future::BoxFuture;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
@@ -2553,8 +2554,15 @@ mod tests {
             serde_json::json!({ "command": "printf shell-ok" }).to_string(),
         );
 
-        let result =
-            run_command_tool_execution(&store, &call, &context, Some(&requester), None).await;
+        let result = run_command_tool_execution(
+            &store,
+            &call,
+            &context,
+            Some(&requester),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.success);
         assert!(result.content.contains("stdout:"));
@@ -2604,6 +2612,7 @@ mod tests {
                 &context,
                 &store,
                 None,
+                CancellationToken::new(),
             )
             .await;
         assert!(list_result.content.contains("README.md"));
@@ -2623,6 +2632,7 @@ mod tests {
                 &context,
                 &store,
                 None,
+                CancellationToken::new(),
             )
             .await;
         assert!(glob_result.content.contains("src/lib.rs"));
@@ -2671,6 +2681,7 @@ mod tests {
                 &context,
                 &store,
                 None,
+                CancellationToken::new(),
             )
             .await;
 
@@ -3329,6 +3340,7 @@ mod tests {
                 &context,
                 &store,
                 None,
+                CancellationToken::new(),
             )
             .await;
         assert!(!empty_result.success);
@@ -3340,6 +3352,7 @@ mod tests {
                 &context,
                 &store,
                 None,
+                CancellationToken::new(),
             )
             .await;
         assert!(!read_only_result.success);
@@ -3956,7 +3969,15 @@ mod tests {
             "run_command",
             serde_json::json!({ "command": "   " }).to_string(),
         );
-        let result = run_command_tool_execution(&store, &call, &context, None, None).await;
+        let result = run_command_tool_execution(
+            &store,
+            &call,
+            &context,
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(!result.success);
         assert!(result.content.contains("command must not be empty"));
     }
@@ -4200,6 +4221,119 @@ mod tests {
         }
     }
 
+    impl super::KillTerminalRequester for FakeTerminalRequester {
+        fn kill_terminal(
+            &self,
+            _request: agent_client_protocol::schema::KillTerminalRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::KillTerminalResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            Box::pin(async move { Ok(agent_client_protocol::schema::KillTerminalResponse::new()) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CancelTracker {
+        kills: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+
+    impl super::CreateTerminalRequester for CancelTracker {
+        fn create_terminal(
+            &self,
+            _request: agent_client_protocol::schema::CreateTerminalRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::CreateTerminalResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(agent_client_protocol::schema::CreateTerminalResponse::new(
+                    agent_client_protocol::schema::TerminalId::new("term-cancel"),
+                ))
+            })
+        }
+    }
+
+    impl super::TerminalOutputRequester for CancelTracker {
+        fn terminal_output(
+            &self,
+            _request: agent_client_protocol::schema::TerminalOutputRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::TerminalOutputResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(agent_client_protocol::schema::TerminalOutputResponse::new(
+                    String::new(),
+                    false,
+                ))
+            })
+        }
+    }
+
+    impl super::WaitForTerminalExitRequester for CancelTracker {
+        fn wait_for_terminal_exit(
+            &self,
+            _request: agent_client_protocol::schema::WaitForTerminalExitRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::WaitForTerminalExitResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    impl super::ReleaseTerminalRequester for CancelTracker {
+        fn release_terminal(
+            &self,
+            _request: agent_client_protocol::schema::ReleaseTerminalRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::ReleaseTerminalResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            let releases = Arc::clone(&self.releases);
+            Box::pin(async move {
+                releases.fetch_add(1, Ordering::SeqCst);
+                Ok(agent_client_protocol::schema::ReleaseTerminalResponse::new())
+            })
+        }
+    }
+
+    impl super::KillTerminalRequester for CancelTracker {
+        fn kill_terminal(
+            &self,
+            _request: agent_client_protocol::schema::KillTerminalRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<
+                agent_client_protocol::schema::KillTerminalResponse,
+                agent_client_protocol::Error,
+            >,
+        > {
+            let kills = Arc::clone(&self.kills);
+            Box::pin(async move {
+                kills.fetch_add(1, Ordering::SeqCst);
+                Ok(agent_client_protocol::schema::KillTerminalResponse::new())
+            })
+        }
+    }
+
     // (TerminalRequester is auto-implemented via blanket impl)
 
     // ── run_command_via_terminal tests ──────────────────────
@@ -4223,6 +4357,7 @@ mod tests {
             std::path::Path::new("/tmp"),
             "echo hi",
             Some(&fake as &dyn super::TerminalRequester),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -4238,6 +4373,7 @@ mod tests {
             std::path::Path::new("/tmp"),
             "echo hi",
             None,
+            &CancellationToken::new(),
         )
         .await;
 
@@ -4264,6 +4400,7 @@ mod tests {
             std::path::Path::new("/tmp"),
             "echo hi",
             Some(&fake as &dyn super::TerminalRequester),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -4290,6 +4427,7 @@ mod tests {
             std::path::Path::new("/tmp"),
             "echo hi",
             Some(&fake as &dyn super::TerminalRequester),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -4316,6 +4454,7 @@ mod tests {
             std::path::Path::new("/tmp"),
             "echo hi",
             Some(&fake as &dyn super::TerminalRequester),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -4342,11 +4481,34 @@ mod tests {
             std::path::Path::new("/tmp"),
             "echo hi",
             Some(&fake as &dyn super::TerminalRequester),
+            &CancellationToken::new(),
         )
         .await;
 
         assert!(!result.success);
         assert!(result.content.contains("terminal/release failed"));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn run_command_via_terminal_kills_on_cancellation() {
+        let tracker = CancelTracker::default();
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let session_id = agent_client_protocol::schema::SessionId::new("terminal-cancel");
+        let result = super::run_command_via_terminal(
+            &session_id,
+            std::path::Path::new("/tmp"),
+            "sleep 100",
+            Some(&tracker as &dyn super::TerminalRequester),
+            &token,
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.content.contains("cancelled"));
+        assert_eq!(tracker.kills.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker.releases.load(Ordering::SeqCst), 1);
     }
 
     // ── edit_file_tool_execution error paths ────────────────
@@ -4492,7 +4654,15 @@ mod tests {
         };
         let call = DeepSeekToolCall::new("run-invalid", "run_command", "not json");
 
-        let result = run_command_tool_execution(&store, &call, &context, None, None).await;
+        let result = run_command_tool_execution(
+            &store,
+            &call,
+            &context,
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(!result.success);
         assert!(result.content.contains("invalid run_command arguments"));
         Ok(())
@@ -4909,6 +5079,7 @@ mod tests {
                 &context,
                 &store,
                 None,
+                CancellationToken::new(),
             )
             .await;
         assert!(!result.success);

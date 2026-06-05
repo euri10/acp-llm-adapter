@@ -6,8 +6,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::{
-    CreateTerminalRequest, ReadTextFileRequest, ReleaseTerminalRequest, SessionId,
-    TerminalOutputRequest, ToolCallStatus, ToolKind, WaitForTerminalExitRequest,
+    CreateTerminalRequest, KillTerminalRequest, ReadTextFileRequest, ReleaseTerminalRequest,
+    SessionId, TerminalOutputRequest, ToolCallStatus, ToolKind, WaitForTerminalExitRequest,
     WriteTextFileRequest,
 };
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
@@ -20,6 +20,7 @@ use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use super::request_tool_permission;
 
@@ -48,12 +49,17 @@ pub(crate) trait ToolRegistry: Send + Sync {
     fn kind(&self, name: &str) -> ToolKind;
 
     /// Execute a complete model-requested tool call.
+    ///
+    /// The `cancellation_token` is cancelled when the turn is cancelled (via
+    /// `session/cancel`); long-running tools (e.g. terminal commands) should race
+    /// their work against it and abort promptly.
     fn execute<'a>(
         &'a self,
         call: &'a DeepSeekToolCall,
         context: &'a ToolContext,
         store: &'a super::SessionStore,
         connection: Option<&'a dyn super::ToolCallRequester>,
+        cancellation_token: CancellationToken,
     ) -> BoxFuture<'a, ToolExecution>;
 }
 
@@ -81,6 +87,7 @@ impl ToolRegistry for EmptyToolRegistry {
         _context: &'a ToolContext,
         _store: &'a super::SessionStore,
         _connection: Option<&'a dyn super::ToolCallRequester>,
+        _cancellation_token: CancellationToken,
     ) -> BoxFuture<'a, ToolExecution> {
         Box::pin(async move { ToolExecution::failed(format!("unknown tool: {}", call.name())) })
     }
@@ -125,6 +132,7 @@ impl ToolRegistry for AdapterToolRegistry {
         context: &'a ToolContext,
         store: &'a super::SessionStore,
         connection: Option<&'a dyn super::ToolCallRequester>,
+        cancellation_token: CancellationToken,
     ) -> BoxFuture<'a, ToolExecution> {
         Box::pin(async move {
             match call.name() {
@@ -167,6 +175,7 @@ impl ToolRegistry for AdapterToolRegistry {
                         context,
                         connection.map(|requester| requester as &dyn super::PermissionRequester),
                         connection.map(|requester| requester as &dyn super::TerminalRequester),
+                        &cancellation_token,
                     )
                     .await
                 }
@@ -604,6 +613,7 @@ pub(crate) async fn run_command_tool_execution(
     context: &ToolContext,
     permission_requester: Option<&dyn super::PermissionRequester>,
     terminal_connection: Option<&dyn super::TerminalRequester>,
+    cancellation_token: &CancellationToken,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<RunCommandArguments>(call.arguments()) {
         Ok(arguments) => arguments,
@@ -638,6 +648,7 @@ pub(crate) async fn run_command_tool_execution(
             &context.cwd,
             &parsed_arguments.command,
             terminal_connection,
+            cancellation_token,
         )
         .await;
     }
@@ -681,6 +692,7 @@ pub(crate) async fn run_command_via_terminal(
     cwd: &Path,
     command: &str,
     connection: Option<&dyn super::TerminalRequester>,
+    cancellation_token: &CancellationToken,
 ) -> ToolExecution {
     let Some(terminal_requester) = connection else {
         return ToolExecution::failed("terminal support advertised but no connection available");
@@ -698,20 +710,36 @@ pub(crate) async fn run_command_via_terminal(
     let terminal_id = create_response.terminal_id;
 
     let wait_request = WaitForTerminalExitRequest::new(session_id.clone(), terminal_id.clone());
-    let wait_response = match terminal_requester
-        .wait_for_terminal_exit(wait_request)
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
+    let wait_response = tokio::select! {
+        // Turn cancelled while the command is running: kill it, then release the
+        // terminal so the client frees its resources.
+        () = cancellation_token.cancelled() => {
+            let _ = terminal_requester
+                .kill_terminal(KillTerminalRequest::new(
+                    session_id.clone(),
+                    terminal_id.clone(),
+                ))
+                .await;
             let _ = terminal_requester
                 .release_terminal(ReleaseTerminalRequest::new(
                     session_id.clone(),
                     terminal_id.clone(),
                 ))
                 .await;
-            return ToolExecution::failed(format!("terminal/wait_for_exit failed: {error}"));
+            return ToolExecution::failed("run_command cancelled");
         }
+        result = terminal_requester.wait_for_terminal_exit(wait_request) => match result {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = terminal_requester
+                    .release_terminal(ReleaseTerminalRequest::new(
+                        session_id.clone(),
+                        terminal_id.clone(),
+                    ))
+                    .await;
+                return ToolExecution::failed(format!("terminal/wait_for_exit failed: {error}"));
+            }
+        },
     };
 
     let output_request = TerminalOutputRequest::new(session_id.clone(), terminal_id.clone());

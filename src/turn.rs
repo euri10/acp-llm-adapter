@@ -151,7 +151,13 @@ async fn run_prompt_turn(
             report_tool_call(&env.request.session_id, notify, tool_call, tool_kind)?;
             let tool_result = env
                 .tool_registry
-                .execute(tool_call, &env.tool_context, env.store, env.connection)
+                .execute(
+                    tool_call,
+                    &env.tool_context,
+                    env.store,
+                    env.connection,
+                    env.cancellation_token.clone(),
+                )
                 .await;
             report_tool_result(&env.request.session_id, notify, tool_call, &tool_result)?;
             messages.push(ChatMessage::tool_result(
@@ -464,6 +470,7 @@ mod tests {
             _context: &'a ToolContext,
             _store: &'a SessionStore,
             _connection: Option<&'a dyn ToolCallRequester>,
+            _cancellation_token: CancellationToken,
         ) -> BoxFuture<'a, ToolExecution> {
             Box::pin(async move {
                 self.calls

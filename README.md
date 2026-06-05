@@ -12,43 +12,6 @@
 If `DEEPSEEK_BASE_URL` is unset, the adapter uses `https://api.deepseek.com`.
 If `DEEPSEEK_MODEL` is unset, the adapter uses `deepseek-v4-pro`.
 
-## Library API
-
-The crate also exposes a reusable `deepseek` module for request construction and
-streaming response handling. Generate the API docs locally with:
-
-```bash
-cargo doc --no-deps
-```
-
-Typical library entry points:
-
-- `deepseek::ChatMessage` for system, user, assistant, and tool-result messages
-- `deepseek::ChatRequest` for model/tool request construction
-- `deepseek::ToolDefinition` for JSON-schema tool advertisement
-- `deepseek::StreamEvent` for normalized streamed output
-- `deepseek::DeepSeekClient` for HTTP-backed streaming requests
-
-Minimal streaming example:
-
-```rust,no_run
-use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, DeepSeekClient, LlmClient};
-use futures_util::StreamExt;
-use tokio_util::sync::CancellationToken;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = DeepSeekClient::from_env()?;
-    let request = ChatRequest::new(vec![ChatMessage::user("Summarize this repository")]);
-    let mut stream = client.stream_chat(request, CancellationToken::new())?;
-
-    while let Some(event) = stream.next().await {
-        println!("{:?}", event?);
-    }
-
-    Ok(())
-}
-```
 
 ## Run It
 
@@ -180,3 +143,41 @@ than a filesystem sandbox.
 - No non-stdio MCP transports
 - No auto model router
 - No `apply_patch`-style edits in v0.1
+
+## Library API
+
+The crate also exposes a reusable `deepseek` module for request construction and
+streaming response handling. Generate the API docs locally with:
+
+```bash
+cargo doc --no-deps
+```
+
+Typical library entry points:
+
+- `deepseek::ChatMessage` for system, user, assistant, and tool-result messages
+- `deepseek::ChatRequest` for model/tool request construction
+- `deepseek::ToolDefinition` for JSON-schema tool advertisement
+- `deepseek::StreamEvent` for normalized streamed output
+- `deepseek::DeepSeekClient` for HTTP-backed streaming requests
+
+Minimal streaming example:
+
+```rust,no_run
+use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, DeepSeekClient, LlmClient};
+use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = DeepSeekClient::from_env()?;
+    let request = ChatRequest::new(vec![ChatMessage::user("Summarize this repository")]);
+    let mut stream = client.stream_chat(request, CancellationToken::new())?;
+
+    while let Some(event) = stream.next().await {
+        println!("{:?}", event?);
+    }
+
+    Ok(())
+}
+```

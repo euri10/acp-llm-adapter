@@ -507,6 +507,7 @@ mod tests {
                 &context,
                 &store,
                 None,
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
 
