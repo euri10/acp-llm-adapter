@@ -292,3 +292,192 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Backend, DevSmokeResult, MockLlmClient, build_dev_agent, exercise_permission_gate_smoke,
+        llm_client_for_backend, print_dev_smoke_result, run_smoke_flow,
+    };
+    use crate::acp::{build_initialize_response, serve_with_transport};
+    use crate::session::DEFAULT_MAX_TURN_REQUESTS;
+    use crate::tools::EmptyToolRegistry;
+    use agent_client_protocol::Channel;
+    use agent_client_protocol::schema::{McpServer, ProtocolVersion, StopReason};
+    use deepseek_acp_adapter::deepseek::{
+        ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent,
+    };
+    use futures_util::StreamExt;
+    use std::sync::{Arc, Mutex};
+    use tokio_util::sync::CancellationToken;
+
+    fn test_store() -> crate::session::SessionStore {
+        crate::session::SessionStore::new(Arc::new(Mutex::new(
+            crate::session::AdapterState::default(),
+        )))
+    }
+
+    #[test_log::test]
+    fn build_dev_agent_uses_backend_and_executable_path() -> Result<(), agent_client_protocol::Error>
+    {
+        let agent = build_dev_agent(
+            std::path::Path::new("/tmp/deepseek-acp-adapter"),
+            Backend::Mock,
+        )?;
+
+        let McpServer::Stdio(stdio) = agent.server() else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected stdio transport")
+            );
+        };
+
+        assert_eq!(
+            stdio.command,
+            std::path::PathBuf::from("/tmp/deepseek-acp-adapter")
+        );
+        assert_eq!(stdio.args, vec!["serve", "--backend", "mock"]);
+        assert!(stdio.env.is_empty());
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn dev_smoke_flow_runs_initialize_new_and_prompt()
+    -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
+        let tool_registry: Arc<dyn crate::tools::ToolRegistry> = Arc::new(EmptyToolRegistry);
+        let (client_transport, server_transport) = Channel::duplex();
+        let server_state = Arc::clone(&store.state);
+        let server_client = Arc::clone(&llm_client);
+        let server_tools = Arc::clone(&tool_registry);
+
+        let server = tokio::spawn(async move {
+            serve_with_transport(
+                server_transport,
+                server_state,
+                server_client,
+                server_tools,
+                DEFAULT_MAX_TURN_REQUESTS,
+            )
+            .await
+        });
+
+        let result = run_smoke_flow(client_transport, "smoke prompt".to_string()).await?;
+
+        assert_eq!(
+            result.initialize_response.protocol_version,
+            ProtocolVersion::LATEST
+        );
+        assert!(
+            result
+                .new_session_response
+                .session_id
+                .0
+                .starts_with("session-")
+        );
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+        assert_eq!(result.response_text, "mock response to: smoke prompt");
+        assert!(
+            result
+                .updates
+                .iter()
+                .any(|update| update.contains("AgentMessageChunk"))
+        );
+
+        server.abort();
+
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn backend_as_str_covers_real_and_mock() {
+        assert_eq!(Backend::Real.as_str(), "real");
+        assert_eq!(Backend::Mock.as_str(), "mock");
+    }
+
+    #[test_log::test]
+    fn print_dev_smoke_result_is_callable() {
+        let result = DevSmokeResult {
+            initialize_response: build_initialize_response(ProtocolVersion::LATEST),
+            new_session_response: agent_client_protocol::schema::NewSessionResponse::new(
+                "session-1",
+            ),
+            updates: vec!["update-1".to_string()],
+            response_text: "response".to_string(),
+            stop_reason: StopReason::EndTurn,
+        };
+
+        print_dev_smoke_result(&result);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn permission_gate_smoke_helper_runs() -> Result<(), agent_client_protocol::Error> {
+        exercise_permission_gate_smoke().await
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_backend_client_streams_expected_response()
+    -> Result<(), agent_client_protocol::Error> {
+        let client = llm_client_for_backend(Backend::Mock)?;
+        let mut stream = client
+            .stream_chat(
+                deepseek_acp_adapter::deepseek::ChatRequest::new(vec![ChatMessage::user("hello")]),
+                CancellationToken::new(),
+            )
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.map_err(agent_client_protocol::Error::into_internal_error)?);
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Thought("mock reasoning".to_string()),
+                StreamEvent::Message("mock response to: hello".to_string()),
+                StreamEvent::Finished(FinishReason::EndTurn),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn llm_client_for_backend_real_uses_process_environment()
+    -> Result<(), agent_client_protocol::Error> {
+        assert!(crate::init_tracing().is_err());
+        assert!(std::env::var("DEEPSEEK_API_KEY").is_ok());
+
+        let client = deepseek_acp_adapter::deepseek::DeepSeekClient::from_env()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let config = client.config();
+        assert!(!config.base_url().is_empty());
+        assert!(!config.model().is_empty());
+
+        let client = llm_client_for_backend(Backend::Real)?;
+        drop(client);
+
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_client_uses_default_prompt_when_no_messages()
+    -> Result<(), agent_client_protocol::Error> {
+        let client = MockLlmClient;
+        let mut stream = client
+            .stream_chat(ChatRequest::new(Vec::new()), CancellationToken::new())
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.map_err(agent_client_protocol::Error::into_internal_error)?);
+        }
+        assert_eq!(events.len(), 3);
+        let StreamEvent::Message(text) = &events[1] else {
+            return Err(agent_client_protocol::Error::internal_error().data("expected message"));
+        };
+        assert!(text.contains("mock prompt"));
+        Ok(())
+    }
+}

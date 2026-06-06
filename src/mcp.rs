@@ -339,11 +339,12 @@ mod tests {
         McpSession, connect_mcp_sessions, connect_mcp_stdio_session, mcp_call_arguments,
         mcp_http_headers, mcp_tool_execution, mcp_tool_mappings, mcp_tool_result_text,
     };
-    use crate::tools::{AdapterToolRegistry, ToolContext, ToolRegistry};
-    use crate::{
-        PermissionDecision, PermissionRequester, handle_new_session_request,
-        handle_set_session_mode_request, request_tool_permission, test_store,
+    use crate::acp::{handle_new_session_request, handle_set_session_mode_request};
+    use crate::session::{
+        PERMISSION_ALLOW_ONCE_OPTION_ID, PermissionDecision, request_tool_permission,
     };
+    use crate::tools::{AdapterToolRegistry, ToolContext, ToolRegistry};
+    use crate::{PermissionRequester, test_store};
     use agent_client_protocol::schema::{
         McpServer, McpServerStdio, NewSessionRequest, RequestPermissionOutcome,
         RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
@@ -603,7 +604,7 @@ mod tests {
         );
         let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                crate::PERMISSION_ALLOW_ONCE_OPTION_ID,
+                PERMISSION_ALLOW_ONCE_OPTION_ID,
             )),
         )]);
 

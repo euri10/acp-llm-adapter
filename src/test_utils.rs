@@ -23,11 +23,13 @@ use agent_client_protocol::schema::{
 use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
 use futures_util::future::BoxFuture;
 
-use crate::{
+use crate::acp::{
     CreateTerminalRequester, KillTerminalRequester, PermissionRequester, ReadTextFileRequester,
-    ReleaseTerminalRequester, SessionStore, TerminalOutputRequester, ToolContext,
-    WaitForTerminalExitRequester, WriteTextFileRequester,
+    ReleaseTerminalRequester, TerminalOutputRequester, WaitForTerminalExitRequester,
+    WriteTextFileRequester,
 };
+use crate::session::SessionStore;
+use crate::tools::ToolContext;
 
 // ── CountingReadTextFileRequester ───────────────────────────
 
@@ -170,7 +172,7 @@ pub(crate) fn permission_mode_fixture()
 -> Result<PermissionModeFixture, agent_client_protocol::Error> {
     use crate::test_store;
     let store = test_store();
-    let session = crate::handle_new_session_request(
+    let session = crate::acp::handle_new_session_request(
         &store,
         &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
     )?;

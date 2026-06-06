@@ -324,11 +324,12 @@ pub(crate) fn tool_raw_input(call: &DeepSeekToolCall) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{ModelRequestSettings, handle_prompt_request, stream_model_turn};
-    use crate::tools::{EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry};
-    use crate::{
-        DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionStore, ToolCallRequester,
-        handle_new_session_request, handle_set_session_config_option_request, test_store,
+    use crate::acp::{
+        ToolCallRequester, handle_new_session_request, handle_set_session_config_option_request,
     };
+    use crate::session::{DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionStore};
+    use crate::test_store;
+    use crate::tools::{EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry};
     use agent_client_protocol::schema::{
         CancelNotification, ContentBlock, PromptRequest, SessionNotification, SessionUpdate,
         SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolKind,
@@ -983,5 +984,47 @@ mod tests {
         assert_eq!(messages[2].content(), "second");
 
         Ok(())
+    }
+
+    #[test]
+    fn helper_raw_input_and_finish_reason_cover_branches() {
+        use agent_client_protocol::schema::StopReason;
+        use deepseek_acp_adapter::deepseek::FinishReason;
+
+        let valid_raw_input = DeepSeekToolCall::new(
+            "valid-raw-input",
+            "echo",
+            serde_json::json!({ "a": 1 }).to_string(),
+        );
+        assert_eq!(
+            super::tool_raw_input(&valid_raw_input),
+            serde_json::json!({ "a": 1 })
+        );
+        let invalid_raw_input = DeepSeekToolCall::new("invalid-raw-input", "echo", "not json");
+        assert_eq!(
+            super::tool_raw_input(&invalid_raw_input),
+            serde_json::json!("not json")
+        );
+
+        assert_eq!(
+            crate::stop_reason_from_finish(&FinishReason::EndTurn),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            crate::stop_reason_from_finish(&FinishReason::ToolCalls),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            crate::stop_reason_from_finish(&FinishReason::Other("rate_limit".to_string())),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            crate::stop_reason_from_finish(&FinishReason::MaxTokens),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            crate::stop_reason_from_finish(&FinishReason::Refusal),
+            StopReason::Refusal
+        );
     }
 }
