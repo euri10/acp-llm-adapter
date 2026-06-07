@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 use super::{FilesystemSessionStore, PersistedSessionMeta};
 use crate::{PermissionPosture, ReasoningEffort};
 use agent_client_protocol::schema::SessionId;

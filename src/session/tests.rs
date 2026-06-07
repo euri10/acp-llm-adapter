@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 use super::{PendingToolCalls, PermissionDecision, PermissionPosture, ReasoningEffort};
 use agent_client_protocol::schema::SessionModeId;
 

@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 use super::{ModelRequestSettings, handle_prompt_request, stream_model_turn};
 use crate::acp::{
     ToolCallRequester, handle_new_session_request, handle_set_session_config_option_request,

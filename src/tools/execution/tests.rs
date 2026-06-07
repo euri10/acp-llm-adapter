@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 use super::*;
 use crate::acp::handle_new_session_request;
 use crate::session::PERMISSION_ALLOW_ONCE_OPTION_ID;

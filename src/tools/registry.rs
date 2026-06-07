@@ -229,6 +229,7 @@ impl ToolExecution {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::acp::handle_new_session_request;

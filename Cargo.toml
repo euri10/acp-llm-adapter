@@ -51,6 +51,10 @@ harness = false
 missing_docs = "deny"
 unsafe_code = "forbid"
 warnings = "deny"
+# Catch items that are `pub` but unreachable from the crate root.
+unreachable_pub = "deny"
+# All public types must implement Debug.
+missing_debug_implementations = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -62,3 +66,19 @@ unimplemented = "deny"
 unwrap_used = "deny"
 # `#[must_use]` on every internal binary helper is noise at this stage.
 must_use_candidate = "allow"
+# stdout is the JSON-RPC wire; printing to it corrupts protocol frames.
+print_stdout = "deny"
+# dbg! writes to stderr in tests, which is the legitimate log channel,
+# but in production it's a debugging artefact that must not ship.
+dbg_macro = "deny"
+# Direct array/slice indexing panics on out-of-bounds; prefer .get().
+# Test modules carry a blanket allow since test assertions deliberately panic.
+indexing_slicing = "deny"
+# Calling `exit()` in library code terminates the host process.
+exit = "deny"
+# `.get().unwrap()` is a code smell; prefer indexing or safe access.
+get_unwrap = "deny"
+# `unwrap` in `Result`-returning functions should be avoided.
+unwrap_in_result = "deny"
+# Slicing on `String` is byte-index-based and easy to mis-use.
+string_slice = "deny"

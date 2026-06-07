@@ -81,6 +81,7 @@ pub mod deepseek;
 pub mod error;
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use crate::deepseek::ToolCall as DeepSeekToolCall;
     use crate::deepseek::{

@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 use super::{
     McpSession, connect_mcp_http_session, connect_mcp_sessions, connect_mcp_stdio_session,
     mcp_call_arguments, mcp_http_headers, mcp_tool_execution, mcp_tool_mappings,

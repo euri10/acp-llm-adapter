@@ -319,6 +319,7 @@ pub(crate) fn test_store() -> SessionStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS, plan_from_prompt, text_from_prompt,
