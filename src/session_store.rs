@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::{McpServer, SessionId, SessionInfo};
 use deepseek_acp_adapter::deepseek::ChatMessage;
+use deepseek_acp_adapter::error::SessionPersistenceError;
 use serde::{Deserialize, Serialize};
 
 use crate::{PermissionPosture, ReasoningEffort};
@@ -47,23 +48,6 @@ pub(crate) struct PersistedSessionRecord {
     pub(crate) meta: PersistedSessionMeta,
     /// Chat messages loaded from `history.jsonl`.
     pub(crate) history: Vec<ChatMessage>,
-}
-
-/// Error returned by filesystem session persistence.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum SessionPersistenceError {
-    /// The host environment does not expose a usable state directory.
-    #[error("failed to resolve state directory: {0}")]
-    StateDir(String),
-    /// The session id cannot be represented as a safe path component.
-    #[error("invalid persisted session id: {0}")]
-    InvalidSessionId(String),
-    /// Filesystem I/O failed.
-    #[error("filesystem session store I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    /// JSON encoding or decoding failed.
-    #[error("filesystem session store JSON failed: {0}")]
-    Json(#[from] serde_json::Error),
 }
 
 impl FilesystemSessionStore {
