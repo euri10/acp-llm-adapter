@@ -16,8 +16,8 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::num::NonZeroUsize;
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::{error::Error, process::ExitCode};
 
 use agent_client_protocol::Stdio;
 use agent_client_protocol::schema::{
@@ -27,6 +27,7 @@ use agent_client_protocol::schema::{
 };
 use clap::{Parser, Subcommand};
 use deepseek_acp_adapter::deepseek::FinishReason;
+use deepseek_acp_adapter::error::AdapterError;
 use tracing_subscriber::EnvFilter;
 
 mod acp;
@@ -53,8 +54,6 @@ pub(crate) use mcp::{
 pub(crate) use session_store::FilesystemSessionStore;
 use tools::AdapterToolRegistry;
 pub(crate) use turn::tool_raw_input;
-
-type AdapterResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
 // Re-export session domain types so other modules can use `crate::*` imports.
 pub(crate) use session::{
@@ -170,7 +169,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> AdapterResult<()> {
+fn run() -> Result<(), AdapterError> {
     init_tracing()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -189,11 +188,12 @@ fn run() -> AdapterResult<()> {
     Ok(())
 }
 
-fn init_tracing() -> AdapterResult<()> {
+fn init_tracing() -> Result<(), AdapterError> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
-        .try_init()?;
+        .try_init()
+        .map_err(|e| AdapterError::Internal(e.to_string()))?;
     Ok(())
 }
 

@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::deepseek::DeepSeekError;
 
 // ---------------------------------------------------------------------------
-// SessionPersistenceError — moved here from the binary so AdapterError can
-// use `#[from]` without crate-boundary headaches.
+// SessionPersistenceError — moved here from the library crate so AdapterError
+// can use `#[from]` without crate-boundary headaches.
 // ---------------------------------------------------------------------------
 
 /// Error returned by filesystem session persistence.
@@ -50,6 +50,9 @@ pub enum SessionPersistenceError {
 /// |---|---|---|
 /// | `DeepSeek` | [`DeepSeekError`] | API key missing, transport failure, bad response |
 /// | `SessionPersistence` | [`SessionPersistenceError`] | I/O, JSON, invalid session id |
+/// | `InvalidParams` | — | Invalid method parameters |
+/// | `InvalidRequest` | — | Invalid request structure |
+/// | `SessionNotFound` | — | Session id not found in store |
 /// | `Internal` | — | Unexpected internal invariant violations |
 #[derive(Debug, Error)]
 pub enum AdapterError {
@@ -61,18 +64,57 @@ pub enum AdapterError {
     #[error("session persistence error: {0}")]
     SessionPersistence(#[from] SessionPersistenceError),
 
+    /// Invalid method parameters.
+    #[error("invalid params: {0}")]
+    InvalidParams(String),
+
+    /// Invalid request.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    /// Session id not found in the store.
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
+
     /// An unexpected internal invariant was violated.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 impl From<AdapterError> for agent_client_protocol::Error {
-    /// Converts any [`AdapterError`] into an ACP internal error.
-    ///
-    /// The error's `Display` message is attached as JSON-RPC error data so
-    /// that the client receives diagnostic information without leaking
-    /// implementation details into the error code / message fields.
+    /// Converts any [`AdapterError`] into an ACP error with the appropriate
+    /// JSON-RPC error code.
     fn from(err: AdapterError) -> Self {
-        agent_client_protocol::Error::into_internal_error(err)
+        match err {
+            AdapterError::InvalidParams(msg) => {
+                agent_client_protocol::Error::invalid_params().data(msg)
+            }
+            AdapterError::InvalidRequest(msg) => {
+                agent_client_protocol::Error::invalid_request().data(msg)
+            }
+            AdapterError::SessionNotFound(id) => agent_client_protocol::Error::invalid_params()
+                .data(format!("session not found: {id}")),
+            other => agent_client_protocol::Error::into_internal_error(other),
+        }
+    }
+}
+
+impl From<std::io::Error> for AdapterError {
+    fn from(err: std::io::Error) -> Self {
+        Self::SessionPersistence(SessionPersistenceError::Io(err))
+    }
+}
+
+impl From<serde_json::Error> for AdapterError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::SessionPersistence(SessionPersistenceError::Json(err))
+    }
+}
+
+/// Allows `?` to convert ACP protocol errors encountered inside domain code
+/// into [`AdapterError::Internal`].
+impl From<agent_client_protocol::Error> for AdapterError {
+    fn from(err: agent_client_protocol::Error) -> Self {
+        Self::Internal(err.to_string())
     }
 }

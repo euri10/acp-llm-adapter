@@ -13,6 +13,7 @@ use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
     ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
 };
+use deepseek_acp_adapter::error::AdapterError;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use std::collections::VecDeque;
@@ -147,7 +148,7 @@ impl ToolRegistry for FakeToolRegistry {
         &self,
         _context: &ToolContext,
         _store: &SessionStore,
-    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+    ) -> Result<Vec<ToolDefinition>, AdapterError> {
         Ok(self.definitions.clone())
     }
 

@@ -17,6 +17,7 @@ use tokio::process::Command as TokioCommand;
 
 use crate::SessionStore;
 use crate::tools::{ToolContext, ToolExecution};
+use deepseek_acp_adapter::error::AdapterError;
 
 /// Prefix used for model-visible MCP tool names.
 pub(crate) const MCP_TOOL_PREFIX: &str = "mcp";
@@ -156,7 +157,7 @@ pub(crate) fn mcp_tool_result_text(content: &[McpContent]) -> String {
 /// for tools.
 pub(crate) async fn connect_mcp_sessions(
     servers: &[McpServer],
-) -> Result<Vec<McpSession>, agent_client_protocol::Error> {
+) -> Result<Vec<McpSession>, AdapterError> {
     let mut sessions = Vec::new();
 
     for server in servers {
@@ -164,12 +165,14 @@ pub(crate) async fn connect_mcp_sessions(
             McpServer::Stdio(stdio) => sessions.push(connect_mcp_stdio_session(stdio).await?),
             McpServer::Http(http) => sessions.push(connect_mcp_http_session(http).await?),
             McpServer::Sse(_) => {
-                return Err(agent_client_protocol::Error::invalid_params()
-                    .data("SSE MCP servers are not supported"));
+                return Err(AdapterError::InvalidParams(
+                    "SSE MCP servers are not supported".to_string(),
+                ));
             }
             _ => {
-                return Err(agent_client_protocol::Error::invalid_params()
-                    .data("unsupported MCP server transport"));
+                return Err(AdapterError::InvalidParams(
+                    "unsupported MCP server transport".to_string(),
+                ));
             }
         }
     }
@@ -185,9 +188,9 @@ pub(crate) async fn connect_mcp_sessions(
 /// fails to start, initialization fails, or tool discovery fails.
 pub(crate) async fn connect_mcp_stdio_session(
     server: &McpServerStdio,
-) -> Result<McpSession, agent_client_protocol::Error> {
+) -> Result<McpSession, AdapterError> {
     if !server.command.is_absolute() {
-        return Err(agent_client_protocol::Error::invalid_params().data(format!(
+        return Err(AdapterError::InvalidParams(format!(
             "MCP server '{}' command must be absolute",
             server.name
         )));
@@ -200,13 +203,13 @@ pub(crate) async fn connect_mcp_stdio_session(
         }
     });
     let transport = TokioChildProcess::new(command).map_err(|error| {
-        agent_client_protocol::Error::invalid_params().data(format!(
+        AdapterError::InvalidParams(format!(
             "failed to start MCP server '{}': {error}",
             server.name
         ))
     })?;
     let service = ().serve(transport).await.map_err(|error| {
-        agent_client_protocol::Error::invalid_params().data(format!(
+        AdapterError::InvalidParams(format!(
             "failed to initialize MCP server '{}': {error}",
             server.name
         ))
@@ -222,13 +225,13 @@ pub(crate) async fn connect_mcp_stdio_session(
 /// discovery fails.
 pub(crate) async fn connect_mcp_http_session(
     server: &McpServerHttp,
-) -> Result<McpSession, agent_client_protocol::Error> {
+) -> Result<McpSession, AdapterError> {
     let custom_headers = mcp_http_headers(&server.headers, &server.name)?;
     let config = StreamableHttpClientTransportConfig::with_uri(server.url.clone())
         .custom_headers(custom_headers);
     let transport = StreamableHttpClientTransport::from_config(config);
     let service = ().serve(transport).await.map_err(|error| {
-        agent_client_protocol::Error::invalid_params().data(format!(
+        AdapterError::InvalidParams(format!(
             "failed to initialize MCP server '{}': {error}",
             server.name
         ))
@@ -240,10 +243,10 @@ pub(crate) async fn connect_mcp_http_session(
 async fn mcp_session_from_service(
     server_name: &str,
     service: RunningService<RoleClient, ()>,
-) -> Result<McpSession, agent_client_protocol::Error> {
+) -> Result<McpSession, AdapterError> {
     let peer = service.peer().clone();
     let tools = peer.list_all_tools().await.map_err(|error| {
-        agent_client_protocol::Error::invalid_params().data(format!(
+        AdapterError::InvalidParams(format!(
             "failed to list MCP tools for server '{server_name}': {error}",
         ))
     })?;
@@ -260,17 +263,17 @@ async fn mcp_session_from_service(
 fn mcp_http_headers(
     headers: &[HttpHeader],
     server_name: &str,
-) -> Result<HashMap<HeaderName, HeaderValue>, agent_client_protocol::Error> {
+) -> Result<HashMap<HeaderName, HeaderValue>, AdapterError> {
     let mut parsed = HashMap::with_capacity(headers.len());
     for header in headers {
         let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|error| {
-            agent_client_protocol::Error::invalid_params().data(format!(
+            AdapterError::InvalidParams(format!(
                 "invalid HTTP header name '{}' for MCP server '{server_name}': {error}",
                 header.name
             ))
         })?;
         let value = HeaderValue::from_str(&header.value).map_err(|error| {
-            agent_client_protocol::Error::invalid_params().data(format!(
+            AdapterError::InvalidParams(format!(
                 "invalid HTTP header value for '{}' on MCP server '{server_name}': {error}",
                 header.name
             ))

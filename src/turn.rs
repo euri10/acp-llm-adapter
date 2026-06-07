@@ -20,6 +20,7 @@ use crate::{
     PendingToolCalls, ReasoningEffort, SessionStore, plan_from_prompt, session_notification,
     stop_reason_from_finish, text_from_prompt,
 };
+use deepseek_acp_adapter::error::AdapterError;
 
 /// Stable model settings applied to each streamed LLM request in a prompt turn.
 #[derive(Debug, Clone, Copy)]
@@ -60,7 +61,7 @@ pub(crate) async fn handle_prompt_request(
     request: PromptRequest,
     max_turn_requests: NonZeroUsize,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-) -> Result<PromptResponse, agent_client_protocol::Error> {
+) -> Result<PromptResponse, AdapterError> {
     let user_text = text_from_prompt(&request.prompt)?;
     let user_message = ChatMessage::user(user_text.clone());
     let session_id = request.session_id.clone();
@@ -108,7 +109,7 @@ async fn run_prompt_turn(
     mut messages: Vec<ChatMessage>,
     model_settings: ModelRequestSettings<'_>,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-) -> Result<PromptResponse, agent_client_protocol::Error> {
+) -> Result<PromptResponse, AdapterError> {
     let tool_definitions = env
         .tool_registry
         .definitions(&env.tool_context, env.store)?;
@@ -189,7 +190,7 @@ pub(crate) async fn stream_model_turn(
     cancellation_token: CancellationToken,
     session_id: &SessionId,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-) -> Result<ModelTurn, agent_client_protocol::Error> {
+) -> Result<ModelTurn, AdapterError> {
     let mut stream = llm_client
         .stream_chat(
             ChatRequest::new(messages.to_vec())
@@ -198,7 +199,7 @@ pub(crate) async fn stream_model_turn(
                 .with_reasoning_effort(model_settings.reasoning_effort.id()),
             cancellation_token.clone(),
         )
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
+        .map_err(AdapterError::from)?;
     let mut assistant_text = String::new();
     let mut stop_reason = StopReason::EndTurn;
     let mut finish_reason = FinishReason::EndTurn;
@@ -220,7 +221,7 @@ pub(crate) async fn stream_model_turn(
             break;
         };
 
-        match event.map_err(agent_client_protocol::Error::into_internal_error)? {
+        match event.map_err(AdapterError::from)? {
             StreamEvent::Thought(chunk) => notify(session_notification(
                 session_id.clone(),
                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(chunk.into())),
@@ -268,7 +269,7 @@ fn report_tool_call(
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
     call: &DeepSeekToolCall,
     kind: ToolKind,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AdapterError> {
     notify(session_notification(
         session_id.clone(),
         SessionUpdate::ToolCall(
@@ -277,7 +278,8 @@ fn report_tool_call(
                 .status(ToolCallStatus::Pending)
                 .raw_input(tool_raw_input(call)),
         ),
-    ))
+    ))?;
+    Ok(())
 }
 
 fn report_tool_result(
@@ -285,7 +287,7 @@ fn report_tool_result(
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
     call: &DeepSeekToolCall,
     result: &ToolExecution,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AdapterError> {
     let mut fields = ToolCallUpdateFields::new()
         .status(result.status())
         .content(tool_call_update_content(result))
@@ -300,7 +302,8 @@ fn report_tool_result(
     notify(session_notification(
         session_id.clone(),
         SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call.id().to_string(), fields)),
-    ))
+    ))?;
+    Ok(())
 }
 
 fn tool_call_update_content(result: &ToolExecution) -> Vec<ToolCallContent> {

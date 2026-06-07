@@ -218,7 +218,8 @@ pub(crate) async fn serve_with_transport(
         )
         .on_receive_notification(
             async move |notification: CancelNotification, _cx| {
-                cancel_store.cancel_active_turn(&notification.session_id)
+                cancel_store.cancel_active_turn(&notification.session_id)?;
+                Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
         )
@@ -564,6 +565,7 @@ pub(crate) async fn handle_prompt_request(
         notify,
     )
     .await
+    .map_err(Into::into)
 }
 
 pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> InitializeResponse {
