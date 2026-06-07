@@ -919,7 +919,8 @@ mod tests {
         handle_new_session_request_connected, handle_prompt_request, handle_resume_session_request,
         handle_set_session_config_option_request,
         handle_set_session_config_option_request_notifying, handle_set_session_mode_request,
-        handle_set_session_mode_request_notifying, replay_session_history, replayed_tool_call,
+        handle_set_session_mode_request_notifying, replay_assistant_message,
+        replay_session_history, replayed_tool_call, restore_persisted_session,
         serve_with_transport, tool_result_content, validate_load_session_paths,
         validate_resume_session_paths, validate_session_paths,
     };
@@ -3294,8 +3295,8 @@ mod tests {
     // ── replayed_tool_call ──────────────────────────────────
 
     #[test]
-    fn replayed_tool_call_formats_acp_tool_call_with_output(
-    ) -> Result<(), agent_client_protocol::Error> {
+    fn replayed_tool_call_formats_acp_tool_call_with_output()
+    -> Result<(), agent_client_protocol::Error> {
         let history = vec![
             ChatMessage::user("run echo"),
             ChatMessage::assistant_with_tool_calls(
@@ -3330,8 +3331,9 @@ mod tests {
                 .data("expected Content tool call content"));
         };
         let ContentBlock::Text(text) = &content.content else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected Text content block"));
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected Text content block")
+            );
         };
         assert_eq!(text.text, "echo: hi");
         Ok(())
@@ -3357,8 +3359,9 @@ mod tests {
                 .data("expected Content tool call content"));
         };
         let ContentBlock::Text(text) = &content.content else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected Text content block"));
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected Text content block")
+            );
         };
         assert_eq!(text.text, "");
         Ok(())
@@ -3445,6 +3448,133 @@ mod tests {
             notifications[2].update,
             SessionUpdate::ToolCall(_)
         ));
+        Ok(())
+    }
+
+    // ── replay_assistant_message ────────────────────────────
+
+    #[test]
+    fn replay_assistant_message_emits_content_and_tool_calls()
+    -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("replay-asst");
+        let history: Vec<ChatMessage> = Vec::new();
+        let tool_calls = vec![deepseek_acp_adapter::deepseek::ToolCall::new(
+            "call-1", "echo", "{}",
+        )];
+        let message = ChatMessage::assistant_with_tool_calls("assistant text", tool_calls);
+        let mut notifications = Vec::new();
+
+        replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        })?;
+
+        assert_eq!(notifications.len(), 2);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+        assert!(matches!(
+            notifications[1].update,
+            SessionUpdate::ToolCall(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_assistant_message_skips_empty_content() -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("replay-empty");
+        let history: Vec<ChatMessage> = Vec::new();
+        let message = ChatMessage::assistant_with_tool_calls("", vec![]);
+        let mut notifications = Vec::new();
+
+        replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        })?;
+
+        assert!(notifications.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn replay_assistant_message_content_only_no_tool_calls()
+    -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("replay-content");
+        let history: Vec<ChatMessage> = Vec::new();
+        let message = ChatMessage::assistant("just text");
+        let mut notifications = Vec::new();
+
+        replay_assistant_message(&session_id, &history, &message, &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        })?;
+
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+        Ok(())
+    }
+
+    // ── restore_persisted_session: id mismatch ──────────────
+
+    #[test_log::test(tokio::test)]
+    async fn restore_persisted_session_rejects_mismatched_id()
+    -> Result<(), agent_client_protocol::Error> {
+        let state_dir =
+            std::env::temp_dir().join(format!("deepseek-acp-restore-id-{}", Uuid::new_v4()));
+        let workspace = state_dir.join("workspace");
+        let persistence = FilesystemSessionStore::new(&state_dir);
+        let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+            .with_persistence(persistence.clone());
+
+        // Persist a session normally with matching meta.session_id and
+        // directory name, so load_record succeeds.
+        let session_id = agent_client_protocol::schema::SessionId::new("session-restore-id");
+        persistence
+            .persist_turn(
+                &PersistedSessionMeta {
+                    session_id: session_id.0.to_string(),
+                    cwd: workspace.clone(),
+                    additional_directories: Vec::new(),
+                    mode: PermissionPosture::Ask,
+                    model: "deepseek-v4-pro".to_string(),
+                    reasoning_effort: ReasoningEffort::High,
+                    mcp_servers: Vec::new(),
+                },
+                &[ChatMessage::user("hello")],
+            )
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        // Overwrite meta.json with a mismatched session_id so the
+        // id-comparison guard in restore_persisted_session fires.
+        let meta_dir = state_dir.join("sessions").join("session-restore-id");
+        let mismatched_meta = PersistedSessionMeta {
+            session_id: "session-restore-id-mismatched".to_string(),
+            cwd: workspace.clone(),
+            additional_directories: Vec::new(),
+            mode: PermissionPosture::Ask,
+            model: "deepseek-v4-pro".to_string(),
+            reasoning_effort: ReasoningEffort::High,
+            mcp_servers: Vec::new(),
+        };
+        let meta_json = serde_json::to_string(&mismatched_meta)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::write(meta_dir.join("meta.json"), meta_json.as_bytes())
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let Err(error) = restore_persisted_session(&store, &session_id, &workspace).await else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected mismatched persisted session id to fail"));
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match requested session id")
+        );
         Ok(())
     }
 }
