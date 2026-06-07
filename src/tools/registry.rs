@@ -231,10 +231,141 @@ impl ToolExecution {
 mod tests {
     use super::*;
     use crate::acp::handle_new_session_request;
+    use crate::session::PERMISSION_ALLOW_ONCE_OPTION_ID;
     use crate::test_store;
-    use agent_client_protocol::schema::NewSessionRequest;
+    use agent_client_protocol::schema::{
+        ClientCapabilities, CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities,
+        KillTerminalRequest, KillTerminalResponse, NewSessionRequest, ReadTextFileRequest,
+        ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+        SelectedPermissionOutcome, TerminalExitStatus, TerminalId, TerminalOutputRequest,
+        TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+        WriteTextFileRequest, WriteTextFileResponse,
+    };
     use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
+    use futures_util::future::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug, Default)]
+    struct RecordingToolCallRequester {
+        read_file: AtomicUsize,
+        write_file: AtomicUsize,
+        permission: AtomicUsize,
+        terminal_create: AtomicUsize,
+        terminal_output: AtomicUsize,
+        terminal_wait: AtomicUsize,
+        terminal_release: AtomicUsize,
+    }
+
+    impl RecordingToolCallRequester {
+        fn read_calls(&self) -> usize {
+            self.read_file.load(Ordering::SeqCst)
+        }
+
+        fn write_calls(&self) -> usize {
+            self.write_file.load(Ordering::SeqCst)
+        }
+
+        fn permission_calls(&self) -> usize {
+            self.permission.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::ReadTextFileRequester for RecordingToolCallRequester {
+        fn read_text_file(
+            &self,
+            _request: ReadTextFileRequest,
+        ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+            self.read_file.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(ReadTextFileResponse::new("client original")) })
+        }
+    }
+
+    impl crate::WriteTextFileRequester for RecordingToolCallRequester {
+        fn write_text_file(
+            &self,
+            _request: WriteTextFileRequest,
+        ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
+            self.write_file.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(WriteTextFileResponse::new()) })
+        }
+    }
+
+    impl crate::PermissionRequester for RecordingToolCallRequester {
+        fn request_permission(
+            &self,
+            _request: RequestPermissionRequest,
+        ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>>
+        {
+            self.permission.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                        PERMISSION_ALLOW_ONCE_OPTION_ID,
+                    )),
+                ))
+            })
+        }
+    }
+
+    impl crate::acp::CreateTerminalRequester for RecordingToolCallRequester {
+        fn create_terminal(
+            &self,
+            _request: CreateTerminalRequest,
+        ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
+            self.terminal_create.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(CreateTerminalResponse::new(TerminalId::new(
+                    "registry-terminal",
+                )))
+            })
+        }
+    }
+
+    impl crate::acp::TerminalOutputRequester for RecordingToolCallRequester {
+        fn terminal_output(
+            &self,
+            _request: TerminalOutputRequest,
+        ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>> {
+            self.terminal_output.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(TerminalOutputResponse::new("terminal output", false)) })
+        }
+    }
+
+    impl crate::acp::WaitForTerminalExitRequester for RecordingToolCallRequester {
+        fn wait_for_terminal_exit(
+            &self,
+            _request: WaitForTerminalExitRequest,
+        ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>>
+        {
+            self.terminal_wait.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(WaitForTerminalExitResponse::new(
+                    TerminalExitStatus::new().exit_code(Some(0)),
+                ))
+            })
+        }
+    }
+
+    impl crate::acp::ReleaseTerminalRequester for RecordingToolCallRequester {
+        fn release_terminal(
+            &self,
+            _request: ReleaseTerminalRequest,
+        ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>> {
+            self.terminal_release.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(ReleaseTerminalResponse::new()) })
+        }
+    }
+
+    impl crate::acp::KillTerminalRequester for RecordingToolCallRequester {
+        fn kill_terminal(
+            &self,
+            _request: KillTerminalRequest,
+        ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>> {
+            Box::pin(async move { Ok(KillTerminalResponse::new()) })
+        }
+    }
 
     fn registry_context(cwd: std::path::PathBuf) -> ToolContext {
         ToolContext {
@@ -298,6 +429,94 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.content, "alpha\nbeta\ngamma");
         assert_eq!(result.raw_output["source"], "local");
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_execute_client_file_tools_use_connection()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-reg-client-fs-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
+        let requester = RecordingToolCallRequester::default();
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root,
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true)),
+            ),
+        };
+        let registry = AdapterToolRegistry;
+
+        let read_call = DeepSeekToolCall::new(
+            "reg-client-read",
+            "read_file",
+            serde_json::json!({"path": "sample.txt"}).to_string(),
+        );
+        let read_result = registry
+            .execute(
+                &read_call,
+                &context,
+                &store,
+                Some(&requester),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(read_result.success);
+        assert_eq!(read_result.content, "client original");
+        assert_eq!(read_result.raw_output["source"], "client");
+
+        let write_call = DeepSeekToolCall::new(
+            "reg-client-write",
+            "write_file",
+            serde_json::json!({"path": "sample.txt", "content": "replacement"}).to_string(),
+        );
+        let write_result = registry
+            .execute(
+                &write_call,
+                &context,
+                &store,
+                Some(&requester),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(write_result.success);
+        assert_eq!(write_result.raw_output["source"], "client");
+
+        let edit_call = DeepSeekToolCall::new(
+            "reg-client-edit",
+            "edit_file",
+            serde_json::json!({
+                "path": "sample.txt",
+                "old_text": "original",
+                "new_text": "edited"
+            })
+            .to_string(),
+        );
+        let edit_result = registry
+            .execute(
+                &edit_call,
+                &context,
+                &store,
+                Some(&requester),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(edit_result.success);
+        assert_eq!(edit_result.raw_output["read_source"], "client");
+        assert_eq!(edit_result.raw_output["write_source"], "client");
+        assert_eq!(requester.read_calls(), 3);
+        assert_eq!(requester.write_calls(), 2);
+        assert_eq!(requester.permission_calls(), 2);
         Ok(())
     }
 
@@ -401,6 +620,55 @@ mod tests {
         // run_command requires permission which is denied without a requester
         assert!(!result.success);
         assert!(result.content.contains("requires a client connection"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn adapter_registry_execute_run_command_uses_terminal_connection()
+    -> Result<(), agent_client_protocol::Error> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "deepseek-acp-reg-terminal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
+        let requester = RecordingToolCallRequester::default();
+        let context = ToolContext {
+            session_id: session.session_id.clone(),
+            cwd: temp_root,
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                ClientCapabilities::new()
+                    .terminal(true)
+                    .fs(FileSystemCapabilities::new()),
+            ),
+        };
+        let call = DeepSeekToolCall::new(
+            "reg-terminal",
+            "run_command",
+            serde_json::json!({"command": "echo via-terminal"}).to_string(),
+        );
+
+        let result = AdapterToolRegistry
+            .execute(
+                &call,
+                &context,
+                &store,
+                Some(&requester),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.success);
+        assert!(result.content.contains("terminal output"));
+        assert_eq!(requester.permission_calls(), 1);
+        assert_eq!(requester.terminal_create.load(Ordering::SeqCst), 1);
+        assert_eq!(requester.terminal_wait.load(Ordering::SeqCst), 1);
+        assert_eq!(requester.terminal_output.load(Ordering::SeqCst), 1);
+        assert_eq!(requester.terminal_release.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
