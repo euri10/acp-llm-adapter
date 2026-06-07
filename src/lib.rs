@@ -77,7 +77,11 @@
 /// `DeepSeek` client primitives and streaming SSE adapter.
 pub mod deepseek;
 
+/// Unified domain error type for the adapter crate.
+pub mod error;
+
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use crate::deepseek::ToolCall as DeepSeekToolCall;
     use crate::deepseek::{

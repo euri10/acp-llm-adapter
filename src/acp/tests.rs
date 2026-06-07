@@ -1,3 +1,4 @@
+#![allow(clippy::indexing_slicing)]
 use super::{
     build_initialize_response, config_value_id, handle_authenticate_request,
     handle_close_session_request, handle_initialize_request, handle_list_sessions_request,

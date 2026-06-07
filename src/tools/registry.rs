@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use agent_client_protocol::schema::{SessionId, ToolCallStatus, ToolKind};
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
+use deepseek_acp_adapter::error::AdapterError;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +32,7 @@ pub(crate) trait ToolRegistry: Send + Sync {
         &self,
         context: &ToolContext,
         store: &crate::SessionStore,
-    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error>;
+    ) -> Result<Vec<ToolDefinition>, AdapterError>;
 
     /// Return the ACP kind used when displaying and gating a tool call.
     fn kind(&self, name: &str) -> ToolKind;
@@ -61,7 +62,7 @@ impl ToolRegistry for EmptyToolRegistry {
         &self,
         _context: &ToolContext,
         _store: &crate::SessionStore,
-    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+    ) -> Result<Vec<ToolDefinition>, AdapterError> {
         Ok(Vec::new())
     }
 
@@ -89,7 +90,7 @@ impl ToolRegistry for AdapterToolRegistry {
         &self,
         context: &ToolContext,
         store: &crate::SessionStore,
-    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+    ) -> Result<Vec<ToolDefinition>, AdapterError> {
         let mut definitions = vec![
             read_file_tool_definition(),
             list_dir_tool_definition(),
@@ -228,6 +229,7 @@ impl ToolExecution {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::acp::handle_new_session_request;
@@ -243,6 +245,7 @@ mod tests {
         WriteTextFileRequest, WriteTextFileResponse,
     };
     use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
+    use deepseek_acp_adapter::error::AdapterError;
     use futures_util::future::BoxFuture;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
@@ -377,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_definitions_returns_empty() -> Result<(), agent_client_protocol::Error> {
+    fn empty_registry_definitions_returns_empty() -> Result<(), AdapterError> {
         let registry = EmptyToolRegistry;
         let context = registry_context(std::path::PathBuf::from("/tmp"));
         let store = test_store();
@@ -406,14 +409,12 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn adapter_registry_execute_read_file_local() -> Result<(), agent_client_protocol::Error>
-    {
+    async fn adapter_registry_execute_read_file_local() -> Result<(), AdapterError> {
         let temp_root =
             std::env::temp_dir().join(format!("deepseek-acp-reg-read-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_root)
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
         std::fs::write(temp_root.join("sample.txt"), "alpha\nbeta\ngamma\n")
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(AdapterError::from)?;
 
         let registry = AdapterToolRegistry;
         let context = registry_context(temp_root.clone());
@@ -433,14 +434,13 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn adapter_registry_execute_client_file_tools_use_connection()
-    -> Result<(), agent_client_protocol::Error> {
+    async fn adapter_registry_execute_client_file_tools_use_connection() -> Result<(), AdapterError>
+    {
         let temp_root = std::env::temp_dir().join(format!(
             "deepseek-acp-reg-client-fs-{}",
             uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(&temp_root)
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
 
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
@@ -521,12 +521,10 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn adapter_registry_execute_write_file_local_no_permission()
-    -> Result<(), agent_client_protocol::Error> {
+    async fn adapter_registry_execute_write_file_local_no_permission() -> Result<(), AdapterError> {
         let temp_root =
             std::env::temp_dir().join(format!("deepseek-acp-reg-write-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_root)
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
 
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
@@ -553,14 +551,12 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn adapter_registry_execute_edit_file_local_no_permission()
-    -> Result<(), agent_client_protocol::Error> {
+    async fn adapter_registry_execute_edit_file_local_no_permission() -> Result<(), AdapterError> {
         let temp_root =
             std::env::temp_dir().join(format!("deepseek-acp-reg-edit-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_root)
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
         std::fs::write(temp_root.join("source.txt"), "original content\n")
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(AdapterError::from)?;
 
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
@@ -592,12 +588,11 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn adapter_registry_execute_run_command_local_no_permission()
-    -> Result<(), agent_client_protocol::Error> {
+    async fn adapter_registry_execute_run_command_local_no_permission() -> Result<(), AdapterError>
+    {
         let temp_root =
             std::env::temp_dir().join(format!("deepseek-acp-reg-cmd-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_root)
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
 
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
@@ -625,13 +620,12 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn adapter_registry_execute_run_command_uses_terminal_connection()
-    -> Result<(), agent_client_protocol::Error> {
+    -> Result<(), AdapterError> {
         let temp_root = std::env::temp_dir().join(format!(
             "deepseek-acp-reg-terminal-{}",
             uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(&temp_root)
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
 
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;

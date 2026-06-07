@@ -28,7 +28,7 @@ use crate::mcp::{McpSession, McpToolTarget};
 use crate::session_store::{FilesystemSessionStore, PersistedSessionMeta, PersistedSessionRecord};
 use crate::tools::ToolContext;
 use crate::turn::tool_raw_input;
-
+use deepseek_acp_adapter::error::AdapterError;
 /// Default maximum number of tool-call/response cycles per prompt turn.
 pub(crate) const DEFAULT_MAX_TURN_REQUESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(99);
 pub(crate) const PERMISSION_ALLOW_ONCE_OPTION_ID: &str = "allow_once";
@@ -138,7 +138,7 @@ impl ReasoningEffort {
 ///
 /// # Errors
 ///
-/// Returns an ACP error when the session is unknown, the permission request
+/// Returns an [`AdapterError`] when the session is unknown, the permission request
 /// cannot be sent, or the client returns an unrecognized outcome.
 pub(crate) async fn request_tool_permission(
     store: &SessionStore,
@@ -146,7 +146,7 @@ pub(crate) async fn request_tool_permission(
     call: &DeepSeekToolCall,
     kind: ToolKind,
     requester: &dyn PermissionRequester,
-) -> Result<PermissionDecision, agent_client_protocol::Error> {
+) -> Result<PermissionDecision, AdapterError> {
     if store.is_always_allowed(&context.session_id, call.name())? {
         return Ok(PermissionDecision::AllowAlways);
     }
@@ -170,7 +170,10 @@ pub(crate) async fn request_tool_permission(
         permission_options(),
     );
 
-    let response = requester.request_permission(request).await?;
+    let response = requester
+        .request_permission(request)
+        .await
+        .map_err(|e| AdapterError::Internal(e.to_string()))?;
     let decision = match response.outcome {
         RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
         RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
@@ -179,13 +182,15 @@ pub(crate) async fn request_tool_permission(
             PERMISSION_REJECT_ONCE_OPTION_ID => PermissionDecision::RejectOnce,
             PERMISSION_REJECT_ALWAYS_OPTION_ID => PermissionDecision::RejectAlways,
             other => {
-                return Err(agent_client_protocol::Error::invalid_params()
-                    .data(format!("unknown permission option selected: {other}")));
+                return Err(AdapterError::InvalidParams(format!(
+                    "unknown permission option selected: {other}"
+                )));
             }
         },
         _ => {
-            return Err(agent_client_protocol::Error::invalid_params()
-                .data("unsupported permission outcome variant"));
+            return Err(AdapterError::InvalidParams(
+                "unsupported permission outcome variant".to_string(),
+            ));
         }
     };
 
@@ -246,7 +251,7 @@ impl PendingToolCalls {
         }
     }
 
-    pub(crate) fn finish(self) -> Result<Vec<DeepSeekToolCall>, agent_client_protocol::Error> {
+    pub(crate) fn finish(self) -> Result<Vec<DeepSeekToolCall>, AdapterError> {
         self.calls
             .into_iter()
             .enumerate()
@@ -263,13 +268,12 @@ struct PendingToolCall {
 }
 
 impl PendingToolCall {
-    fn finish(self, index: usize) -> Result<DeepSeekToolCall, agent_client_protocol::Error> {
+    fn finish(self, index: usize) -> Result<DeepSeekToolCall, AdapterError> {
         let id = self.id.ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("tool call delta {index} is missing an id"))
+            AdapterError::InvalidParams(format!("tool call delta {index} is missing an id"))
         })?;
         let name = self.name.ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params().data(format!(
+            AdapterError::InvalidParams(format!(
                 "tool call delta {index} is missing a function name"
             ))
         })?;
@@ -358,13 +362,14 @@ fn reasoning_effort_select_options() -> Vec<SessionConfigSelectOption> {
 pub(crate) fn validate_session_model(
     session: &SessionRecord,
     model: &str,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<(), AdapterError> {
     if is_known_model(model) || model == session.model {
         return Ok(());
     }
 
-    Err(agent_client_protocol::Error::invalid_params()
-        .data(format!("unsupported DeepSeek model: {model}")))
+    Err(AdapterError::InvalidParams(format!(
+        "unsupported DeepSeek model: {model}"
+    )))
 }
 
 fn is_known_model(model: &str) -> bool {
@@ -459,26 +464,27 @@ impl SessionStore {
     pub(crate) fn load_persisted_record(
         &self,
         session_id: &SessionId,
-    ) -> Result<PersistedSessionRecord, agent_client_protocol::Error> {
+    ) -> Result<PersistedSessionRecord, AdapterError> {
         let Some(persistence) = &self.persistence else {
-            return Err(agent_client_protocol::Error::invalid_request()
-                .data("session/load requires filesystem persistence"));
+            return Err(AdapterError::InvalidRequest(
+                "session/load requires filesystem persistence".to_string(),
+            ));
         };
 
         persistence
             .load_record(session_id.0.as_ref())
-            .map_err(agent_client_protocol::Error::into_internal_error)
+            .map_err(|e| AdapterError::Internal(e.to_string()))
     }
 
     /// Store the client capabilities reported during initialization.
     pub(crate) fn record_client_capabilities(
         &self,
         client_capabilities: ClientCapabilities,
-    ) -> Result<(), agent_client_protocol::Error> {
+    ) -> Result<(), AdapterError> {
         let mut guard = self
             .state
             .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
         guard.client_capabilities = Some(client_capabilities);
         Ok(())
     }
@@ -487,12 +493,12 @@ impl SessionStore {
     pub(crate) fn list_sessions(
         &self,
         cwd_filter: Option<&Path>,
-    ) -> Result<Vec<SessionInfo>, agent_client_protocol::Error> {
+    ) -> Result<Vec<SessionInfo>, AdapterError> {
         let (mut sessions, persistence) = {
             let guard = self
                 .state
                 .lock()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
+                .map_err(|e| AdapterError::Internal(e.to_string()))?;
             (
                 guard
                     .sessions
@@ -510,7 +516,7 @@ impl SessionStore {
         if let (Some(persistence), Some(cwd)) = (persistence, cwd_filter) {
             for persisted in persistence
                 .list_persisted(cwd)
-                .map_err(agent_client_protocol::Error::into_internal_error)?
+                .map_err(|e| AdapterError::Internal(e.to_string()))?
             {
                 if !sessions
                     .iter()
@@ -525,14 +531,11 @@ impl SessionStore {
     }
 
     /// Remove a session by id. Returns `true` if the session existed.
-    pub(crate) fn remove_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<bool, agent_client_protocol::Error> {
+    pub(crate) fn remove_session(&self, session_id: &SessionId) -> Result<bool, AdapterError> {
         let mut guard = self
             .state
             .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
         Ok(guard.sessions.remove(session_id).is_some())
     }
 
@@ -541,21 +544,21 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         record: SessionRecord,
-    ) -> Result<(), agent_client_protocol::Error> {
+    ) -> Result<(), AdapterError> {
         let mut guard = self
             .state
             .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
         guard.sessions.insert(session_id, record);
         Ok(())
     }
 
     /// Return the default model identifier for new sessions.
-    pub(crate) fn default_model(&self) -> Result<String, agent_client_protocol::Error> {
+    pub(crate) fn default_model(&self) -> Result<String, AdapterError> {
         let guard = self
             .state
             .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
         Ok(guard.default_model.clone())
     }
 
@@ -565,15 +568,14 @@ impl SessionStore {
     pub(crate) fn with_session<T>(
         &self,
         session_id: &SessionId,
-        f: impl FnOnce(&SessionRecord) -> Result<T, agent_client_protocol::Error>,
-    ) -> Result<T, agent_client_protocol::Error> {
+        f: impl FnOnce(&SessionRecord) -> Result<T, AdapterError>,
+    ) -> Result<T, AdapterError> {
         let guard = self
             .state
             .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
         let session = guard.sessions.get(session_id).ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("unknown session id: {}", session_id.0))
+            AdapterError::InvalidParams(format!("unknown session id: {}", session_id.0))
         })?;
         f(session)
     }
@@ -584,15 +586,14 @@ impl SessionStore {
     pub(crate) fn with_session_mut<T>(
         &self,
         session_id: &SessionId,
-        f: impl FnOnce(&mut SessionRecord) -> Result<T, agent_client_protocol::Error>,
-    ) -> Result<T, agent_client_protocol::Error> {
+        f: impl FnOnce(&mut SessionRecord) -> Result<T, AdapterError>,
+    ) -> Result<T, AdapterError> {
         let mut guard = self
             .state
             .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
         let session = guard.sessions.get_mut(session_id).ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("unknown session id: {}", session_id.0))
+            AdapterError::InvalidParams(format!("unknown session id: {}", session_id.0))
         })?;
         f(session)
     }
@@ -601,7 +602,7 @@ impl SessionStore {
     pub(crate) fn mcp_definitions(
         &self,
         session_id: &SessionId,
-    ) -> Result<Vec<ToolDefinition>, agent_client_protocol::Error> {
+    ) -> Result<Vec<ToolDefinition>, AdapterError> {
         self.with_session(session_id, |session| {
             Ok(session
                 .mcp_sessions
@@ -616,7 +617,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         exposed_name: &str,
-    ) -> Result<Option<McpToolTarget>, agent_client_protocol::Error> {
+    ) -> Result<Option<McpToolTarget>, AdapterError> {
         self.with_session(session_id, |session| {
             Ok(session.mcp_sessions.iter().find_map(|mcp_session| {
                 mcp_session.tools.iter().find_map(|tool| {
@@ -639,7 +640,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         tool_name: &str,
-    ) -> Result<bool, agent_client_protocol::Error> {
+    ) -> Result<bool, AdapterError> {
         self.with_session(session_id, |session| {
             Ok(session.permission_allow_always.contains(tool_name))
         })
@@ -649,7 +650,7 @@ impl SessionStore {
     pub(crate) fn permission_posture(
         &self,
         session_id: &SessionId,
-    ) -> Result<PermissionPosture, agent_client_protocol::Error> {
+    ) -> Result<PermissionPosture, AdapterError> {
         self.with_session(session_id, |session| Ok(session.mode))
     }
 
@@ -658,7 +659,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         tool_name: String,
-    ) -> Result<(), agent_client_protocol::Error> {
+    ) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
             session.permission_allow_always.insert(tool_name);
             Ok(())
@@ -666,10 +667,7 @@ impl SessionStore {
     }
 
     /// Cancel the active turn token for a session, if one exists.
-    pub(crate) fn cancel_active_turn(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(), agent_client_protocol::Error> {
+    pub(crate) fn cancel_active_turn(&self, session_id: &SessionId) -> Result<(), AdapterError> {
         self.with_session(session_id, |session| {
             if let Some(token) = &session.active_turn {
                 token.cancel();
@@ -679,10 +677,7 @@ impl SessionStore {
     }
 
     /// Clear the active turn token for a session.
-    pub(crate) fn clear_active_turn(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(), agent_client_protocol::Error> {
+    pub(crate) fn clear_active_turn(&self, session_id: &SessionId) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
             session.active_turn = None;
             Ok(())
@@ -694,7 +689,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         mode: PermissionPosture,
-    ) -> Result<(), agent_client_protocol::Error> {
+    ) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
             session.mode = mode;
             Ok(())
@@ -706,7 +701,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         model: String,
-    ) -> Result<(), agent_client_protocol::Error> {
+    ) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
             session.model = model;
             Ok(())
@@ -718,7 +713,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         effort: ReasoningEffort,
-    ) -> Result<(), agent_client_protocol::Error> {
+    ) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
             session.reasoning_effort = effort;
             Ok(())
@@ -735,24 +730,21 @@ impl SessionStore {
         session_id: &SessionId,
         token: CancellationToken,
         user_message: ChatMessage,
-    ) -> Result<TurnSetup, agent_client_protocol::Error> {
+    ) -> Result<TurnSetup, AdapterError> {
         let mut guard = self
             .state
             .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
         let client_capabilities = guard.client_capabilities.clone();
         let session = guard.sessions.get_mut(session_id).ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params()
-                .data(format!("unknown session id: {}", session_id.0))
+            AdapterError::InvalidParams(format!("unknown session id: {}", session_id.0))
         })?;
 
         if session.active_turn.is_some() {
-            return Err(
-                agent_client_protocol::Error::invalid_request().data(format!(
-                    "session {} already has an active turn",
-                    session_id.0
-                )),
-            );
+            return Err(AdapterError::InvalidRequest(format!(
+                "session {} already has an active turn",
+                session_id.0
+            )));
         }
         session.active_turn = Some(token);
 
@@ -776,15 +768,14 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         messages: Vec<ChatMessage>,
-    ) -> Result<(), agent_client_protocol::Error> {
+    ) -> Result<(), AdapterError> {
         let (persistence, meta, new_messages) = {
             let guard = self
                 .state
                 .lock()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
+                .map_err(|e| AdapterError::Internal(e.to_string()))?;
             let session = guard.sessions.get(session_id).ok_or_else(|| {
-                agent_client_protocol::Error::invalid_params()
-                    .data(format!("unknown session id: {}", session_id.0))
+                AdapterError::InvalidParams(format!("unknown session id: {}", session_id.0))
             })?;
             let previous_len = session.history.len();
             let new_messages = messages
@@ -810,7 +801,7 @@ impl SessionStore {
         if let Some(persistence) = persistence {
             persistence
                 .persist_turn(&meta, &new_messages)
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
+                .map_err(|e| AdapterError::Internal(e.to_string()))?;
         }
 
         self.with_session_mut(session_id, |session| {
@@ -823,131 +814,15 @@ impl SessionStore {
     pub(crate) fn session_config_options(
         &self,
         session_id: &SessionId,
-    ) -> Result<Vec<SessionConfigOption>, agent_client_protocol::Error> {
+    ) -> Result<Vec<SessionConfigOption>, AdapterError> {
         self.with_session(session_id, |session| Ok(session_config_options(session)))
     }
 
     /// Look up a session record for a new-session response.
-    pub(crate) fn lookup_session(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(), agent_client_protocol::Error> {
+    pub(crate) fn lookup_session(&self, session_id: &SessionId) -> Result<(), AdapterError> {
         self.with_session(session_id, |_session| Ok(()))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{PendingToolCalls, PermissionDecision, PermissionPosture, ReasoningEffort};
-    use agent_client_protocol::schema::SessionModeId;
-
-    #[test]
-    fn permission_decision_debug_impl_is_callable() {
-        let decisions = [
-            PermissionDecision::AllowOnce,
-            PermissionDecision::AllowAlways,
-            PermissionDecision::AllowByMode,
-            PermissionDecision::RejectOnce,
-            PermissionDecision::RejectAlways,
-            PermissionDecision::Cancelled,
-        ];
-        for decision in &decisions {
-            let _ = format!("{decision:?}");
-        }
-    }
-
-    #[test]
-    fn reasoning_effort_name_and_description() {
-        assert_eq!(ReasoningEffort::High.name(), "High");
-        assert_eq!(ReasoningEffort::Max.name(), "Max");
-        assert!(
-            ReasoningEffort::High
-                .description()
-                .contains("Default DeepSeek")
-        );
-        assert!(
-            ReasoningEffort::Max
-                .description()
-                .contains("Maximum DeepSeek")
-        );
-    }
-
-    #[test]
-    fn reasoning_effort_from_value_id_rejects_unknown() {
-        assert!(
-            ReasoningEffort::from_value_id(
-                &agent_client_protocol::schema::SessionConfigValueId::new("bogus",)
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn pending_tool_calls_require_complete_metadata() -> Result<(), agent_client_protocol::Error> {
-        use deepseek_acp_adapter::deepseek::ToolCallDelta;
-
-        let mut missing_id = PendingToolCalls::default();
-        missing_id.push(&ToolCallDelta::new(
-            1,
-            None,
-            Some("echo".to_string()),
-            Some("{}".to_string()),
-        ));
-        let Err(error) = missing_id.finish() else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected missing tool call id to fail"));
-        };
-        assert!(error.to_string().contains("missing an id"));
-
-        let mut missing_name = PendingToolCalls::default();
-        missing_name.push(&ToolCallDelta::new(
-            0,
-            Some("call-1".to_string()),
-            None,
-            Some("{}".to_string()),
-        ));
-        let Err(error) = missing_name.finish() else {
-            return Err(agent_client_protocol::Error::internal_error()
-                .data("expected missing tool call name to fail"));
-        };
-        assert!(error.to_string().contains("missing a function name"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn permission_posture_helpers_cover_all_branches() {
-        use crate::mcp::{is_mcp_tool_name, mcp_tool_kind};
-        use agent_client_protocol::schema::ToolKind;
-
-        assert_eq!(PermissionPosture::Ask.mode_id().0.as_ref(), "ask");
-        assert_eq!(
-            PermissionPosture::AcceptEdits.mode_id().0.as_ref(),
-            "accept-edits"
-        );
-        assert_eq!(PermissionPosture::Yolo.mode_id().0.as_ref(), "yolo");
-        assert_eq!(
-            PermissionPosture::from_mode_id(&SessionModeId::new("ask")),
-            Some(PermissionPosture::Ask)
-        );
-        assert_eq!(
-            PermissionPosture::from_mode_id(&SessionModeId::new("accept-edits")),
-            Some(PermissionPosture::AcceptEdits)
-        );
-        assert_eq!(
-            PermissionPosture::from_mode_id(&SessionModeId::new("yolo")),
-            Some(PermissionPosture::Yolo)
-        );
-        assert_eq!(
-            PermissionPosture::from_mode_id(&SessionModeId::new("bogus")),
-            None
-        );
-        assert!(!PermissionPosture::Ask.allows_without_prompt(ToolKind::Edit));
-        assert!(PermissionPosture::AcceptEdits.allows_without_prompt(ToolKind::Edit));
-        assert!(!PermissionPosture::AcceptEdits.allows_without_prompt(ToolKind::Execute));
-        assert!(PermissionPosture::Yolo.allows_without_prompt(ToolKind::Execute));
-        assert!(!PermissionPosture::Yolo.allows_without_prompt(ToolKind::Read));
-        assert!(is_mcp_tool_name("mcp__server__tool"));
-        assert_eq!(mcp_tool_kind(), ToolKind::Execute);
-    }
-}
+mod tests;

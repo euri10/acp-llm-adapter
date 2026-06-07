@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::{McpServer, SessionId, SessionInfo};
 use deepseek_acp_adapter::deepseek::ChatMessage;
+use deepseek_acp_adapter::error::SessionPersistenceError;
 use serde::{Deserialize, Serialize};
 
 use crate::{PermissionPosture, ReasoningEffort};
@@ -47,23 +48,6 @@ pub(crate) struct PersistedSessionRecord {
     pub(crate) meta: PersistedSessionMeta,
     /// Chat messages loaded from `history.jsonl`.
     pub(crate) history: Vec<ChatMessage>,
-}
-
-/// Error returned by filesystem session persistence.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum SessionPersistenceError {
-    /// The host environment does not expose a usable state directory.
-    #[error("failed to resolve state directory: {0}")]
-    StateDir(String),
-    /// The session id cannot be represented as a safe path component.
-    #[error("invalid persisted session id: {0}")]
-    InvalidSessionId(String),
-    /// Filesystem I/O failed.
-    #[error("filesystem session store I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    /// JSON encoding or decoding failed.
-    #[error("filesystem session store JSON failed: {0}")]
-    Json(#[from] serde_json::Error),
 }
 
 impl FilesystemSessionStore {
@@ -226,51 +210,4 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionPersistenceError> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{FilesystemSessionStore, PersistedSessionMeta};
-    use crate::{PermissionPosture, ReasoningEffort};
-    use agent_client_protocol::schema::SessionId;
-    use deepseek_acp_adapter::deepseek::ChatMessage;
-    use uuid::Uuid;
-
-    #[test_log::test]
-    fn round_trips_session_metadata_and_history()
-    -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-        let state_dir =
-            std::env::temp_dir().join(format!("deepseek-acp-session-store-{}", Uuid::new_v4()));
-        let cwd = state_dir.join("workspace");
-        let store = FilesystemSessionStore::new(&state_dir);
-        let meta = PersistedSessionMeta {
-            session_id: "session-roundtrip".to_string(),
-            cwd: cwd.clone(),
-            additional_directories: vec![state_dir.join("extra")],
-            mode: PermissionPosture::Yolo,
-            model: "deepseek-v4-pro".to_string(),
-            reasoning_effort: ReasoningEffort::Max,
-            mcp_servers: Vec::new(),
-        };
-
-        store.persist_turn(&meta, &[ChatMessage::user("hello")])?;
-        store.persist_turn(&meta, &[ChatMessage::assistant("world")])?;
-
-        let record = store.load_record("session-roundtrip")?;
-        assert_eq!(record.meta, meta);
-        assert_eq!(record.history.len(), 2);
-        assert_eq!(record.history[0], ChatMessage::user("hello"));
-        assert_eq!(record.history[1], ChatMessage::assistant("world"));
-
-        let listed = store.list_persisted(&cwd)?;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].session_id, SessionId::new("session-roundtrip"));
-        assert_eq!(listed[0].cwd, cwd);
-
-        Ok(())
-    }
-
-    #[test_log::test]
-    fn rejects_session_ids_that_are_not_path_components() {
-        let store = FilesystemSessionStore::new("/tmp/deepseek-acp-invalid");
-        let error = store.load_record("../escape").err();
-        assert!(error.is_some());
-    }
-}
+mod tests;

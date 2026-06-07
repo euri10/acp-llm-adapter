@@ -3,6 +3,10 @@
 //! Mocks the LLM client and permission requester so the full ACP adapter
 //! pipeline can be exercised without hitting the `DeepSeek` API.
 
+// stdout is the JSON-RPC wire; this harness is the only place where
+// developer-facing output is intentionally printed to stdout.
+#![allow(clippy::print_stdout)]
+
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -294,6 +298,7 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         Backend, DevSmokeResult, MockLlmClient, MockPermissionRequester, build_dev_agent,
