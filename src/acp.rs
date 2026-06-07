@@ -913,14 +913,15 @@ pub(crate) fn validate_resume_session_paths(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_initialize_response, handle_authenticate_request, handle_close_session_request,
-        handle_initialize_request, handle_list_sessions_request, handle_load_session_request,
-        handle_logout_request, handle_new_session_request, handle_new_session_request_connected,
-        handle_prompt_request, handle_resume_session_request,
+        build_initialize_response, config_value_id, handle_authenticate_request,
+        handle_close_session_request, handle_initialize_request, handle_list_sessions_request,
+        handle_load_session_request, handle_logout_request, handle_new_session_request,
+        handle_new_session_request_connected, handle_prompt_request, handle_resume_session_request,
         handle_set_session_config_option_request,
         handle_set_session_config_option_request_notifying, handle_set_session_mode_request,
-        handle_set_session_mode_request_notifying, serve_with_transport,
-        validate_load_session_paths, validate_resume_session_paths, validate_session_paths,
+        handle_set_session_mode_request_notifying, replay_session_history, replayed_tool_call,
+        serve_with_transport, tool_result_content, validate_load_session_paths,
+        validate_resume_session_paths, validate_session_paths,
     };
     use crate::dev::MockLlmClient;
     use crate::session::{
@@ -940,8 +941,9 @@ mod tests {
         Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
         NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
         RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
-        SelectedPermissionOutcome, SessionConfigOptionCategory, SessionUpdate,
-        SetSessionConfigOptionRequest, SetSessionModeRequest, ToolCallStatus, ToolKind,
+        SelectedPermissionOutcome, SessionConfigOptionCategory, SessionConfigOptionValue,
+        SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, ToolCallContent,
+        ToolCallStatus, ToolKind,
     };
     use agent_client_protocol::{Channel, Client};
     use deepseek_acp_adapter::deepseek::{ChatMessage, LlmClient};
@@ -3225,6 +3227,224 @@ mod tests {
                 .to_string()
                 .contains("additional directories must be absolute paths")
         );
+        Ok(())
+    }
+
+    // ── config_value_id ─────────────────────────────────────
+
+    #[test]
+    fn config_value_id_extracts_value_id() -> Result<(), agent_client_protocol::Error> {
+        let value = SessionConfigOptionValue::value_id("model-1");
+        let result = config_value_id(&value)?;
+        assert_eq!(result.0.as_ref(), "model-1");
+        Ok(())
+    }
+
+    #[test]
+    fn config_value_id_rejects_boolean_value() -> Result<(), agent_client_protocol::Error> {
+        let value = SessionConfigOptionValue::boolean(true);
+        let Err(error) = config_value_id(&value) else {
+            return Err(
+                agent_client_protocol::Error::internal_error().data("expected boolean rejection")
+            );
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("session config option requires a selectable value id")
+        );
+        Ok(())
+    }
+
+    // ── tool_result_content ─────────────────────────────────
+
+    #[test]
+    fn tool_result_content_finds_matching_tool_result() {
+        let history = vec![
+            ChatMessage::user("run tool"),
+            ChatMessage::assistant_with_tool_calls(
+                "calling",
+                vec![deepseek_acp_adapter::deepseek::ToolCall::new(
+                    "call-1", "echo", "{}",
+                )],
+            ),
+            ChatMessage::tool_result("call-1", "tool output"),
+            ChatMessage::assistant("done"),
+        ];
+
+        assert_eq!(
+            tool_result_content("call-1", &history),
+            Some("tool output".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_result_content_returns_none_when_not_found() {
+        let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")];
+
+        assert_eq!(tool_result_content("missing-call", &history), None);
+    }
+
+    #[test]
+    fn tool_result_content_returns_none_for_empty_history() {
+        let history: Vec<ChatMessage> = Vec::new();
+        assert_eq!(tool_result_content("any-call", &history), None);
+    }
+
+    // ── replayed_tool_call ──────────────────────────────────
+
+    #[test]
+    fn replayed_tool_call_formats_acp_tool_call_with_output(
+    ) -> Result<(), agent_client_protocol::Error> {
+        let history = vec![
+            ChatMessage::user("run echo"),
+            ChatMessage::assistant_with_tool_calls(
+                "using echo",
+                vec![deepseek_acp_adapter::deepseek::ToolCall::new(
+                    "call-1",
+                    "echo",
+                    r#"{"message":"hi"}"#,
+                )],
+            ),
+            ChatMessage::tool_result("call-1", "echo: hi"),
+        ];
+
+        let tool_call =
+            deepseek_acp_adapter::deepseek::ToolCall::new("call-1", "echo", r#"{"message":"hi"}"#);
+        let replayed = replayed_tool_call(&tool_call, &history);
+
+        assert_eq!(replayed.tool_call_id.0.as_ref(), "call-1");
+        assert_eq!(replayed.title, "echo");
+        assert_eq!(replayed.status, ToolCallStatus::Completed);
+        assert_eq!(
+            replayed.raw_input,
+            Some(serde_json::json!({ "message": "hi" }))
+        );
+        assert_eq!(
+            replayed.raw_output,
+            Some(serde_json::json!({ "content": "echo: hi" }))
+        );
+        assert_eq!(replayed.content.len(), 1);
+        let ToolCallContent::Content(content) = &replayed.content[0] else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected Content tool call content"));
+        };
+        let ContentBlock::Text(text) = &content.content else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected Text content block"));
+        };
+        assert_eq!(text.text, "echo: hi");
+        Ok(())
+    }
+
+    #[test]
+    fn replayed_tool_call_defaults_output_when_tool_result_missing()
+    -> Result<(), agent_client_protocol::Error> {
+        let tool_call =
+            deepseek_acp_adapter::deepseek::ToolCall::new("call-2", "echo", r#"{"message":"hi"}"#);
+        let history: Vec<ChatMessage> = Vec::new();
+        let replayed = replayed_tool_call(&tool_call, &history);
+
+        assert_eq!(replayed.tool_call_id.0.as_ref(), "call-2");
+        assert_eq!(replayed.status, ToolCallStatus::Completed);
+        assert_eq!(
+            replayed.raw_output,
+            Some(serde_json::json!({ "content": "" }))
+        );
+        assert_eq!(replayed.content.len(), 1);
+        let ToolCallContent::Content(content) = &replayed.content[0] else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected Content tool call content"));
+        };
+        let ContentBlock::Text(text) = &content.content else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected Text content block"));
+        };
+        assert_eq!(text.text, "");
+        Ok(())
+    }
+
+    // ── replay_session_history ──────────────────────────────
+
+    #[test]
+    fn replay_session_history_emits_user_and_assistant_notifications()
+    -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("replay-test");
+        let history = vec![ChatMessage::user("hello"), ChatMessage::assistant("world")];
+        let mut notifications = Vec::new();
+
+        replay_session_history(&session_id, &history, &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        })?;
+
+        assert_eq!(notifications.len(), 2);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::UserMessageChunk(_)
+        ));
+        assert!(matches!(
+            notifications[1].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_session_history_skips_system_and_tool_messages()
+    -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("replay-skip");
+        let history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("user prompt"),
+            ChatMessage::tool_result("call-1", "result"),
+        ];
+        let mut notifications = Vec::new();
+
+        replay_session_history(&session_id, &history, &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        })?;
+
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::UserMessageChunk(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_session_history_replays_tool_calls_for_assistant()
+    -> Result<(), agent_client_protocol::Error> {
+        let session_id = agent_client_protocol::schema::SessionId::new("replay-tools");
+        let tool_call =
+            deepseek_acp_adapter::deepseek::ToolCall::new("call-1", "echo", r#"{"message":"hi"}"#);
+        let history = vec![
+            ChatMessage::user("use echo"),
+            ChatMessage::assistant_with_tool_calls("using tool", vec![tool_call]),
+            ChatMessage::tool_result("call-1", "echo: hi"),
+        ];
+        let mut notifications = Vec::new();
+
+        replay_session_history(&session_id, &history, &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        })?;
+
+        assert_eq!(notifications.len(), 3);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::UserMessageChunk(_)
+        ));
+        assert!(matches!(
+            notifications[1].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
+        assert!(matches!(
+            notifications[2].update,
+            SessionUpdate::ToolCall(_)
+        ));
         Ok(())
     }
 }
