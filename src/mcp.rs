@@ -792,4 +792,314 @@ mod tests {
             "hello_world"
         );
     }
+
+    #[test]
+    fn mcp_http_headers_rejects_invalid_header_value() -> Result<(), agent_client_protocol::Error> {
+        let headers = [agent_client_protocol::schema::HttpHeader::new(
+            "X-Token", "val\0ue",
+        )];
+
+        let Err(error) = mcp_http_headers(&headers, "remote") else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("expected invalid header value to fail"));
+        };
+
+        let error = error.to_string();
+        assert!(error.contains("invalid HTTP header value"));
+        assert!(!error.contains("val\0ue"));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mcp_tool_execution_bad_arguments_for_registered_tool()
+    -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let mcp_session = connected_echo_mcp_session().await?;
+        {
+            let mut guard = store
+                .state
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let session = guard
+                .sessions
+                .get_mut(&response.session_id)
+                .ok_or_else(|| {
+                    agent_client_protocol::Error::internal_error().data("missing session")
+                })?;
+            session.mcp_sessions.push(mcp_session);
+        }
+
+        let context = ToolContext {
+            session_id: response.session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("mcp-bad-args", "mcp__echo_server__echo", "[1,2,3]");
+        let result = mcp_tool_execution(&store, &call, &context).await;
+        assert!(!result.success);
+        assert!(result.content.contains("arguments must be a JSON object"));
+        Ok(())
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailingMcpServer;
+
+    impl ServerHandler for FailingMcpServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, rmcp::ErrorData> {
+            Err(rmcp::ErrorData::internal_error(
+                "simulated tool failure",
+                None,
+            ))
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::ErrorData> {
+            Ok(ListToolsResult {
+                tools: vec![McpTool::new(
+                    "failer",
+                    "Always fails",
+                    rmcp::model::object(serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    })),
+                )],
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn connected_failing_mcp_session() -> Result<McpSession, agent_client_protocol::Error> {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let running = FailingMcpServer
+                .serve(server_transport)
+                .await
+                .map_err(|error| error.to_string())?;
+            running.waiting().await.map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        });
+        drop(server_task);
+
+        let service = ().serve(client_transport).await.map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to initialize test MCP client: {error}"))
+        })?;
+        let peer = service.peer().clone();
+        let tools = peer.list_all_tools().await.map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to list test MCP tools: {error}"))
+        })?;
+
+        Ok(McpSession {
+            name: "Failing Server".to_string(),
+            tools: mcp_tool_mappings("Failing Server", tools),
+            peer,
+            _service: service,
+        })
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mcp_tool_execution_peer_call_tool_error() -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let mcp_session = connected_failing_mcp_session().await?;
+        {
+            let mut guard = store
+                .state
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let session = guard
+                .sessions
+                .get_mut(&response.session_id)
+                .ok_or_else(|| {
+                    agent_client_protocol::Error::internal_error().data("missing session")
+                })?;
+            session.mcp_sessions.push(mcp_session);
+        }
+
+        let context = ToolContext {
+            session_id: response.session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("mcp-failing", "mcp__failing_server__failer", "{}");
+        let result = mcp_tool_execution(&store, &call, &context).await;
+        assert!(!result.success);
+        assert!(
+            result
+                .content
+                .contains("MCP tool 'failer' on server 'Failing Server' failed")
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, Clone)]
+    struct ErrorFlagMcpServer;
+
+    impl ServerHandler for ErrorFlagMcpServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, rmcp::ErrorData> {
+            let mut result = CallToolResult::error(vec![McpContent::text("err output")]);
+            result.is_error = Some(true);
+            Ok(result)
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::ErrorData> {
+            Ok(ListToolsResult {
+                tools: vec![McpTool::new(
+                    "error_flag",
+                    "Returns is_error",
+                    rmcp::model::object(serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    })),
+                )],
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn connected_error_flag_mcp_session() -> Result<McpSession, agent_client_protocol::Error>
+    {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let running = ErrorFlagMcpServer
+                .serve(server_transport)
+                .await
+                .map_err(|error| error.to_string())?;
+            running.waiting().await.map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        });
+        drop(server_task);
+
+        let service = ().serve(client_transport).await.map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to initialize test MCP client: {error}"))
+        })?;
+        let peer = service.peer().clone();
+        let tools = peer.list_all_tools().await.map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to list test MCP tools: {error}"))
+        })?;
+
+        Ok(McpSession {
+            name: "Error Flag Server".to_string(),
+            tools: mcp_tool_mappings("Error Flag Server", tools),
+            peer,
+            _service: service,
+        })
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mcp_tool_execution_is_error_flag() -> Result<(), agent_client_protocol::Error> {
+        let store = test_store();
+        let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let mcp_session = connected_error_flag_mcp_session().await?;
+        {
+            let mut guard = store
+                .state
+                .lock()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let session = guard
+                .sessions
+                .get_mut(&response.session_id)
+                .ok_or_else(|| {
+                    agent_client_protocol::Error::internal_error().data("missing session")
+                })?;
+            session.mcp_sessions.push(mcp_session);
+        }
+
+        let context = ToolContext {
+            session_id: response.session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("mcp-errflag", "mcp__error_flag_server__error_flag", "{}");
+        let result = mcp_tool_execution(&store, &call, &context).await;
+        assert!(!result.success);
+        assert_eq!(result.content, "err output");
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mcp_tool_execution_unknown_session() {
+        let store = test_store();
+        let context = ToolContext {
+            session_id: agent_client_protocol::schema::SessionId::new("nonexistent-session"),
+            cwd: PathBuf::from("/tmp"),
+            additional_directories: Vec::new(),
+            client_capabilities: None,
+        };
+        let call = DeepSeekToolCall::new("mcp-unknown-session", "mcp__server__tool", "{}");
+        let result = mcp_tool_execution(&store, &call, &context).await;
+        assert!(!result.success);
+        assert!(result.content.contains("unknown session id"));
+    }
+
+    #[test]
+    fn mcp_tool_result_text_resource_content() {
+        let content = vec![McpContent::resource(rmcp::model::ResourceContents::text(
+            "file content",
+            "file:///test.txt",
+        ))];
+        let result = mcp_tool_result_text(&content);
+        assert!(!result.is_empty());
+        assert!(result.contains("file:///test.txt"));
+    }
+
+    #[test]
+    fn mcp_tool_mappings_no_description() -> Result<(), agent_client_protocol::Error> {
+        // Deserialize a tool with no description to exercise the fallback
+        // description path in `mcp_tool_mappings`. `McpTool::new` always
+        // wraps description in `Some`, so we construct via JSON.
+        let tool_json = serde_json::json!({
+            "name": "bare_tool",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        });
+        let tool: McpTool = serde_json::from_value(tool_json).map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+                .data(format!("failed to deserialize tool: {error}"))
+        })?;
+
+        let mappings = mcp_tool_mappings("NoDesc Server", vec![tool]);
+
+        assert_eq!(mappings.len(), 1);
+        let mapping = &mappings[0];
+        assert_eq!(mapping.exposed_name, "mcp__nodesc_server__bare_tool");
+        assert_eq!(mapping.original_name, "bare_tool");
+        assert_eq!(
+            mapping.definition.description(),
+            "MCP tool 'bare_tool' from server 'NoDesc Server'"
+        );
+        Ok(())
+    }
 }
