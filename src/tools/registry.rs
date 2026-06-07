@@ -20,6 +20,8 @@ use crate::{
     WriteTextFileRequester, is_mcp_tool_name, mcp_tool_execution, mcp_tool_kind,
 };
 
+type ToolExecutionFuture<'a> = BoxFuture<'a, ToolExecution>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolContext {
     pub(crate) session_id: SessionId,
@@ -52,7 +54,7 @@ pub(crate) trait ToolRegistry: Send + Sync {
         store: &'a crate::SessionStore,
         connection: Option<&'a dyn crate::ToolCallRequester>,
         cancellation_token: CancellationToken,
-    ) -> BoxFuture<'a, ToolExecution>;
+    ) -> ToolExecutionFuture<'a>;
 }
 
 #[derive(Debug)]
@@ -79,7 +81,7 @@ impl ToolRegistry for EmptyToolRegistry {
         _store: &'a crate::SessionStore,
         _connection: Option<&'a dyn crate::ToolCallRequester>,
         _cancellation_token: CancellationToken,
-    ) -> BoxFuture<'a, ToolExecution> {
+    ) -> ToolExecutionFuture<'a> {
         Box::pin(async move { ToolExecution::failed(format!("unknown tool: {}", call.name())) })
     }
 }
@@ -124,7 +126,7 @@ impl ToolRegistry for AdapterToolRegistry {
         store: &'a crate::SessionStore,
         connection: Option<&'a dyn crate::ToolCallRequester>,
         cancellation_token: CancellationToken,
-    ) -> BoxFuture<'a, ToolExecution> {
+    ) -> ToolExecutionFuture<'a> {
         Box::pin(async move {
             match call.name() {
                 "read_file" => {

@@ -38,18 +38,20 @@ use crate::{
     validate_session_model,
 };
 
+type AcpRequestFuture<'a, T> = BoxFuture<'a, Result<T, agent_client_protocol::Error>>;
+
 pub(crate) trait ReadTextFileRequester: Send + Sync {
     fn read_text_file(
         &self,
         request: ReadTextFileRequest,
-    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>>;
+    ) -> AcpRequestFuture<'_, ReadTextFileResponse>;
 }
 
 pub(crate) trait WriteTextFileRequester: Send + Sync {
     fn write_text_file(
         &self,
         request: WriteTextFileRequest,
-    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>>;
+    ) -> AcpRequestFuture<'_, WriteTextFileResponse>;
 }
 
 /// Trait for creating a terminal via ACP client `terminal/create`.
@@ -58,7 +60,7 @@ pub(crate) trait CreateTerminalRequester: Send + Sync {
     fn create_terminal(
         &self,
         request: CreateTerminalRequest,
-    ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>>;
+    ) -> AcpRequestFuture<'_, CreateTerminalResponse>;
 }
 
 /// Trait for getting terminal output via ACP client `terminal/output`.
@@ -67,7 +69,7 @@ pub(crate) trait TerminalOutputRequester: Send + Sync {
     fn terminal_output(
         &self,
         request: TerminalOutputRequest,
-    ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>>;
+    ) -> AcpRequestFuture<'_, TerminalOutputResponse>;
 }
 
 /// Trait for waiting for terminal exit via ACP client `terminal/wait_for_exit`.
@@ -76,7 +78,7 @@ pub(crate) trait WaitForTerminalExitRequester: Send + Sync {
     fn wait_for_terminal_exit(
         &self,
         request: WaitForTerminalExitRequest,
-    ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>>;
+    ) -> AcpRequestFuture<'_, WaitForTerminalExitResponse>;
 }
 
 /// Trait for releasing a terminal via ACP client `terminal/release`.
@@ -85,7 +87,7 @@ pub(crate) trait ReleaseTerminalRequester: Send + Sync {
     fn release_terminal(
         &self,
         request: ReleaseTerminalRequest,
-    ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>>;
+    ) -> AcpRequestFuture<'_, ReleaseTerminalResponse>;
 }
 
 /// Trait for killing a terminal command via ACP client `terminal/kill`.
@@ -94,7 +96,7 @@ pub(crate) trait KillTerminalRequester: Send + Sync {
     fn kill_terminal(
         &self,
         request: KillTerminalRequest,
-    ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>>;
+    ) -> AcpRequestFuture<'_, KillTerminalResponse>;
 }
 
 /// Combined trait for all terminal operations.
@@ -121,7 +123,7 @@ impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn create_terminal(
         &self,
         request: CreateTerminalRequest,
-    ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, CreateTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -130,7 +132,7 @@ impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     fn create_terminal(
         &self,
         request: CreateTerminalRequest,
-    ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, CreateTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -139,7 +141,7 @@ impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn terminal_output(
         &self,
         request: TerminalOutputRequest,
-    ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, TerminalOutputResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -148,7 +150,7 @@ impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Client> {
     fn terminal_output(
         &self,
         request: TerminalOutputRequest,
-    ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, TerminalOutputResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -157,7 +159,7 @@ impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Agent>
     fn wait_for_terminal_exit(
         &self,
         request: WaitForTerminalExitRequest,
-    ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, WaitForTerminalExitResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -166,7 +168,7 @@ impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Client
     fn wait_for_terminal_exit(
         &self,
         request: WaitForTerminalExitRequest,
-    ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, WaitForTerminalExitResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -175,7 +177,7 @@ impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn release_terminal(
         &self,
         request: ReleaseTerminalRequest,
-    ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, ReleaseTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -184,7 +186,7 @@ impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     fn release_terminal(
         &self,
         request: ReleaseTerminalRequest,
-    ) -> BoxFuture<'_, Result<ReleaseTerminalResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, ReleaseTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -193,7 +195,7 @@ impl KillTerminalRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn kill_terminal(
         &self,
         request: KillTerminalRequest,
-    ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, KillTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -202,7 +204,7 @@ impl KillTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     fn kill_terminal(
         &self,
         request: KillTerminalRequest,
-    ) -> BoxFuture<'_, Result<KillTerminalResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, KillTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -225,14 +227,14 @@ pub(crate) trait PermissionRequester: Send + Sync {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
-    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>>;
+    ) -> AcpRequestFuture<'_, RequestPermissionResponse>;
 }
 
 impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn read_text_file(
         &self,
         request: ReadTextFileRequest,
-    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, ReadTextFileResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -241,7 +243,7 @@ impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
     fn read_text_file(
         &self,
         request: ReadTextFileRequest,
-    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, ReadTextFileResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -250,7 +252,7 @@ impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn write_text_file(
         &self,
         request: WriteTextFileRequest,
-    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, WriteTextFileResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -259,7 +261,7 @@ impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
     fn write_text_file(
         &self,
         request: WriteTextFileRequest,
-    ) -> BoxFuture<'_, Result<WriteTextFileResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, WriteTextFileResponse> {
         Box::pin(async move {
             self.send_request(request)
                 .block_task()
@@ -286,7 +288,7 @@ impl PermissionRequester for agent_client_protocol::ConnectionTo<Agent> {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
-    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, RequestPermissionResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }
@@ -295,7 +297,7 @@ impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
-    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+    ) -> AcpRequestFuture<'_, RequestPermissionResponse> {
         Box::pin(self.send_request(request).block_task())
     }
 }

@@ -1,6 +1,5 @@
 //! Tool definitions, execution, and helper utilities.
 
-#![allow(unused_imports)]
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
@@ -12,7 +11,6 @@ use agent_client_protocol::schema::{
     ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest, WriteTextFileResponse,
 };
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
-use futures_util::future::BoxFuture;
 use globset::{Glob, GlobSetBuilder};
 use grep::regex::RegexMatcher;
 use grep::searcher::sinks::UTF8;
