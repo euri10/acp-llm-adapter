@@ -61,8 +61,20 @@ pub(super) async fn run_stream_attempt(
             Err(error) => {
                 if events_sent == 0 && attempt < max_retries && is_retryable_transport_error(&error)
                 {
+                    tracing::warn!(
+                        error = ?error,
+                        attempt,
+                        max_retries,
+                        "retryable transport error, will retry"
+                    );
                     return StreamAttemptOutcome::ShouldRetry;
                 }
+                tracing::error!(
+                    error = ?error,
+                    events_sent,
+                    attempt,
+                    "non-retryable stream error or max retries exceeded"
+                );
                 let _ = tx.send(Err(error.into()));
                 return StreamAttemptOutcome::Cancelled;
             }

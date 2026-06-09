@@ -170,9 +170,29 @@ impl LlmClient for DeepSeekClient {
 
                 let request = http.post(&url).bearer_auth(&api_key).json(&body);
 
+                tracing::debug!(
+                    url = %url,
+                    model = %body.model,
+                    message_count = body.messages.len(),
+                    tool_count = body.tools.len(),
+                    stream = body.stream,
+                    reasoning_effort = ?body.reasoning_effort,
+                    "sending chat completion request to DeepSeek"
+                );
+
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    if let Ok(request_json) = serde_json::to_string(&body) {
+                        tracing::trace!(request_body = %request_json, "DeepSeek request body");
+                    }
+                }
+
                 let event_source = match EventSource::new(request) {
-                    Ok(es) => es,
+                    Ok(es) => {
+                        tracing::debug!("successfully created SSE event source");
+                        es
+                    }
                     Err(error) => {
+                        tracing::error!(error = ?error, "failed to create SSE event source");
                         let _ = tx.send(Err(DeepSeekError::from(error)));
                         return;
                     }
