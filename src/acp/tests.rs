@@ -7,8 +7,9 @@ use super::{
     handle_set_session_config_option_request, handle_set_session_config_option_request_notifying,
     handle_set_session_mode_request, handle_set_session_mode_request_notifying,
     replay_assistant_message, replay_session_history, replayed_tool_call,
-    restore_persisted_session, serve_with_transport, tool_result_content,
-    validate_load_session_paths, validate_resume_session_paths, validate_session_paths,
+    restore_persisted_session, serve_with_transport, serve_with_transport_and_state_dir,
+    tool_result_content, validate_load_session_paths, validate_resume_session_paths,
+    validate_session_paths,
 };
 use crate::dev::MockLlmClient;
 use crate::session::{
@@ -1191,6 +1192,7 @@ async fn new_session_connected_async_path_creates_session()
 async fn serve_with_transport_exercises_list_close_and_logout()
 -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
+    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-list-test-{}", Uuid::new_v4()));
     let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
     let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
     let (client_transport, server_transport) = Channel::duplex();
@@ -1199,12 +1201,13 @@ async fn serve_with_transport_exercises_list_close_and_logout()
     let server_tools = Arc::clone(&tool_registry);
 
     let server = tokio::spawn(async move {
-        serve_with_transport(
+        serve_with_transport_and_state_dir(
             server_transport,
             server_state,
             server_client,
             server_tools,
             DEFAULT_MAX_TURN_REQUESTS,
+            Some(state_dir),
         )
         .await
     });

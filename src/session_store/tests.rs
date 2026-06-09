@@ -33,7 +33,7 @@ fn round_trips_session_metadata_and_history()
     assert_eq!(record.history[0], ChatMessage::user("hello"));
     assert_eq!(record.history[1], ChatMessage::assistant("world"));
 
-    let listed = store.list_persisted(&cwd)?;
+    let listed = store.list_persisted()?;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].session_id, SessionId::new("session-roundtrip"));
     assert_eq!(listed[0].cwd, cwd);

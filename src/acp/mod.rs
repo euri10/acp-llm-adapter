@@ -49,8 +49,54 @@ pub(crate) async fn serve_with_transport(
     tool_registry: Arc<dyn ToolRegistry>,
     max_turn_requests: NonZeroUsize,
 ) -> Result<(), agent_client_protocol::Error> {
-    let persistence = FilesystemSessionStore::from_default_state_dir()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    serve_with_transport_and_state_dir(
+        transport,
+        state,
+        llm_client,
+        tool_registry,
+        max_turn_requests,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn serve_with_transport_and_state_dir(
+    transport: impl ConnectTo<Agent> + 'static,
+    state: Arc<Mutex<AdapterState>>,
+    llm_client: Arc<dyn LlmClient>,
+    tool_registry: Arc<dyn ToolRegistry>,
+    max_turn_requests: NonZeroUsize,
+    state_dir: Option<std::path::PathBuf>,
+) -> Result<(), agent_client_protocol::Error> {
+    let persistence = match state_dir {
+        Some(dir) => FilesystemSessionStore::new(dir),
+        None => FilesystemSessionStore::from_default_state_dir()
+            .map_err(agent_client_protocol::Error::into_internal_error)?,
+    };
+    serve_with_transport_impl(
+        transport,
+        state,
+        llm_client,
+        tool_registry,
+        max_turn_requests,
+        persistence,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn serve_with_transport_impl(
+    transport: impl ConnectTo<Agent> + 'static,
+    state: Arc<Mutex<AdapterState>>,
+    llm_client: Arc<dyn LlmClient>,
+    tool_registry: Arc<dyn ToolRegistry>,
+    max_turn_requests: NonZeroUsize,
+    persistence: FilesystemSessionStore,
+) -> Result<(), agent_client_protocol::Error> {
+    // Handler registration is inherently repetitive: each request type requires its own
+    // .on_receive_request() call with transport/state setup. Extracting individual handlers
+    // would require passing the builder through a chain of functions or storing it in a
+    // struct, adding more complexity and boilerplate than the current linear setup.
     let store = SessionStore::new(state).with_persistence(persistence);
     let initialize_store = store.clone();
     let new_session_store = store.clone();
@@ -244,6 +290,18 @@ pub(crate) fn handle_list_sessions_request(
     request: &ListSessionsRequest,
 ) -> Result<ListSessionsResponse, agent_client_protocol::Error> {
     let sessions = store.list_sessions(request.cwd.as_deref())?;
+    tracing::debug!(
+        session_count = sessions.len(),
+        cwd = ?request.cwd.as_deref(),
+        "returning sessions"
+    );
+    for session in &sessions {
+        tracing::debug!(
+            session_id = %session.session_id.0,
+            cwd = %session.cwd.display(),
+            "session returned"
+        );
+    }
     Ok(ListSessionsResponse::new(sessions))
 }
 

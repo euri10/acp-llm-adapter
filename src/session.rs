@@ -414,28 +414,45 @@ impl Default for AdapterState {
 /// `chrono` or `time` as a direct dependency.  The format is
 /// `YYYY-MM-DDTHH:MM:SSZ` with second precision.
 pub(crate) fn iso_timestamp_now() -> String {
-    let dur = std::time::SystemTime::now()
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let total_secs = dur.as_secs();
-    // Civil date from Unix timestamp (Hinnant algorithm).
-    let days_since_epoch = total_secs / 86_400 + 719_468;
-    let era = (days_since_epoch * 4 + 3) / 146_097;
-    let day_of_era = days_since_epoch - era * 146_097 / 4;
-    let year_of_era = (day_of_era * 4 + 3) / 1461;
+        .ok()
+        .and_then(|dur| {
+            let secs = dur.as_secs();
+            let days = secs / 86400;
+            let seconds_today = secs % 86400;
+
+            let hours = seconds_today / 3600;
+            let minutes = (seconds_today % 3600) / 60;
+            let seconds = seconds_today % 60;
+
+            let (year, month, day) = unix_days_to_ymd(days);
+
+            Some(format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                year, month, day, hours, minutes, seconds
+            ))
+        })
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn unix_days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    days += 719468; // Adjust to proleptic Gregorian calendar
+    let era = days / 146097;
+    let day_of_era = days % 146097;
+
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
     let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (year_of_era * 1461).div_ceil(4);
-    let month_phase = (day_of_year * 5 + 2) / 153;
-    let day = day_of_year - (month_phase * 153 + 2) / 5 + 1;
-    let month = month_phase + u64::from(month_phase < 10) * 3 - 2;
-    let year = year + u64::from(month <= 2);
 
-    let tod = total_secs % 86_400;
-    let hour = tod / 3600;
-    let minute = (tod % 3600) / 60;
-    let second = tod % 60;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
 
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    let month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month + 2) / 5 + 1;
+
+    let month = if month < 10 { month + 3 } else { month - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+
+    (year, month, day)
 }
 
 /// Derive a human-readable session title from the message history.
@@ -581,11 +598,14 @@ impl SessionStore {
             )
         };
 
-        if let (Some(persistence), Some(cwd)) = (persistence, cwd_filter) {
-            for persisted in persistence
-                .list_persisted(cwd)
-                .map_err(|e| AdapterError::Internal(e.to_string()))?
-            {
+        if let Some(persistence) = persistence {
+            let persisted_list = persistence
+                .list_persisted()
+                .map_err(|e| AdapterError::Internal(e.to_string()))?;
+            for persisted in persisted_list {
+                // Always include ALL persisted sessions, regardless of cwd_filter.
+                // Users need to see all saved sessions to resume them, even from different directories.
+                // The cwd validation (if needed) happens during the actual resume call.
                 if !sessions
                     .iter()
                     .any(|session| session.session_id == persisted.session_id)
@@ -594,6 +614,15 @@ impl SessionStore {
                 }
             }
         }
+
+        // Sort most-recently-updated first so that the /resume picker surfaces
+        // recent sessions at the top regardless of filesystem iteration order.
+        // Sessions without an `updated_at` timestamp sort to the end.
+        sessions.sort_by(|a, b| {
+            let a_ts = a.updated_at.as_deref().unwrap_or("");
+            let b_ts = b.updated_at.as_deref().unwrap_or("");
+            b_ts.cmp(a_ts)
+        });
 
         Ok(sessions)
     }
