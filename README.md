@@ -57,13 +57,25 @@ The adapter bridges two independent channels:
 
 ### Module Map
 
+**Binary Modules** (adapter runtime):
+
 | Module | Responsibility |
 |--------|---------------|
-| [`acp.rs`](src/acp.rs) | ACP transport registration, request handler dispatch, response builders |
-| [`turn.rs`](src/turn.rs) | Prompt-turn lifecycle: LLM streaming, tool-call accumulation, loop control, cancellation, history updates |
-| [`tools.rs`](src/tools.rs) | Built-in tool definitions, argument parsing, execution (read/list/write/edit/grep/glob/command), output truncation |
+| [`acp/`](src/acp/) | ACP transport registration, request handler dispatch, response builders, permission requesters |
+| [`session.rs`](src/session.rs) | Session state, permission model, in-memory session store, session lifecycle |
+| [`turn.rs`](src/turn.rs) | Prompt-turn orchestration: LLM streaming, tool-call accumulation, loop control, cancellation |
+| [`tools/`](src/tools/) | Built-in tool execution with two submodules: |
+| · `registry.rs` | `ToolRegistry` trait, `ToolContext`, `AdapterToolRegistry` impl, tool metadata |
+| · `execution/` | Tool definitions, argument parsing, execution (read/write/edit/grep/glob/command), output truncation |
 | [`mcp.rs`](src/mcp.rs) | MCP server connection (stdio + HTTP streamable), tool-name mapping, invocation, result rendering |
 | [`session_store.rs`](src/session_store.rs) | Filesystem-backed session metadata and JSONL chat-history persistence |
+| [`dev.rs`](src/dev.rs) | Development utilities, smoke tests, CLI testing backends |
+| [`error.rs`](src/error.rs) | Unified domain error type (adapter crate root) |
+
+**Library Modules** (`deepseek` - reusable client):
+
+| Module | Responsibility |
+|--------|---------------|
 | [`deepseek/types.rs`](src/deepseek/types.rs) | Chat message, request, tool definition, and stream-event types (public facade) |
 | [`deepseek/client.rs`](src/deepseek/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `DeepSeekClient` impl |
 | [`deepseek/stream.rs`](src/deepseek/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping |
