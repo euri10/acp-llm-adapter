@@ -1372,11 +1372,11 @@ fn save_history_appends_only_new_messages_to_persistence()
 
     store.save_history(
         &session.session_id,
-        vec![ChatMessage::user("one"), ChatMessage::assistant("two")],
+        &[ChatMessage::user("one"), ChatMessage::assistant("two")],
     )?;
     store.save_history(
         &session.session_id,
-        vec![
+        &[
             ChatMessage::user("one"),
             ChatMessage::assistant("two"),
             ChatMessage::user("three"),
@@ -1404,7 +1404,7 @@ fn list_sessions_includes_persisted_sessions_for_requested_cwd()
         .with_persistence(FilesystemSessionStore::new(&state_dir));
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
 
-    store.save_history(&session.session_id, vec![ChatMessage::user("persist me")])?;
+    store.save_history(&session.session_id, &[ChatMessage::user("persist me")])?;
     handle_close_session_request(
         &store,
         &CloseSessionRequest::new(session.session_id.clone()),
@@ -1429,7 +1429,7 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone());
     let active = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
-    store.save_history(&active.session_id, vec![ChatMessage::user("active")])?;
+    store.save_history(&active.session_id, &[ChatMessage::user("active")])?;
 
     let persisted_id = agent_client_protocol::schema::SessionId::new("session-persisted-list");
     persistence

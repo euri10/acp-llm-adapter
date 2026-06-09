@@ -872,7 +872,7 @@ impl SessionStore {
     pub(crate) fn save_history(
         &self,
         session_id: &SessionId,
-        messages: Vec<ChatMessage>,
+        messages: &[ChatMessage],
     ) -> Result<(), AdapterError> {
         let (persistence, meta, new_messages) = {
             let guard = self
@@ -912,7 +912,7 @@ impl SessionStore {
         }
 
         self.with_session_mut(session_id, |session| {
-            session.history = messages;
+            session.history = messages.to_vec();
             Ok(())
         })
     }

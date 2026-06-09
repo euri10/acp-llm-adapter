@@ -144,6 +144,8 @@ async fn run_prompt_turn(
 
         if !matches!(turn.finish_reason, FinishReason::ToolCalls) || turn.tool_calls.is_empty() {
             stop_reason = turn.stop_reason;
+            // Persist before exiting — this is the final assistant answer.
+            env.store.save_history(&env.request.session_id, &messages)?;
             break;
         }
 
@@ -166,10 +168,11 @@ async fn run_prompt_turn(
                 tool_result.content_for_model(),
             ));
         }
-    }
 
-    if stop_reason != StopReason::Cancelled {
-        env.store.save_history(&env.request.session_id, messages)?;
+        // Persist after every complete turn cycle (assistant text + tool results).
+        // If the process crashes during the next LLM stream, history up to this
+        // point is already on disk and can be resumed.
+        env.store.save_history(&env.request.session_id, &messages)?;
     }
 
     Ok(PromptResponse::new(stop_reason))
