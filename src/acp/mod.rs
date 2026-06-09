@@ -84,6 +84,9 @@ pub(crate) async fn serve_with_transport_and_state_dir(
     .await
 }
 
+// Handler registration is inherently repetitive and linear — splitting would require
+// threading a builder through a chain of partial-application functions, adding more
+// complexity than the current setup.
 #[allow(clippy::too_many_lines)]
 async fn serve_with_transport_impl(
     transport: impl ConnectTo<Agent> + 'static,

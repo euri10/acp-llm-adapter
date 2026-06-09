@@ -229,6 +229,8 @@ impl ToolExecution {
 }
 
 #[cfg(test)]
+// Test assertions legitimately use indexing to access elements by position; replacing
+// every `slice[i]` with `.get(i).unwrap()` adds noise without safety benefit in tests.
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;

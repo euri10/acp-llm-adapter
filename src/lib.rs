@@ -81,6 +81,8 @@ pub mod deepseek;
 pub mod error;
 
 #[cfg(test)]
+// Test assertions legitimately use indexing to access elements by position; replacing
+// every `slice[i]` with `.get(i).unwrap()` adds noise without safety benefit in tests.
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use crate::deepseek::ToolCall as DeepSeekToolCall;

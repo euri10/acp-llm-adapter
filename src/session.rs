@@ -417,31 +417,31 @@ pub(crate) fn iso_timestamp_now() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
-        .and_then(|dur| {
-            let secs = dur.as_secs();
-            let days = secs / 86400;
-            let seconds_today = secs % 86400;
+        .map_or_else(
+            || "1970-01-01T00:00:00Z".to_string(),
+            |dur| {
+                let secs = dur.as_secs();
+                let days = secs / 86400;
+                let seconds_today = secs % 86400;
 
-            let hours = seconds_today / 3600;
-            let minutes = (seconds_today % 3600) / 60;
-            let seconds = seconds_today % 60;
+                let hours = seconds_today / 3600;
+                let minutes = (seconds_today % 3600) / 60;
+                let seconds = seconds_today % 60;
 
-            let (year, month, day) = unix_days_to_ymd(days);
+                let (year, month, day) = unix_days_to_ymd(days);
 
-            Some(format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-                year, month, day, hours, minutes, seconds
-            ))
-        })
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+                format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+            },
+        )
 }
 
 fn unix_days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    days += 719468; // Adjust to proleptic Gregorian calendar
-    let era = days / 146097;
-    let day_of_era = days % 146097;
+    days += 719_468; // Adjust to proleptic Gregorian calendar
+    let era = days / 146_097;
+    let day_of_era = days % 146_097;
 
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let year = year_of_era + era * 400;
 
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
