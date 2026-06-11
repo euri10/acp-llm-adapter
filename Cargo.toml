@@ -21,8 +21,9 @@ test-log = { version = "=0.2.21", default-features = false, features = [
 
 [dependencies]
 agent-client-protocol = { version = "=0.14.0", features = ["unstable"] }
+blocking = "=1.6.2"
 clap = { version = "=4.5.40", features = ["derive"] }
-futures-util = "=0.3.32"
+futures-util = { version = "=0.3.32", features = ["io", "sink"] }
 globset = "=0.4.16"
 grep = "=0.3.2"
 http = "=1.4.1"
