@@ -19,7 +19,9 @@ use std::num::NonZeroUsize;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::Stdio;
+use agent_client_protocol::{Agent, ConnectTo, Lines};
+use tokio_util::sync::CancellationToken;
+
 use agent_client_protocol::schema::{
     AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource, Plan,
     PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionNotification, SessionUpdate, StopReason,
@@ -198,6 +200,109 @@ fn init_tracing() -> Result<(), AdapterError> {
     Ok(())
 }
 
+/// Cancels its [`CancellationToken`] when dropped.
+///
+/// The ACP transport reads incoming JSON-RPC lines from stdin and drops the
+/// incoming stream once it reaches end-of-input. By moving an `EofGuard` into
+/// the incoming stream's adapter closure (see [`stdio_transport_with_eof`]),
+/// dropping that stream at stdin EOF cancels the token, which the serve loop
+/// races on so the process shuts down promptly instead of hanging forever.
+#[derive(Debug)]
+struct EofGuard {
+    token: CancellationToken,
+}
+
+// A plain RAII cancellation signal: `Drop` only flips a `CancellationToken`. This
+// is not the "manual Drop manipulation" AGENTS.md §5.2 warns about (no `unsafe`,
+// no resource juggling) — it is the idiomatic way to fire a signal when a value
+// goes out of scope.
+impl Drop for EofGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
+/// Wrap `stream` so that `token` is cancelled once the stream is dropped.
+///
+/// The returned stream owns an [`EofGuard`]. The ACP transport drops the
+/// incoming line stream when stdin reaches EOF, which drops the guard and
+/// cancels the token.
+fn attach_eof_guard<S, T>(
+    stream: S,
+    token: CancellationToken,
+) -> impl futures_util::Stream<Item = T>
+where
+    S: futures_util::Stream<Item = T>,
+{
+    use futures_util::StreamExt;
+
+    let guard = EofGuard { token };
+    stream.map(move |item| {
+        // Keep `guard` owned by the stream: dropping the stream drops the guard.
+        let _guard = &guard;
+        item
+    })
+}
+
+/// Build the stdio ACP transport, cancelling `shutdown` when stdin reaches EOF.
+///
+/// Mirrors the line-mode transport that `agent_client_protocol::Stdio` builds,
+/// but attaches an [`EofGuard`] to the incoming line stream so the serve loop
+/// can detect client disconnect (stdin close) and exit instead of hanging,
+/// because the ACP agent server otherwise runs forever.
+fn stdio_transport_with_eof(shutdown: CancellationToken) -> impl ConnectTo<Agent> + 'static {
+    use futures_util::io::BufReader;
+    use futures_util::{AsyncBufReadExt, AsyncWriteExt};
+
+    let stdin = blocking::Unblock::new(std::io::stdin());
+    let stdout = blocking::Unblock::new(std::io::stdout());
+
+    let incoming = attach_eof_guard(BufReader::new(stdin).lines(), shutdown);
+
+    let outgoing = futures_util::sink::unfold(stdout, |mut writer, line: String| async move {
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await?;
+        Ok::<_, std::io::Error>(writer)
+    });
+
+    Lines::new(outgoing, incoming)
+}
+
+/// Resolve when the process receives `SIGTERM`, `SIGINT`, or `SIGHUP`.
+///
+/// # Errors
+///
+/// Returns an internal ACP error if a signal listener cannot be registered.
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<(), agent_client_protocol::Error> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let mut sigint = signal(SignalKind::interrupt())
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let mut sighup =
+        signal(SignalKind::hangup()).map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    let which = tokio::select! {
+        _ = sigterm.recv() => "SIGTERM",
+        _ = sigint.recv() => "SIGINT",
+        _ = sighup.recv() => "SIGHUP",
+    };
+    tracing::info!(signal = which, "received termination signal");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<(), agent_client_protocol::Error> {
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    tracing::info!(signal = "CTRL_C", "received termination signal");
+    Ok(())
+}
+
 async fn serve(
     backend: Backend,
     max_turn_requests: NonZeroUsize,
@@ -205,14 +310,30 @@ async fn serve(
     let llm_client = llm_client_for_backend(backend)?;
     let tool_registry = Arc::new(AdapterToolRegistry);
     let state = Arc::new(Mutex::new(AdapterState::new(initial_model_from_env())));
-    serve_with_transport(
-        Stdio::new(),
-        state,
-        llm_client,
-        tool_registry,
-        max_turn_requests,
-    )
-    .await
+
+    let shutdown = CancellationToken::new();
+    let transport = stdio_transport_with_eof(shutdown.clone());
+
+    tokio::select! {
+        result = serve_with_transport(
+            transport,
+            state,
+            llm_client,
+            tool_registry,
+            max_turn_requests,
+        ) => {
+            tracing::info!("ACP serve loop returned");
+            result
+        }
+        () = shutdown.cancelled() => {
+            tracing::info!("stdin EOF detected; shutting down");
+            Ok(())
+        }
+        result = shutdown_signal() => {
+            tracing::info!("termination signal received; shutting down");
+            result
+        }
+    }
 }
 
 async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protocol::Error> {
@@ -325,7 +446,8 @@ pub(crate) fn test_store() -> SessionStore {
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
-        Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS, plan_from_prompt, text_from_prompt,
+        Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS, EofGuard, attach_eof_guard,
+        plan_from_prompt, text_from_prompt,
     };
     use crate::acp::validate_session_paths;
     use agent_client_protocol::schema::{
@@ -334,6 +456,8 @@ mod tests {
         TextResourceContents,
     };
     use clap::Parser;
+    use futures_util::StreamExt;
+    use tokio_util::sync::CancellationToken;
 
     #[test_log::test]
     fn parses_serve_subcommand() {
@@ -760,5 +884,37 @@ mod tests {
         assert!(rendered.contains("[resource]"));
         assert!(rendered.contains("file:///ctx.md"));
         assert!(rendered.contains("body text"));
+    }
+
+    #[test_log::test]
+    fn eof_guard_cancels_token_when_dropped() {
+        let token = CancellationToken::new();
+        let guard = EofGuard {
+            token: token.clone(),
+        };
+        assert!(!token.is_cancelled());
+        drop(guard);
+        assert!(token.is_cancelled());
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn incoming_stream_eof_cancels_shutdown_token() {
+        let token = CancellationToken::new();
+        let base = futures_util::stream::iter(vec![
+            Ok::<String, std::io::Error>("a".to_string()),
+            Ok("b".to_string()),
+        ]);
+        let mut wrapped = attach_eof_guard(base, token.clone());
+
+        let mut count = 0;
+        while let Some(item) = wrapped.next().await {
+            assert!(item.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 2);
+        // The guard lives in the stream object; only dropping it cancels.
+        assert!(!token.is_cancelled());
+        drop(wrapped);
+        assert!(token.is_cancelled());
     }
 }
