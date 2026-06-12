@@ -221,6 +221,9 @@ async fn serve_with_transport_impl(
                 let tools = Arc::clone(&prompt_tools);
                 let connection = cx.clone();
 
+                let session_id = request.session_id.clone();
+                tracing::debug!(session_id = %session_id, "received session/prompt request");
+
                 cx.spawn(async move {
                     let result = handle_prompt_request(
                         &store,
@@ -233,6 +236,11 @@ async fn serve_with_transport_impl(
                     )
                     .await;
 
+                    tracing::debug!(
+                        session_id = %session_id,
+                        result_is_ok = result.is_ok(),
+                        "session/prompt request completed"
+                    );
                     responder.respond_with_result(result)?;
                     Ok(())
                 })?;

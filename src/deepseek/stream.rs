@@ -140,6 +140,8 @@ struct ChatCompletionUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    #[serde(default, alias = "context_window")]
+    context_length: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,9 +220,22 @@ pub(crate) fn parse_chat_completion_chunk(
     }
 
     if let Some(usage) = chunk.usage {
+        tracing::debug!(
+            input_tokens = usage.prompt_tokens,
+            output_tokens = usage.completion_tokens,
+            context_length = usage.context_length,
+            "parsed usage data from API chunk"
+        );
+        if usage.context_length == 0 {
+            tracing::debug!(
+                payload = %payload,
+                "API chunk did not include context_length/context_window in usage"
+            );
+        }
         updates.push(StreamEvent::Usage(UsageData {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
+            context_length: usage.context_length,
         }));
     }
 

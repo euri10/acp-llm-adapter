@@ -441,6 +441,8 @@ pub struct UsageData {
     pub input_tokens: u64,
     /// Tokens in the response.
     pub output_tokens: u64,
+    /// Context window size in tokens.
+    pub context_length: u64,
 }
 
 /// A normalized update emitted while streaming a `DeepSeek` response.

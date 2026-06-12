@@ -252,6 +252,12 @@ pub(crate) async fn stream_model_turn(
                 finish_reason = reason;
             }
             StreamEvent::Usage(data) => {
+                tracing::debug!(
+                    input_tokens = data.input_tokens,
+                    output_tokens = data.output_tokens,
+                    context_length = data.context_length,
+                    "received usage data from stream"
+                );
                 usage = Some(data);
             }
         }
@@ -260,11 +266,20 @@ pub(crate) async fn stream_model_turn(
     let tool_calls = tool_calls.finish()?;
 
     // Send usage update if available
-    if let Some(usage_data) = usage {
+    if let Some(mut usage_data) = usage {
+        // Fill in context_length from model if not provided by API
+        if usage_data.context_length == 0 {
+            usage_data.context_length = get_context_length_for_model(model_settings.model);
+        }
         let used_tokens = usage_data.input_tokens + usage_data.output_tokens;
+        tracing::debug!(
+            used = used_tokens,
+            size = usage_data.context_length,
+            "sending usage_update notification"
+        );
         notify(session_notification(
             session_id.clone(),
-            SessionUpdate::UsageUpdate(UsageUpdate::new(used_tokens, 128_000)),
+            SessionUpdate::UsageUpdate(UsageUpdate::new(used_tokens, usage_data.context_length)),
         ))?;
     }
 
@@ -403,6 +418,18 @@ pub(crate) fn tool_call_title(call: &DeepSeekToolCall) -> String {
 pub(crate) fn tool_raw_input(call: &DeepSeekToolCall) -> serde_json::Value {
     serde_json::from_str(call.arguments())
         .unwrap_or_else(|_| serde_json::Value::String(call.arguments().to_string()))
+}
+
+/// Get the context window size for a `DeepSeek` model.
+///
+/// Returns the context window size in tokens. Falls back to `1_000_000` for unknown models.
+/// See: <https://api-docs.deepseek.com/quick_start/pricing>
+#[must_use]
+fn get_context_length_for_model(model: &str) -> u64 {
+    match model {
+        "deepseek-chat" => 4_096,
+        _ => 1_000_000,
+    }
 }
 
 #[cfg(test)]
