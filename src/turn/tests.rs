@@ -1,7 +1,8 @@
 #![allow(clippy::indexing_slicing)]
 use super::{ModelRequestSettings, handle_prompt_request, stream_model_turn};
 use crate::acp::{
-    ToolCallRequester, handle_new_session_request, handle_set_session_config_option_request,
+    ToolCallRequester, handle_delete_session_request, handle_new_session_request,
+    handle_set_session_config_option_request,
 };
 use crate::session::{DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionStore};
 use crate::test_store;
@@ -9,8 +10,9 @@ use crate::tools::{
     AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry,
 };
 use agent_client_protocol::schema::{
-    CancelNotification, ContentBlock, PromptRequest, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
+    CancelNotification, ContentBlock, DeleteSessionRequest, PromptRequest, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus,
+    ToolKind,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
@@ -624,6 +626,59 @@ async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_pr
         .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing session"))?;
     assert!(session.active_turn.is_none());
     assert!(session.history.is_empty());
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn delete_session_cancels_prompt_without_failing_cleanup()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+    let session_id = session.session_id.clone();
+    let started = Arc::new(Notify::new());
+    let client = Arc::new(PendingLlmClient::new(Arc::clone(&started)));
+
+    let prompt_store = store.clone();
+    let prompt_session_id = session_id.clone();
+    let prompt_client = Arc::clone(&client);
+    let prompt_task = tokio::spawn(async move {
+        handle_prompt_request(
+            &prompt_store,
+            prompt_client.as_ref(),
+            &EmptyToolRegistry,
+            None,
+            PromptRequest::new(prompt_session_id, vec![ContentBlock::from("delete me")]),
+            DEFAULT_MAX_TURN_REQUESTS,
+            |_| Ok(()),
+        )
+        .await
+    });
+
+    started.notified().await;
+    let delete_response =
+        handle_delete_session_request(&store, &DeleteSessionRequest::new(session_id.clone()))?;
+    assert_eq!(
+        serde_json::to_value(&delete_response)
+            .map_err(agent_client_protocol::Error::into_internal_error)?,
+        serde_json::json!({})
+    );
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), prompt_task)
+        .await
+        .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))?
+        .map_err(agent_client_protocol::Error::into_internal_error)??;
+
+    assert_eq!(response.stop_reason, StopReason::Cancelled);
+
+    let guard = store
+        .state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    assert!(!guard.sessions.contains_key(&session_id));
 
     Ok(())
 }
