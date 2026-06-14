@@ -114,7 +114,11 @@ pub(crate) async fn handle_prompt_request(
         .await
     }
     .await;
-    let clear_result = store.clear_active_turn(&session_id);
+    let clear_result = match store.clear_active_turn(&session_id) {
+        Ok(()) => Ok(()),
+        Err(AdapterError::InvalidParams(msg)) if msg.starts_with("unknown session id:") => Ok(()),
+        Err(err) => Err(err),
+    };
     match (result, clear_result) {
         (Ok(response), Ok(())) => Ok(response),
         (Err(error), Ok(())) => Err(error),
