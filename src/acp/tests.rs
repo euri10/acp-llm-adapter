@@ -138,6 +138,41 @@ async fn prompt_request_rejects_active_turn() -> Result<(), agent_client_protoco
     Ok(())
 }
 
+#[test_log::test(tokio::test)]
+async fn prompt_request_empty_prompt_is_invalid_params() -> Result<(), agent_client_protocol::Error>
+{
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+
+    let Err(error) = handle_prompt_request(
+        &store,
+        &MockLlmClient,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(session.session_id, vec![]),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await
+    else {
+        return Err(agent_client_protocol::Error::internal_error()
+            .data("expected empty prompt to be rejected"));
+    };
+
+    // Empty prompt is a caller error: it must surface as `Invalid params`
+    // (-32602), not as a mis-classified `Internal error` (-32603) produced by a
+    // lossy acp::Error -> AdapterError::Internal round-trip.
+    assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert!(
+        error
+            .to_string()
+            .contains("prompt must include non-empty text")
+    );
+    assert!(!error.to_string().contains("internal error"));
+
+    Ok(())
+}
+
 #[test_log::test]
 fn build_initialize_response_advertises_expected_caps() {
     let response = build_initialize_response(ProtocolVersion::LATEST);

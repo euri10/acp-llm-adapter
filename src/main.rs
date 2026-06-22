@@ -319,7 +319,7 @@ async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protoc
     Ok(())
 }
 
-fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_protocol::Error> {
+fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, AdapterError> {
     let mut text = String::new();
 
     for block in prompt {
@@ -331,25 +331,29 @@ fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, agent_client_prot
                     text.push_str(&resource_text_prompt_text(contents));
                 }
                 EmbeddedResourceResource::BlobResourceContents(_) => {
-                    return Err(agent_client_protocol::Error::invalid_params()
-                        .data("binary resource prompt blocks are not supported"));
+                    return Err(AdapterError::InvalidParams(
+                        "binary resource prompt blocks are not supported".into(),
+                    ));
                 }
                 _ => {
-                    return Err(agent_client_protocol::Error::invalid_params()
-                        .data("unsupported embedded resource prompt block"));
+                    return Err(AdapterError::InvalidParams(
+                        "unsupported embedded resource prompt block".into(),
+                    ));
                 }
             },
             _ => {
-                return Err(agent_client_protocol::Error::invalid_params().data(
-                    "only text, resource link, and text resource prompt blocks are supported",
+                return Err(AdapterError::InvalidParams(
+                    "only text, resource link, and text resource prompt blocks are supported"
+                        .into(),
                 ));
             }
         }
     }
 
     if text.trim().is_empty() {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data("prompt must include non-empty text"));
+        return Err(AdapterError::InvalidParams(
+            "prompt must include non-empty text".into(),
+        ));
     }
 
     Ok(text)
