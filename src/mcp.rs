@@ -295,11 +295,10 @@ pub(crate) fn mcp_tool_mappings(server_name: &str, tools: Vec<McpTool>) -> Vec<M
                 || format!("MCP tool '{original_name}' from server '{server_name}'"),
                 |description| description.to_string(),
             );
-            let definition = ToolDefinition::new(
-                exposed_name.clone(),
-                description,
-                Value::Object(tool.input_schema.as_ref().clone()),
-            );
+            // DeepSeek API requires tool parameters to have type: "object" at the root.
+            // MCP schemas might not have this structure, so we ensure it's properly wrapped.
+            let schema = validate_tool_schema(tool.input_schema.as_ref());
+            let definition = ToolDefinition::new(exposed_name.clone(), description, schema);
 
             McpToolMapping {
                 exposed_name,
@@ -308,6 +307,30 @@ pub(crate) fn mcp_tool_mappings(server_name: &str, tools: Vec<McpTool>) -> Vec<M
             }
         })
         .collect()
+}
+
+/// Validate and normalize a tool schema for `DeepSeek` API compatibility.
+///
+/// `DeepSeek` requires tool parameters to be a JSON schema with `type: "object"` at the root.
+/// If the schema doesn't have this structure, wrap it appropriately.
+fn validate_tool_schema(schema: &JsonObject) -> Value {
+    let schema_value = Value::Object(schema.clone());
+
+    // Check if the schema already has type: "object"
+    if let Some(Value::String(type_val)) = schema_value.get("type")
+        && type_val == "object"
+    {
+        return schema_value;
+    }
+
+    // If not, wrap it in an object schema where the original schema becomes properties
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "value": schema_value
+        },
+        "required": ["value"]
+    })
 }
 
 fn mcp_tool_name(server_name: &str, tool_name: &str) -> String {
