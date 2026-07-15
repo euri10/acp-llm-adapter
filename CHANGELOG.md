@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/euri10/deepseek-acp-adapter/compare/v0.5.1...v0.5.2) - 2026-07-15
+
+### Added
+
+- expose max_tokens as a session config option (daa-hna)
+- implement message filtering to respect CloudFront payload limit
+
+### Fixed
+
+- resolve cargo audit vulnerabilities
+- stop history truncation collapsing to a single message (daa-wx1)
+- validate tool result messages when filtering conversation history
+- validate MCP tool schemas to ensure DeepSeek API compatibility (daa-fj0)
+- root cause of 400 Bad Request identified - payload size limit (daa-gd9)
+
+### Other
+
+- cargo audit failures fixed (daa-nnu)
+- cargo audit fails in CI (daa-nnu)
+- close daa-fj0 - root cause identified and fixed (daa-fj0)
+- investigate root cause of 400 errors (daa-fj0)
+- enable TRACE logging in acp-debug.sh for easier debugging
+- clarify EventSource error response body limitation
+- DeepSeek API returns 400 Bad Request on streaming chat completion (daa-gd9)
+
 ## [0.5.1](https://github.com/euri10/deepseek-acp-adapter/compare/v0.5.0...v0.5.1) - 2026-06-22
 
 ### Fixed
