@@ -184,9 +184,19 @@ fn validate_tool_results(messages: &[ChatMessage]) -> Vec<ChatMessage> {
 }
 
 /// Estimate the size of a message in bytes for filtering purposes.
+///
+/// Accounts for JSON serialization overhead (quotes, escapes, delimiters).
+/// Raw content alone underestimates the serialized size.
 fn estimate_message_size(msg: &ChatMessage) -> usize {
-    // Rough estimate: role (10) + content length + tool calls overhead
-    10 + msg.content().len() + (msg.tool_calls().len() * 100)
+    // Account for JSON serialization overhead using integer arithmetic:
+    // - Role field + delimiters: ~10 bytes
+    // - Content as quoted string: (content.len() * 21) / 20 ≈ content.len() * 1.05
+    // - Tool calls with IDs and function info: ~150 bytes each
+    let base: usize = 10;
+    let content_len = msg.content().len();
+    let content_overhead = (content_len.saturating_mul(21)) / 20;
+    let tool_overhead = msg.tool_calls().len().saturating_mul(150);
+    base + content_overhead + tool_overhead
 }
 
 /// Run the full prompt-turn lifecycle for a single ACP `session/prompt` request.
@@ -381,8 +391,11 @@ pub(crate) async fn stream_model_turn(
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<ModelTurn, AdapterError> {
     // Filter messages to respect CloudFront's ~1MB request limit.
-    // Keep 512KB budget for messages to leave headroom for tools, system prompts, etc.
-    let max_message_bytes = 512 * 1024; // 512KB
+    // Allocate a conservative 256KB budget for messages to leave ample headroom for:
+    // - Tool definitions (can be 100KB+ with long descriptions)
+    // - JSON serialization overhead (quotes, escapes, structure)
+    // - Request metadata (model, stream flag, etc.)
+    let max_message_bytes = 256 * 1024; // 256KB
     let filtered_messages = filter_messages_by_size(messages, max_message_bytes);
 
     if filtered_messages.len() < messages.len() {
