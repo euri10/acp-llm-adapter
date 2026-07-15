@@ -267,6 +267,74 @@ async fn prompt_uses_updated_session_model_and_reasoning()
 }
 
 #[test_log::test(tokio::test)]
+async fn prompt_uses_updated_session_max_tokens() -> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+    handle_set_session_config_option_request(
+        &store,
+        &SetSessionConfigOptionRequest::new(
+            session.session_id.clone(),
+            crate::SESSION_CONFIG_MAX_TOKENS_ID,
+            "8192",
+        ),
+    )?;
+
+    let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+    let requests = client.requests();
+
+    handle_prompt_request(
+        &store,
+        &client,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(session.session_id, vec![ContentBlock::from("hi")]),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    let request_guard = requests
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    assert_eq!(request_guard[0].max_tokens(), Some(8_192));
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn prompt_omits_max_tokens_by_default() -> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+
+    let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+    let requests = client.requests();
+
+    handle_prompt_request(
+        &store,
+        &client,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(session.session_id, vec![ContentBlock::from("hi")]),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    let request_guard = requests
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    assert_eq!(request_guard[0].max_tokens(), None);
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let session = handle_new_session_request(
@@ -703,6 +771,7 @@ async fn stream_model_turn_respects_cancellation_token() -> Result<(), agent_cli
             ModelRequestSettings {
                 model: "deepseek-v4-pro",
                 reasoning_effort: Some(ReasoningEffort::High),
+                max_tokens: None,
             },
             task_token,
             &session_id,

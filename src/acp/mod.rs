@@ -28,10 +28,10 @@ use uuid::Uuid;
 use crate::tools::ToolRegistry;
 use crate::{
     ADAPTER_NAME, ADAPTER_VERSION, AdapterState, FilesystemSessionStore, McpSession,
-    PermissionPosture, ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
-    SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore, adapter_available_commands,
-    connect_mcp_sessions, default_session_modes, session_notification, tool_raw_input,
-    validate_session_model,
+    PermissionPosture, ReasoningEffort, SESSION_CONFIG_MAX_TOKENS_ID, SESSION_CONFIG_MODE_ID,
+    SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore,
+    adapter_available_commands, connect_mcp_sessions, default_session_modes,
+    max_tokens_from_value_id, session_notification, tool_raw_input, validate_session_model,
 };
 
 pub(crate) mod requesters;
@@ -464,6 +464,7 @@ async fn restore_persisted_session(
             mode: persisted.meta.mode,
             model: persisted.meta.model,
             reasoning_effort: persisted.meta.reasoning_effort,
+            max_tokens: persisted.meta.max_tokens,
             permission_allow_always: HashSet::new(),
             mcp_servers: persisted.meta.mcp_servers,
             mcp_sessions,
@@ -495,6 +496,7 @@ fn insert_session_record(
             mode: PermissionPosture::Ask,
             model: default_model,
             reasoning_effort: ReasoningEffort::High,
+            max_tokens: None,
             permission_allow_always: HashSet::new(),
             mcp_servers: request.mcp_servers.clone(),
             mcp_sessions,
@@ -677,6 +679,10 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
                     .data(format!("unsupported reasoning effort: {}", value.0)));
             };
             store.set_reasoning_effort(&request.session_id, effort)?;
+        }
+        SESSION_CONFIG_MAX_TOKENS_ID => {
+            let max_tokens = max_tokens_from_value_id(value)?;
+            store.set_max_tokens(&request.session_id, max_tokens)?;
         }
         _ => {
             return Err(agent_client_protocol::Error::invalid_params().data(format!(

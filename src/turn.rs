@@ -32,6 +32,9 @@ pub(crate) struct ModelRequestSettings<'a> {
     /// Reasoning effort requested from the model, if explicitly configured.
     /// `None` means use the model's default — omit the parameter from the request.
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    /// Maximum tokens the model may generate. `None` means use the model's
+    /// default — omit the parameter from the request.
+    pub(crate) max_tokens: Option<u32>,
 }
 
 struct PromptTurnEnvironment<'a> {
@@ -249,6 +252,7 @@ pub(crate) async fn handle_prompt_request(
             ModelRequestSettings {
                 model: &turn_setup.model,
                 reasoning_effort,
+                max_tokens: turn_setup.max_tokens,
             },
             &mut notify,
         )
@@ -394,6 +398,9 @@ pub(crate) async fn stream_model_turn(
         .with_model(model_settings.model);
     if let Some(effort) = model_settings.reasoning_effort {
         chat_request = chat_request.with_reasoning_effort(effort.id());
+    }
+    if let Some(max_tokens) = model_settings.max_tokens {
+        chat_request = chat_request.with_max_tokens(max_tokens);
     }
 
     let mut stream = llm_client

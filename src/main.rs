@@ -59,10 +59,10 @@ pub(crate) use turn::tool_raw_input;
 // Re-export session domain types so other modules can use `crate::*` imports.
 pub(crate) use session::{
     AdapterState, DEFAULT_MAX_TURN_REQUESTS, PendingToolCalls, PermissionDecision,
-    PermissionPosture, ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
-    SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore, default_session_modes,
-    derive_session_title, initial_model_from_env, iso_timestamp_now, request_tool_permission,
-    validate_session_model,
+    PermissionPosture, ReasoningEffort, SESSION_CONFIG_MAX_TOKENS_ID, SESSION_CONFIG_MODE_ID,
+    SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore,
+    default_session_modes, derive_session_title, initial_model_from_env, iso_timestamp_now,
+    max_tokens_from_value_id, request_tool_permission, validate_session_model,
 };
 
 const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");

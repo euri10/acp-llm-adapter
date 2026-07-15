@@ -37,6 +37,9 @@ pub(crate) struct PersistedSessionMeta {
     pub(crate) model: String,
     /// `DeepSeek` reasoning effort selected for the session.
     pub(crate) reasoning_effort: ReasoningEffort,
+    /// Max output token cap selected for the session (absent in sessions
+    /// created before this field was added, treated as unset).
+    pub(crate) max_tokens: Option<u32>,
     /// MCP servers originally attached to the session.
     pub(crate) mcp_servers: Vec<McpServer>,
     /// Human-readable session title (absent in sessions created before this field was added).

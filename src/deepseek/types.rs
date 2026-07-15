@@ -340,6 +340,15 @@ struct WireToolCallFunction {
     arguments: String,
 }
 
+/// Decomposed [`ChatRequest`] fields, as returned by [`ChatRequest::into_parts`].
+pub(crate) type ChatRequestParts = (
+    Vec<ChatMessage>,
+    Vec<ToolDefinition>,
+    Option<String>,
+    Option<String>,
+    Option<u32>,
+);
+
 /// A chat-completions request that can be streamed from `DeepSeek`.
 ///
 /// Requests are immutable builder values: start with [`ChatRequest::new`]
@@ -352,10 +361,12 @@ struct WireToolCallFunction {
 ///
 /// let request = ChatRequest::new(vec![ChatMessage::user("Summarize the diff")])
 ///     .with_model("deepseek-v4-flash")
-///     .with_reasoning_effort("high");
+///     .with_reasoning_effort("high")
+///     .with_max_tokens(4_096);
 ///
 /// assert_eq!(request.model(), Some("deepseek-v4-flash"));
 /// assert_eq!(request.reasoning_effort(), Some("high"));
+/// assert_eq!(request.max_tokens(), Some(4_096));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatRequest {
@@ -363,6 +374,7 @@ pub struct ChatRequest {
     tools: Vec<ToolDefinition>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    max_tokens: Option<u32>,
 }
 
 impl ChatRequest {
@@ -374,6 +386,7 @@ impl ChatRequest {
             tools: Vec::new(),
             model: None,
             reasoning_effort: None,
+            max_tokens: None,
         }
     }
 
@@ -398,15 +411,21 @@ impl ChatRequest {
         self
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<ChatMessage>,
-        Vec<ToolDefinition>,
-        Option<String>,
-        Option<String>,
-    ) {
-        (self.messages, self.tools, self.model, self.reasoning_effort)
+    /// Cap the number of tokens the model may generate in this completion.
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    pub(crate) fn into_parts(self) -> ChatRequestParts {
+        (
+            self.messages,
+            self.tools,
+            self.model,
+            self.reasoning_effort,
+            self.max_tokens,
+        )
     }
 
     /// Return the request messages.
@@ -431,6 +450,12 @@ impl ChatRequest {
     #[must_use]
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.reasoning_effort.as_deref()
+    }
+
+    /// Return the request's max output token cap.
+    #[must_use]
+    pub const fn max_tokens(&self) -> Option<u32> {
+        self.max_tokens
     }
 }
 

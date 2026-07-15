@@ -121,6 +121,8 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 impl LlmClient for DeepSeekClient {
@@ -133,7 +135,7 @@ impl LlmClient for DeepSeekClient {
             return Err(DeepSeekError::MissingApiKey);
         }
 
-        let (messages, tools, model, reasoning_effort) = request.into_parts();
+        let (messages, tools, model, reasoning_effort, max_tokens) = request.into_parts();
         let body = ChatCompletionRequest {
             model: model.unwrap_or_else(|| self.config.model().to_string()),
             messages: messages
@@ -143,6 +145,7 @@ impl LlmClient for DeepSeekClient {
             tools: tools.iter().map(WireToolDefinition::from).collect(),
             stream: true,
             reasoning_effort,
+            max_tokens,
         };
 
         let http = self.http.clone();
@@ -177,6 +180,7 @@ impl LlmClient for DeepSeekClient {
                     tool_count = body.tools.len(),
                     stream = body.stream,
                     reasoning_effort = ?body.reasoning_effort,
+                    max_tokens = ?body.max_tokens,
                     "sending chat completion request to DeepSeek"
                 );
 

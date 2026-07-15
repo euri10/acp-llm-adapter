@@ -333,12 +333,14 @@ async fn deepseek_client_stream_chat_serializes_request_and_parses_events()
     ])
     .with_tools(vec![tool_definition.clone()])
     .with_model("request-model")
-    .with_reasoning_effort("max");
+    .with_reasoning_effort("max")
+    .with_max_tokens(4_096);
 
     assert_eq!(request.messages().len(), 4);
     assert_eq!(request.tools().len(), 1);
     assert_eq!(request.model(), Some("request-model"));
     assert_eq!(request.reasoning_effort(), Some("max"));
+    assert_eq!(request.max_tokens(), Some(4_096));
 
     let mut stream = client.stream_chat(request, CancellationToken::new())?;
     let mut events = Vec::new();
@@ -376,6 +378,7 @@ async fn deepseek_client_stream_chat_serializes_request_and_parses_events()
 
     assert_eq!(request_json["model"], "request-model");
     assert_eq!(request_json["reasoning_effort"], "max");
+    assert_eq!(request_json["max_tokens"], serde_json::json!(4_096));
     assert_eq!(request_json["stream"], serde_json::json!(true));
     assert_eq!(request_json["messages"][0]["role"], "system");
     assert_eq!(request_json["messages"][1]["role"], "user");
@@ -596,10 +599,18 @@ fn parse_chunk_with_invalid_json_fails() {
 fn chat_request_model_and_reasoning_effort_accessors() {
     let request = ChatRequest::new(vec![ChatMessage::user("hello")])
         .with_model("custom-model")
-        .with_reasoning_effort("medium");
+        .with_reasoning_effort("medium")
+        .with_max_tokens(2_048);
 
     assert_eq!(request.model(), Some("custom-model"));
     assert_eq!(request.reasoning_effort(), Some("medium"));
+    assert_eq!(request.max_tokens(), Some(2_048));
+}
+
+#[test_log::test]
+fn chat_request_max_tokens_defaults_to_none() {
+    let request = ChatRequest::new(vec![ChatMessage::user("hello")]);
+    assert_eq!(request.max_tokens(), None);
 }
 
 #[test_log::test]

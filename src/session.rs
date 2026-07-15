@@ -42,10 +42,19 @@ pub(crate) const SESSION_MODE_YOLO_ID: &str = "yolo";
 pub(crate) const SESSION_CONFIG_MODE_ID: &str = "mode";
 pub(crate) const SESSION_CONFIG_MODEL_ID: &str = "model";
 pub(crate) const SESSION_CONFIG_REASONING_EFFORT_ID: &str = "reasoning_effort";
+pub(crate) const SESSION_CONFIG_MAX_TOKENS_ID: &str = "max_tokens";
 pub(crate) const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
 pub(crate) const DEEPSEEK_V4_PRO_MODEL_ID: &str = "deepseek-v4-pro";
 pub(crate) const REASONING_EFFORT_HIGH_ID: &str = "high";
 pub(crate) const REASONING_EFFORT_MAX_ID: &str = "max";
+pub(crate) const MAX_TOKENS_DEFAULT_ID: &str = "default";
+/// Preset `max_tokens` values offered in the session config selector.
+///
+/// `DeepSeek`'s chat-completions API accepts any positive integer for
+/// `max_tokens` (bounded by the model's max output), but ACP session config
+/// options only support fixed selectable values, not freeform text input.
+/// These presets cover common output-length budgets.
+const MAX_TOKENS_PRESETS: [u32; 6] = [4_096, 8_192, 16_384, 32_768, 65_536, 131_072];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionDecision {
@@ -320,6 +329,13 @@ pub(crate) fn session_config_options(session: &SessionRecord) -> Vec<SessionConf
         )
         .category(SessionConfigOptionCategory::ThoughtLevel)
         .description("Choose how much DeepSeek thinking effort to request."),
+        SessionConfigOption::select(
+            SESSION_CONFIG_MAX_TOKENS_ID,
+            "Max Output Tokens",
+            max_tokens_value_id(session.max_tokens),
+            max_tokens_select_options(),
+        )
+        .description("Cap the number of tokens DeepSeek may generate in a response."),
     ]
 }
 
@@ -358,6 +374,49 @@ fn reasoning_effort_select_options() -> Vec<SessionConfigSelectOption> {
                 .description(effort.description())
         })
         .collect()
+}
+
+/// Selectable `max_tokens` values, plus a `default` entry meaning "unset -
+/// let `DeepSeek` use its own default output length".
+fn max_tokens_select_options() -> Vec<SessionConfigSelectOption> {
+    let mut options = vec![
+        SessionConfigSelectOption::new(MAX_TOKENS_DEFAULT_ID, "Default")
+            .description("Use DeepSeek's own default output length."),
+    ];
+    options.extend(
+        MAX_TOKENS_PRESETS
+            .into_iter()
+            .map(|tokens| SessionConfigSelectOption::new(tokens.to_string(), format!("{tokens}"))),
+    );
+    options
+}
+
+/// Map a session's `max_tokens` setting to its session-config value id.
+fn max_tokens_value_id(max_tokens: Option<u32>) -> String {
+    max_tokens.map_or_else(
+        || MAX_TOKENS_DEFAULT_ID.to_string(),
+        |tokens| tokens.to_string(),
+    )
+}
+
+/// Parse a session-config value id back into a `max_tokens` setting.
+///
+/// Returns `Ok(None)` for the `default` id (unset the override) and
+/// `Ok(Some(tokens))` for a positive integer id. Rejects anything else.
+pub(crate) fn max_tokens_from_value_id(
+    value: &SessionConfigValueId,
+) -> Result<Option<u32>, AdapterError> {
+    if value.0.as_ref() == MAX_TOKENS_DEFAULT_ID {
+        return Ok(None);
+    }
+
+    match value.0.parse::<u32>() {
+        Ok(tokens) if tokens > 0 => Ok(Some(tokens)),
+        _ => Err(AdapterError::InvalidParams(format!(
+            "unsupported max_tokens value: {}",
+            value.0
+        ))),
+    }
 }
 
 pub(crate) fn validate_session_model(
@@ -495,6 +554,9 @@ pub(crate) struct SessionRecord {
     pub(crate) mode: PermissionPosture,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
+    /// Maximum tokens `DeepSeek` may generate per response. `None` means use
+    /// the model's own default (the parameter is omitted from the request).
+    pub(crate) max_tokens: Option<u32>,
     pub(crate) permission_allow_always: HashSet<String>,
     pub(crate) mcp_servers: Vec<McpServer>,
     pub(crate) mcp_sessions: Vec<McpSession>,
@@ -526,6 +588,7 @@ pub(crate) struct TurnSetup {
     pub(crate) tool_context: ToolContext,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
+    pub(crate) max_tokens: Option<u32>,
     /// Human-readable session title after the turn begins.
     pub(crate) title: String,
     /// Whether this turn derived the title for the first time.
@@ -889,6 +952,18 @@ impl SessionStore {
         })
     }
 
+    /// Set the max output token cap for a session. `None` unsets the override.
+    pub(crate) fn set_max_tokens(
+        &self,
+        session_id: &SessionId,
+        max_tokens: Option<u32>,
+    ) -> Result<(), AdapterError> {
+        self.with_session_mut(session_id, |session| {
+            session.max_tokens = max_tokens;
+            Ok(())
+        })
+    }
+
     /// Prepare a session for a new prompt turn.
     ///
     /// Sets the active turn token atomically and returns the messages, tool
@@ -943,6 +1018,7 @@ impl SessionStore {
             },
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort,
+            max_tokens: session.max_tokens,
             title: session.title.clone(),
             title_changed,
             updated_at: session.updated_at.clone(),
@@ -978,6 +1054,7 @@ impl SessionStore {
                     mode: session.mode,
                     model: session.model.clone(),
                     reasoning_effort: session.reasoning_effort,
+                    max_tokens: session.max_tokens,
                     mcp_servers: session.mcp_servers.clone(),
                     title: Some(session.title.clone()),
                     updated_at: Some(session.updated_at.clone()),

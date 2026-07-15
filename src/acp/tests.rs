@@ -361,6 +361,11 @@ fn new_session_advertises_model_and_reasoning_config_options()
         "high"
     );
 
+    assert_eq!(
+        select_current_value(&options, crate::SESSION_CONFIG_MAX_TOKENS_ID)?,
+        "default"
+    );
+
     Ok(())
 }
 
@@ -1172,6 +1177,52 @@ fn set_config_option_rejects_invalid_reasoning_effort() -> Result<(), agent_clie
     Ok(())
 }
 
+#[test_log::test]
+fn set_config_option_updates_session_max_tokens() -> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+
+    handle_set_session_config_option_request(
+        &store,
+        &SetSessionConfigOptionRequest::new(
+            session.session_id.clone(),
+            crate::SESSION_CONFIG_MAX_TOKENS_ID,
+            "8192",
+        ),
+    )?;
+
+    let guard = store
+        .state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing stored session")
+    })?;
+    assert_eq!(stored.max_tokens, Some(8_192));
+
+    Ok(())
+}
+
+#[test]
+fn set_config_option_rejects_invalid_max_tokens() -> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+
+    let Err(error) = handle_set_session_config_option_request(
+        &store,
+        &SetSessionConfigOptionRequest::new(
+            session.session_id,
+            crate::SESSION_CONFIG_MAX_TOKENS_ID,
+            "bogus",
+        ),
+    ) else {
+        return Err(agent_client_protocol::Error::internal_error()
+            .data("expected invalid max_tokens to fail"));
+    };
+    assert!(error.to_string().contains("unsupported max_tokens value"));
+    Ok(())
+}
+
 #[test]
 fn set_config_option_rejects_unknown_session() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
@@ -1489,6 +1540,7 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
                 mode: PermissionPosture::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
+                max_tokens: None,
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
@@ -1560,6 +1612,7 @@ async fn load_session_restores_state_and_replays_history()
                 mode: PermissionPosture::AcceptEdits,
                 model: "deepseek-v4-flash".to_string(),
                 reasoning_effort: ReasoningEffort::Max,
+                max_tokens: None,
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
@@ -1659,6 +1712,7 @@ async fn resume_session_restores_state_without_replay() -> Result<(), agent_clie
                 mode: PermissionPosture::Yolo,
                 model: "deepseek-v4-flash".to_string(),
                 reasoning_effort: ReasoningEffort::Max,
+                max_tokens: None,
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
@@ -1728,6 +1782,7 @@ async fn load_session_rejects_mismatched_cwd() -> Result<(), agent_client_protoc
                 mode: PermissionPosture::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
+                max_tokens: None,
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
@@ -1807,6 +1862,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
             mode: PermissionPosture::Ask,
             model: "deepseek-v4-pro".to_string(),
             reasoning_effort: ReasoningEffort::High,
+            max_tokens: None,
             permission_allow_always: std::collections::HashSet::new(),
             mcp_servers: Vec::new(),
             mcp_sessions: Vec::new(),
@@ -1823,6 +1879,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
                 mode: PermissionPosture::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
+                max_tokens: None,
                 mcp_servers: Vec::new(),
                 title: Some("temporary title".to_string()),
                 updated_at: Some("2026-06-14T00:00:00Z".to_string()),
@@ -2631,6 +2688,7 @@ async fn restore_persisted_session_rejects_mismatched_id()
                 mode: PermissionPosture::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
+                max_tokens: None,
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
@@ -2649,6 +2707,7 @@ async fn restore_persisted_session_rejects_mismatched_id()
         mode: PermissionPosture::Ask,
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::High,
+        max_tokens: None,
         mcp_servers: Vec::new(),
         title: None,
         updated_at: None,
@@ -2728,6 +2787,7 @@ async fn load_session_response_includes_history_jsonl_path_in_meta()
                 mode: PermissionPosture::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
+                max_tokens: None,
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
@@ -2783,6 +2843,7 @@ async fn resume_session_response_includes_history_jsonl_path_in_meta()
                 mode: PermissionPosture::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
+                max_tokens: None,
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,

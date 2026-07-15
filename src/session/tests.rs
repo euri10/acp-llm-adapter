@@ -44,6 +44,51 @@ fn reasoning_effort_from_value_id_rejects_unknown() {
 }
 
 #[test]
+fn max_tokens_value_id_round_trips_default_and_preset() {
+    use agent_client_protocol::schema::SessionConfigValueId;
+
+    assert_eq!(super::max_tokens_value_id(None), "default");
+    assert_eq!(super::max_tokens_value_id(Some(8_192)), "8192");
+
+    assert_eq!(
+        super::max_tokens_from_value_id(&SessionConfigValueId::new("default")).ok(),
+        Some(None)
+    );
+    assert_eq!(
+        super::max_tokens_from_value_id(&SessionConfigValueId::new("8192")).ok(),
+        Some(Some(8_192))
+    );
+}
+
+#[test]
+fn max_tokens_from_value_id_rejects_zero_and_non_numeric() {
+    use agent_client_protocol::schema::SessionConfigValueId;
+
+    assert!(super::max_tokens_from_value_id(&SessionConfigValueId::new("0")).is_err());
+    assert!(super::max_tokens_from_value_id(&SessionConfigValueId::new("bogus")).is_err());
+}
+
+#[test]
+fn max_tokens_select_options_include_default_and_presets() {
+    let options = super::max_tokens_select_options();
+    assert!(
+        options
+            .iter()
+            .any(|option| option.value.0.as_ref() == "default")
+    );
+    assert!(
+        options
+            .iter()
+            .any(|option| option.value.0.as_ref() == "4096")
+    );
+    assert!(
+        options
+            .iter()
+            .any(|option| option.value.0.as_ref() == "131072")
+    );
+}
+
+#[test]
 fn pending_tool_calls_require_complete_metadata() -> Result<(), agent_client_protocol::Error> {
     use deepseek_acp_adapter::deepseek::ToolCallDelta;
 
