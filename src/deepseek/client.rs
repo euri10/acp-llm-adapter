@@ -192,6 +192,10 @@ impl LlmClient for DeepSeekClient {
                         es
                     }
                     Err(error) => {
+                        // Note: EventSource::new() does not capture HTTP error response bodies.
+                        // If debugging a non-2xx error (e.g., 400 Bad Request), enable TRACE-level
+                        // logging above to see the full request JSON, or improve error handling
+                        // to manually send the request and read error responses.
                         tracing::error!(error = ?error, "failed to create SSE event source");
                         let _ = tx.send(Err(DeepSeekError::from(error)));
                         return;
