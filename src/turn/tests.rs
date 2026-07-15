@@ -15,7 +15,7 @@ use agent_client_protocol::schema::{
     ToolKind,
 };
 use deepseek_acp_adapter::deepseek::{
-    ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, StreamEvent,
+    ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, MessageRole, StreamEvent,
     ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
 };
 use deepseek_acp_adapter::error::AdapterError;
@@ -1147,4 +1147,95 @@ fn tool_call_title_prefers_command_over_path() {
 fn tool_call_title_empty_string_filtered_out() {
     let call = DeepSeekToolCall::new("c12", "run_command", r#"{"command":""}"#);
     assert_eq!(super::tool_call_title(&call), "run_command");
+}
+
+#[test]
+fn filter_messages_by_size_returns_unchanged_when_under_budget() {
+    let messages = vec![
+        ChatMessage::user("first"),
+        ChatMessage::user("second"),
+        ChatMessage::user("third"),
+    ];
+    assert_eq!(super::filter_messages_by_size(&messages, 1_000), messages);
+}
+
+#[test]
+fn filter_messages_by_size_keeps_older_message_past_an_oversized_recent_one() {
+    // Regression test for daa-wx1: a single oversized *recent* message must not
+    // stop the walk-back before smaller, older messages get a chance to fit.
+    let first = ChatMessage::user("first");
+    let older_small = ChatMessage::user("keep me");
+    let newest_huge = ChatMessage::user("x".repeat(1_000));
+    let messages = vec![first.clone(), older_small.clone(), newest_huge];
+
+    let filtered = super::filter_messages_by_size(&messages, 100);
+
+    assert_eq!(filtered, vec![first, older_small]);
+}
+
+#[test]
+fn filter_messages_by_size_drops_oversized_tool_call_unit_as_a_whole() {
+    // An assistant message requesting tool calls and the tool results that
+    // answer it must be dropped or kept together - never split, which would
+    // otherwise produce a dangling tool call or an orphaned tool result.
+    let first = ChatMessage::user("first");
+    let older_small = ChatMessage::user("keep me");
+    let assistant_call = ChatMessage::assistant_with_tool_calls(
+        "checking",
+        vec![DeepSeekToolCall::new(
+            "call-1",
+            "read_file",
+            r#"{"path":"a"}"#,
+        )],
+    );
+    let tool_result = ChatMessage::tool_result("call-1", "x".repeat(2_000));
+    let messages = vec![
+        first.clone(),
+        older_small.clone(),
+        assistant_call,
+        tool_result,
+    ];
+
+    let filtered = super::filter_messages_by_size(&messages, 200);
+
+    assert_eq!(filtered, vec![first, older_small]);
+    assert!(filtered.iter().all(|m| m.tool_calls().is_empty()));
+    assert!(filtered.iter().all(|m| m.role() != MessageRole::Tool));
+}
+
+#[test]
+fn filter_messages_by_size_keeps_tool_call_unit_together_when_it_fits() {
+    let first = ChatMessage::user("first");
+    let assistant_call = ChatMessage::assistant_with_tool_calls(
+        "checking",
+        vec![DeepSeekToolCall::new(
+            "call-1",
+            "read_file",
+            r#"{"path":"a"}"#,
+        )],
+    );
+    let tool_result = ChatMessage::tool_result("call-1", "small result");
+    let padding = ChatMessage::user("x".repeat(500));
+    let messages = vec![
+        first.clone(),
+        padding,
+        assistant_call.clone(),
+        tool_result.clone(),
+    ];
+
+    let filtered = super::filter_messages_by_size(&messages, 250);
+
+    assert_eq!(filtered, vec![first, assistant_call, tool_result]);
+}
+
+#[test]
+fn validate_tool_results_drops_orphaned_tool_result() {
+    let messages = vec![
+        ChatMessage::user("hello"),
+        ChatMessage::tool_result("missing-call", "orphaned"),
+    ];
+
+    let validated = super::validate_tool_results(&messages);
+
+    assert_eq!(validated, vec![messages[0].clone()]);
 }

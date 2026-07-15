@@ -45,12 +45,14 @@ struct PromptTurnEnvironment<'a> {
     max_turn_requests: NonZeroUsize,
 }
 
-/// Filter messages to fit within a byte budget, keeping system and recent messages.
+/// Filter messages to fit within a byte budget, keeping the first and most recent messages.
 ///
 /// `CloudFront` (the CDN in front of `DeepSeek` API) enforces a ~1MB request size limit.
 /// We filter messages to stay well under this limit (512KB budget) to ensure requests
-/// complete successfully. The filter keeps the system message (if present) and as many
-/// recent messages as fit within the budget, dropping older messages if needed.
+/// complete successfully. The filter keeps the first message and as many recent
+/// tool-call units as fit within the budget, dropping older messages if needed. A
+/// single oversized recent message never blocks smaller, older messages from
+/// also being considered.
 ///
 /// # Arguments
 ///
@@ -76,33 +78,68 @@ fn filter_messages_by_size(messages: &[ChatMessage], max_bytes: usize) -> Vec<Ch
 
 #[allow(clippy::indexing_slicing)]
 fn filter_messages_truncate(messages: &[ChatMessage], max_bytes: usize) -> Vec<ChatMessage> {
-    // Need to filter: keep first message (system prompt) and recent messages
+    // Keep the first message (the oldest message in the session) unconditionally,
+    // then fill the remaining budget with the most recent tool-call units that fit.
     let mut filtered = Vec::new();
     let mut budget = max_bytes;
 
-    // Always keep the first message (usually system prompt) - safe due to non-empty check above
     let first = messages[0].clone();
     let first_size = estimate_message_size(&first);
     filtered.push(first);
     budget = budget.saturating_sub(first_size);
 
-    // Add messages from the end (most recent) backward until budget exhausted
-    for msg in messages[1..].iter().rev() {
-        let msg_size = estimate_message_size(msg);
-        if msg_size > budget {
-            break;
-        }
-        budget = budget.saturating_sub(msg_size);
-        filtered.push(msg.clone());
-    }
+    // Group the rest so an assistant message requesting tool calls always
+    // travels with the tool results answering it - truncation must keep or
+    // drop such a pair together, never split it.
+    let groups = group_tool_call_units(&messages[1..]);
 
-    // Reverse to restore chronological order (we added recent messages in reverse)
-    filtered.reverse();
+    // Walk groups from most recent to oldest. A single oversized recent group
+    // must not stop older, smaller groups from also being considered -
+    // otherwise one large tool result collapses the whole history down to
+    // just the pinned first message.
+    let mut kept_groups = Vec::new();
+    for group in groups.iter().rev() {
+        let group_size: usize = group.iter().map(estimate_message_size).sum();
+        if group_size > budget {
+            continue;
+        }
+        budget = budget.saturating_sub(group_size);
+        kept_groups.push(group);
+    }
+    kept_groups.reverse();
+    for group in kept_groups {
+        filtered.extend_from_slice(group);
+    }
 
     // Validate tool result messages: only keep tool results if the corresponding
     // tool call is present in the filtered messages. This prevents orphaned tool
     // results from causing 400 Bad Request errors from DeepSeek.
     validate_tool_results(&filtered)
+}
+
+/// Group messages so an assistant message requesting tool calls stays with
+/// the tool result messages that answer it.
+///
+/// Truncation operates on these groups as atomic units so it can never keep
+/// an assistant tool call without its result (or vice versa).
+fn group_tool_call_units(messages: &[ChatMessage]) -> Vec<Vec<ChatMessage>> {
+    let mut groups = Vec::new();
+    let mut iter = messages.iter().peekable();
+    while let Some(msg) = iter.next() {
+        let mut group = vec![msg.clone()];
+        if msg.role() == MessageRole::Assistant && !msg.tool_calls().is_empty() {
+            while let Some(next) = iter.peek() {
+                if next.role() == MessageRole::Tool {
+                    group.push((*next).clone());
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        groups.push(group);
+    }
+    groups
 }
 
 /// Ensure tool result messages have corresponding tool calls in the message history.
