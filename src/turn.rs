@@ -9,8 +9,8 @@ use agent_client_protocol::schema::{
     ToolKind, Usage, UsageUpdate,
 };
 use deepseek_acp_adapter::deepseek::{
-    ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent, ToolCall as DeepSeekToolCall,
-    ToolDefinition, UsageData,
+    ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
+    ToolCall as DeepSeekToolCall, ToolDefinition, UsageData,
 };
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -98,7 +98,49 @@ fn filter_messages_truncate(messages: &[ChatMessage], max_bytes: usize) -> Vec<C
 
     // Reverse to restore chronological order (we added recent messages in reverse)
     filtered.reverse();
-    filtered
+
+    // Validate tool result messages: only keep tool results if the corresponding
+    // tool call is present in the filtered messages. This prevents orphaned tool
+    // results from causing 400 Bad Request errors from DeepSeek.
+    validate_tool_results(&filtered)
+}
+
+/// Ensure tool result messages have corresponding tool calls in the message history.
+///
+/// Removes any tool result messages whose referenced `tool_call_id` doesn't appear
+/// in an assistant message within the filtered history. This prevents orphaned
+/// tool responses which violate the `OpenAI`/`DeepSeek` API contract.
+#[allow(clippy::indexing_slicing)]
+fn validate_tool_results(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    // Collect all tool call IDs from assistant messages
+    let mut available_tool_calls = std::collections::HashSet::new();
+    for msg in messages {
+        if msg.role() == MessageRole::Assistant {
+            for tool_call in msg.tool_calls() {
+                available_tool_calls.insert(tool_call.id().to_string());
+            }
+        }
+    }
+
+    // Filter out tool result messages with missing tool calls
+    messages
+        .iter()
+        .filter(|msg| {
+            if msg.role() == MessageRole::Tool {
+                // Keep tool result only if the tool call exists
+                if let Some(tool_call_id) = msg.tool_call_id() {
+                    available_tool_calls.contains(tool_call_id)
+                } else {
+                    // Tool result without ID - invalid, drop it
+                    false
+                }
+            } else {
+                // Keep all non-tool messages
+                true
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 /// Estimate the size of a message in bytes for filtering purposes.
