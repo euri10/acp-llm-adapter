@@ -45,6 +45,68 @@ struct PromptTurnEnvironment<'a> {
     max_turn_requests: NonZeroUsize,
 }
 
+/// Filter messages to fit within a byte budget, keeping system and recent messages.
+///
+/// `CloudFront` (the CDN in front of `DeepSeek` API) enforces a ~1MB request size limit.
+/// We filter messages to stay well under this limit (512KB budget) to ensure requests
+/// complete successfully. The filter keeps the system message (if present) and as many
+/// recent messages as fit within the budget, dropping older messages if needed.
+///
+/// # Arguments
+///
+/// * `messages` - All messages in the conversation
+/// * `max_bytes` - Maximum bytes allowed for the filtered message list
+///
+/// # Returns
+///
+/// A filtered message list that fits within the byte budget.
+fn filter_messages_by_size(messages: &[ChatMessage], max_bytes: usize) -> Vec<ChatMessage> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    // Calculate total size - if it fits, return as-is
+    let total_size: usize = messages.iter().map(estimate_message_size).sum();
+    if total_size <= max_bytes {
+        return messages.to_vec();
+    }
+
+    filter_messages_truncate(messages, max_bytes)
+}
+
+#[allow(clippy::indexing_slicing)]
+fn filter_messages_truncate(messages: &[ChatMessage], max_bytes: usize) -> Vec<ChatMessage> {
+    // Need to filter: keep first message (system prompt) and recent messages
+    let mut filtered = Vec::new();
+    let mut budget = max_bytes;
+
+    // Always keep the first message (usually system prompt) - safe due to non-empty check above
+    let first = messages[0].clone();
+    let first_size = estimate_message_size(&first);
+    filtered.push(first);
+    budget = budget.saturating_sub(first_size);
+
+    // Add messages from the end (most recent) backward until budget exhausted
+    for msg in messages[1..].iter().rev() {
+        let msg_size = estimate_message_size(msg);
+        if msg_size > budget {
+            break;
+        }
+        budget = budget.saturating_sub(msg_size);
+        filtered.push(msg.clone());
+    }
+
+    // Reverse to restore chronological order (we added recent messages in reverse)
+    filtered.reverse();
+    filtered
+}
+
+/// Estimate the size of a message in bytes for filtering purposes.
+fn estimate_message_size(msg: &ChatMessage) -> usize {
+    // Rough estimate: role (10) + content length + tool calls overhead
+    10 + msg.content().len() + (msg.tool_calls().len() * 100)
+}
+
 /// Run the full prompt-turn lifecycle for a single ACP `session/prompt` request.
 ///
 /// This keeps ACP request translation in [`crate::acp`] while moving model
@@ -225,6 +287,7 @@ async fn run_prompt_turn(
 /// Returns an ACP protocol error when the underlying LLM stream fails, when a
 /// streamed tool-call delta cannot be assembled into a complete call, or when
 /// a session update notification fails.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn stream_model_turn(
     llm_client: &dyn LlmClient,
     messages: &[ChatMessage],
@@ -234,7 +297,20 @@ pub(crate) async fn stream_model_turn(
     session_id: &SessionId,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<ModelTurn, AdapterError> {
-    let mut chat_request = ChatRequest::new(messages.to_vec())
+    // Filter messages to respect CloudFront's ~1MB request limit.
+    // Keep 512KB budget for messages to leave headroom for tools, system prompts, etc.
+    let max_message_bytes = 512 * 1024; // 512KB
+    let filtered_messages = filter_messages_by_size(messages, max_message_bytes);
+
+    if filtered_messages.len() < messages.len() {
+        tracing::warn!(
+            total_messages = messages.len(),
+            kept_messages = filtered_messages.len(),
+            "truncated conversation history to fit request size limit"
+        );
+    }
+
+    let mut chat_request = ChatRequest::new(filtered_messages)
         .with_tools(tool_definitions.to_vec())
         .with_model(model_settings.model);
     if let Some(effort) = model_settings.reasoning_effort {
