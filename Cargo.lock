@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "deepseek-acp-adapter"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "agent-client-protocol",
  "axum",
