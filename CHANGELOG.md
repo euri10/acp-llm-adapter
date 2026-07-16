@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/euri10/deepseek-acp-adapter/compare/v0.5.4...v0.6.0) - 2026-07-16
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.5.4](https://github.com/euri10/deepseek-acp-adapter/compare/v0.5.3...v0.5.4) - 2026-07-16
 
 ### Added
