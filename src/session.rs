@@ -98,6 +98,16 @@ impl SessionBehavior {
         }
     }
 
+    pub(crate) const fn allows_tool_kind(self, kind: ToolKind) -> bool {
+        match self {
+            Self::Plan => matches!(
+                kind,
+                ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch
+            ),
+            Self::Ask | Self::AcceptEdits | Self::Yolo => true,
+        }
+    }
+
     pub(crate) fn from_mode_id(mode_id: &SessionModeId) -> Option<Self> {
         match mode_id.0.as_ref() {
             SESSION_MODE_ASK_ID => Some(Self::Ask),
@@ -595,6 +605,7 @@ pub(crate) struct SessionStore {
 pub(crate) struct TurnSetup {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) tool_context: ToolContext,
+    pub(crate) behavior: SessionBehavior,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
     pub(crate) max_tokens: Option<u32>,
@@ -1025,6 +1036,7 @@ impl SessionStore {
                 additional_directories: session.additional_directories.clone(),
                 client_capabilities,
             },
+            behavior: session.mode,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort,
             max_tokens: session.max_tokens,

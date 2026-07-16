@@ -19,8 +19,8 @@ use uuid::Uuid;
 use crate::acp::ToolCallRequester;
 use crate::tools::{ToolContext, ToolExecution, ToolRegistry};
 use crate::{
-    PendingToolCalls, ReasoningEffort, SessionStore, session_notification, stop_reason_from_finish,
-    text_from_prompt,
+    PendingToolCalls, ReasoningEffort, SessionBehavior, SessionStore, session_notification,
+    stop_reason_from_finish, text_from_prompt,
 };
 use deepseek_acp_adapter::error::AdapterError;
 
@@ -43,6 +43,7 @@ struct PromptTurnEnvironment<'a> {
     tool_registry: &'a dyn ToolRegistry,
     connection: Option<&'a dyn ToolCallRequester>,
     tool_context: ToolContext,
+    behavior: SessionBehavior,
     request: PromptRequest,
     cancellation_token: CancellationToken,
     max_turn_requests: NonZeroUsize,
@@ -237,6 +238,25 @@ fn sanitize_conversation(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     sanitized
 }
 
+fn request_messages_for_behavior(
+    behavior: SessionBehavior,
+    messages: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    let mut request_messages = messages.to_vec();
+    if behavior == SessionBehavior::Plan {
+        request_messages.insert(0, plan_mode_instruction_message());
+    }
+    request_messages
+}
+
+fn plan_mode_instruction_message() -> ChatMessage {
+    ChatMessage::system(
+        "You are in Plan mode. Do not modify files, run shell commands, or use MCP tools. \
+Use read-only tools to inspect the codebase, call update_plan when useful, and return a \
+concrete step-by-step implementation plan.",
+    )
+}
+
 /// Estimate the size of a message in bytes for filtering purposes.
 ///
 /// Accounts for JSON serialization overhead (quotes, escapes, delimiters).
@@ -308,6 +328,7 @@ pub(crate) async fn handle_prompt_request(
                 tool_registry,
                 connection,
                 tool_context: turn_setup.tool_context,
+                behavior: turn_setup.behavior,
                 request,
                 cancellation_token: cancellation_token.clone(),
                 max_turn_requests,
@@ -347,16 +368,23 @@ async fn run_prompt_turn(
 ) -> Result<PromptResponse, AdapterError> {
     let tool_definitions = env
         .tool_registry
-        .definitions(&env.tool_context, env.store)?;
+        .definitions(&env.tool_context, env.store)?
+        .into_iter()
+        .filter(|definition| {
+            env.behavior
+                .allows_tool_kind(env.tool_registry.kind(definition.name()))
+        })
+        .collect::<Vec<_>>();
 
     let mut stop_reason = StopReason::MaxTurnRequests;
     let mut accumulated_input_tokens: u64 = 0;
     let mut accumulated_output_tokens: u64 = 0;
 
     for _ in 0..env.max_turn_requests.get() {
+        let request_messages = request_messages_for_behavior(env.behavior, &messages);
         let turn = stream_model_turn(
             env.llm_client,
-            &messages,
+            &request_messages,
             &tool_definitions,
             model_settings,
             env.cancellation_token.clone(),
@@ -394,16 +422,23 @@ async fn run_prompt_turn(
         for tool_call in &turn.tool_calls {
             let tool_kind = env.tool_registry.kind(tool_call.name());
             report_tool_call(&env.request.session_id, notify, tool_call, tool_kind)?;
-            let tool_result = env
-                .tool_registry
-                .execute(
-                    tool_call,
-                    &env.tool_context,
-                    env.store,
-                    env.connection,
-                    env.cancellation_token.clone(),
-                )
-                .await;
+            let tool_result = if env.behavior.allows_tool_kind(tool_kind) {
+                env.tool_registry
+                    .execute(
+                        tool_call,
+                        &env.tool_context,
+                        env.store,
+                        env.connection,
+                        env.cancellation_token.clone(),
+                    )
+                    .await
+            } else {
+                ToolExecution::failed(format!(
+                    "{} mode refuses {} tool calls",
+                    env.behavior.mode_id().0.as_ref(),
+                    tool_call.name()
+                ))
+            };
             report_tool_result(&env.request.session_id, notify, tool_call, &tool_result)?;
             messages.push(ChatMessage::tool_result(
                 tool_call.id(),

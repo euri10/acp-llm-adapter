@@ -4,7 +4,7 @@ use crate::acp::{
     ToolCallRequester, handle_delete_session_request, handle_new_session_request,
     handle_set_session_config_option_request,
 };
-use crate::session::{DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionStore};
+use crate::session::{DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionBehavior, SessionStore};
 use crate::test_store;
 use crate::tools::{
     AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry,
@@ -122,6 +122,129 @@ struct FakeToolRegistry {
     definitions: Vec<ToolDefinition>,
     result: ToolExecution,
     calls: Arc<Mutex<Vec<DeepSeekToolCall>>>,
+}
+
+struct PlanModeToolRegistry {
+    definitions: Vec<ToolDefinition>,
+    calls: Arc<Mutex<Vec<DeepSeekToolCall>>>,
+}
+
+impl PlanModeToolRegistry {
+    fn new() -> Self {
+        let definitions = vec![
+            ToolDefinition::new(
+                "read_file",
+                "Read a text file",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false,
+                }),
+            ),
+            ToolDefinition::new(
+                "update_plan",
+                "Update the current plan",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entries": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": { "type": "string" },
+                                    "priority": { "type": "string" },
+                                    "status": { "type": "string" },
+                                },
+                                "required": ["content", "priority", "status"],
+                                "additionalProperties": false,
+                            },
+                        },
+                    },
+                    "required": ["entries"],
+                    "additionalProperties": false,
+                }),
+            ),
+            ToolDefinition::new(
+                "write_file",
+                "Write a text file",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false,
+                }),
+            ),
+            ToolDefinition::new(
+                "run_command",
+                "Run a shell command",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"],
+                    "additionalProperties": false,
+                }),
+            ),
+            ToolDefinition::new(
+                "mcp__server__tool",
+                "MCP tool",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "input": { "type": "string" } },
+                    "required": ["input"],
+                    "additionalProperties": false,
+                }),
+            ),
+        ];
+
+        Self {
+            definitions,
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls(&self) -> Arc<Mutex<Vec<DeepSeekToolCall>>> {
+        Arc::clone(&self.calls)
+    }
+}
+
+impl ToolRegistry for PlanModeToolRegistry {
+    fn definitions(
+        &self,
+        _context: &ToolContext,
+        _store: &SessionStore,
+    ) -> Result<Vec<ToolDefinition>, AdapterError> {
+        Ok(self.definitions.clone())
+    }
+
+    fn kind(&self, name: &str) -> ToolKind {
+        match name {
+            "read_file" => ToolKind::Read,
+            "update_plan" => ToolKind::Think,
+            "write_file" => ToolKind::Edit,
+            "run_command" => ToolKind::Execute,
+            name if crate::is_mcp_tool_name(name) => crate::mcp_tool_kind(),
+            _ => ToolKind::Other,
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a DeepSeekToolCall,
+        _context: &'a ToolContext,
+        _store: &'a SessionStore,
+        _connection: Option<&'a dyn ToolCallRequester>,
+        _cancellation_token: CancellationToken,
+    ) -> BoxFuture<'a, ToolExecution> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .map(|mut calls| calls.push(call.clone()))
+                .ok();
+            ToolExecution::failed("unexpected tool execution in plan mode")
+        })
+    }
 }
 
 impl FakeToolRegistry {
@@ -330,6 +453,121 @@ async fn prompt_omits_max_tokens_by_default() -> Result<(), agent_client_protoco
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     assert_eq!(request_guard[0].max_tokens(), None);
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn plan_mode_injects_instructions_and_filters_mutating_tools()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+
+    let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+    let requests = client.requests();
+    let registry = PlanModeToolRegistry::new();
+
+    handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("make a plan")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    let request_guard = requests
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    assert_eq!(request_guard.len(), 1);
+    let request = &request_guard[0];
+    assert_eq!(request.messages().len(), 2);
+    assert_eq!(request.messages()[0].role(), MessageRole::System);
+    assert!(request.messages()[0].content().contains("Plan mode"));
+    assert!(request.messages()[0].content().contains("update_plan"));
+    assert_eq!(request.messages()[1].role(), MessageRole::User);
+    assert_eq!(request.messages()[1].content(), "make a plan");
+
+    let tool_names = request
+        .tools()
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(tool_names, vec!["read_file", "update_plan"]);
+
+    let state_guard = store
+        .state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let stored = state_guard
+        .sessions
+        .get(&session.session_id)
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
+    assert_eq!(stored.mode, SessionBehavior::Plan);
+    assert_eq!(stored.history.len(), 2);
+    assert_eq!(stored.history[0].role(), MessageRole::User);
+    assert_eq!(stored.history[1].role(), MessageRole::Assistant);
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn plan_mode_refuses_disallowed_tool_calls_before_execution()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+
+    let client = FakeLlmClient::with_streams(vec![
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                0,
+                Some("call-1".to_string()),
+                Some("run_command".to_string()),
+                Some(serde_json::json!({ "command": "echo hi" }).to_string()),
+            )))),
+            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::ToolCalls))),
+        ],
+        vec![FakeStreamStep::Event(Ok(StreamEvent::Finished(
+            FinishReason::EndTurn,
+        )))],
+    ]);
+    let registry = PlanModeToolRegistry::new();
+    let calls = registry.calls();
+
+    let response = handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("make a plan")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    let calls_guard = calls
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    assert!(calls_guard.is_empty());
 
     Ok(())
 }
