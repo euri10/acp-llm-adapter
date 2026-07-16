@@ -15,9 +15,9 @@ use crate::dev::MockLlmClient;
 use crate::session::{
     AdapterState, DEFAULT_MAX_TURN_REQUESTS, PERMISSION_ALLOW_ALWAYS_OPTION_ID,
     PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision,
-    PermissionPosture, ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
-    SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore, initial_model_from_env,
-    model_select_options, request_tool_permission, validate_session_model,
+    ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
+    SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, SessionStore,
+    initial_model_from_env, model_select_options, request_tool_permission, validate_session_model,
 };
 use crate::session_store::{FilesystemSessionStore, PersistedSessionMeta};
 use crate::test_utils::*;
@@ -29,9 +29,10 @@ use agent_client_protocol::schema::{
     FileSystemCapabilities, Implementation, InitializeRequest, ListSessionsRequest,
     LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, ToolCallContent,
-    ToolCallStatus, ToolKind,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOptions, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, ToolCallContent, ToolCallStatus,
+    ToolKind,
 };
 use agent_client_protocol::{Channel, Client};
 use deepseek_acp_adapter::deepseek::{ChatMessage, LlmClient};
@@ -48,6 +49,31 @@ fn select_current_value(
     id: &str,
 ) -> Result<String, agent_client_protocol::Error> {
     crate::test_utils::select_current_value(options, id)
+}
+
+fn assert_stored_session_state(
+    store: &SessionStore,
+    session_id: &agent_client_protocol::schema::SessionId,
+    expected_cwd: &std::path::Path,
+    expected_mode: SessionBehavior,
+    expected_model: &str,
+    expected_reasoning_effort: ReasoningEffort,
+    expected_history: &[ChatMessage],
+) -> Result<(), agent_client_protocol::Error> {
+    let guard = store
+        .state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let restored = guard.sessions.get(session_id).ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing restored session")
+    })?;
+    assert_eq!(restored.cwd, expected_cwd);
+    assert_eq!(restored.mode, expected_mode);
+    assert_eq!(restored.model, expected_model);
+    assert_eq!(restored.reasoning_effort, expected_reasoning_effort);
+    assert_eq!(restored.history, expected_history);
+
+    Ok(())
 }
 
 #[test]
@@ -296,7 +322,7 @@ fn new_session_returns_id_and_mode() -> Result<(), agent_client_protocol::Error>
         .modes
         .ok_or_else(agent_client_protocol::Error::internal_error)?;
     assert_eq!(modes.current_mode_id.0.as_ref(), "ask");
-    assert_eq!(modes.available_modes.len(), 3);
+    assert_eq!(modes.available_modes.len(), 4);
     assert!(
         modes
             .available_modes
@@ -308,6 +334,12 @@ fn new_session_returns_id_and_mode() -> Result<(), agent_client_protocol::Error>
             .available_modes
             .iter()
             .any(|mode| mode.id.0.as_ref() == "accept-edits")
+    );
+    assert!(
+        modes
+            .available_modes
+            .iter()
+            .any(|mode| mode.id.0.as_ref() == "plan")
     );
     assert!(
         modes
@@ -366,6 +398,33 @@ fn new_session_advertises_model_and_reasoning_config_options()
         "default"
     );
 
+    let mode = options
+        .iter()
+        .find(|option| option.id.0.as_ref() == SESSION_CONFIG_MODE_ID)
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing mode option")
+        })?;
+    assert_eq!(mode.category, Some(SessionConfigOptionCategory::Mode));
+    assert_eq!(
+        select_current_value(&options, SESSION_CONFIG_MODE_ID)?,
+        "ask"
+    );
+    let SessionConfigKind::Select(select) = &mode.kind else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("mode option should be a select")
+        );
+    };
+    let SessionConfigSelectOptions::Ungrouped(options) = &select.options else {
+        return Err(
+            agent_client_protocol::Error::internal_error().data("mode options should be ungrouped")
+        );
+    };
+    assert!(
+        options
+            .iter()
+            .any(|option| option.value.0.as_ref() == "plan")
+    );
+
     Ok(())
 }
 
@@ -376,7 +435,7 @@ fn set_mode_updates_session_state() -> Result<(), agent_client_protocol::Error> 
 
     let response = handle_set_session_mode_request(
         &store,
-        &SetSessionModeRequest::new(session.session_id.clone(), "accept-edits"),
+        &SetSessionModeRequest::new(session.session_id.clone(), "plan"),
     )?;
 
     assert!(response.meta.is_none());
@@ -387,7 +446,7 @@ fn set_mode_updates_session_state() -> Result<(), agent_client_protocol::Error> 
     let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
         agent_client_protocol::Error::internal_error().data("missing stored session")
     })?;
-    assert_eq!(stored.mode, PermissionPosture::AcceptEdits);
+    assert_eq!(stored.mode, SessionBehavior::Plan);
 
     Ok(())
 }
@@ -400,7 +459,7 @@ fn set_mode_emits_current_mode_update() -> Result<(), agent_client_protocol::Err
 
     handle_set_session_mode_request_notifying(
         &store,
-        &SetSessionModeRequest::new(session.session_id.clone(), "yolo"),
+        &SetSessionModeRequest::new(session.session_id.clone(), "plan"),
         |notification| {
             notifications.push(notification);
             Ok(())
@@ -413,7 +472,7 @@ fn set_mode_emits_current_mode_update() -> Result<(), agent_client_protocol::Err
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected current mode update notification"));
     };
-    assert_eq!(update.current_mode_id.0.as_ref(), "yolo");
+    assert_eq!(update.current_mode_id.0.as_ref(), "plan");
 
     Ok(())
 }
@@ -640,8 +699,7 @@ async fn permission_request_rejects_without_caching() -> Result<(), agent_client
 }
 
 #[test_log::test(tokio::test)]
-async fn permission_posture_ask_prompts_all_mutations() -> Result<(), agent_client_protocol::Error>
-{
+async fn session_behavior_ask_prompts_all_mutations() -> Result<(), agent_client_protocol::Error> {
     let (store, _session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
     let requester = FakePermissionRequester::new(vec![
         RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
@@ -674,7 +732,7 @@ async fn permission_posture_ask_prompts_all_mutations() -> Result<(), agent_clie
 }
 
 #[test_log::test(tokio::test)]
-async fn permission_posture_accept_edits_skips_edit_prompts()
+async fn session_behavior_accept_edits_skips_edit_prompts()
 -> Result<(), agent_client_protocol::Error> {
     let (store, session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
     handle_set_session_mode_request(
@@ -712,13 +770,13 @@ async fn permission_posture_accept_edits_skips_edit_prompts()
     let stored = guard.sessions.get(&session_id).ok_or_else(|| {
         agent_client_protocol::Error::internal_error().data("missing stored session")
     })?;
-    assert_eq!(stored.mode, PermissionPosture::AcceptEdits);
+    assert_eq!(stored.mode, SessionBehavior::AcceptEdits);
 
     Ok(())
 }
 
 #[test_log::test(tokio::test)]
-async fn permission_posture_yolo_auto_allows_all_mutations()
+async fn session_behavior_yolo_auto_allows_all_mutations()
 -> Result<(), agent_client_protocol::Error> {
     let (store, session_id, context, edit_call, shell_call) = permission_mode_fixture()?;
     handle_set_session_mode_request(&store, &SetSessionModeRequest::new(session_id, "yolo"))?;
@@ -1120,13 +1178,13 @@ fn set_config_option_updates_mode() -> Result<(), agent_client_protocol::Error> 
         &SetSessionConfigOptionRequest::new(
             session.session_id.clone(),
             SESSION_CONFIG_MODE_ID,
-            "yolo",
+            "plan",
         ),
     )?;
     let options = &response.config_options;
     assert_eq!(
         select_current_value(options, SESSION_CONFIG_MODE_ID)?,
-        "yolo"
+        "plan"
     );
 
     let guard = store
@@ -1136,7 +1194,7 @@ fn set_config_option_updates_mode() -> Result<(), agent_client_protocol::Error> 
     let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
         agent_client_protocol::Error::internal_error().data("missing stored session")
     })?;
-    assert_eq!(stored.mode, PermissionPosture::Yolo);
+    assert_eq!(stored.mode, SessionBehavior::Plan);
     Ok(())
 }
 
@@ -1537,7 +1595,7 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
                 session_id: persisted_id.0.to_string(),
                 cwd: workspace.clone(),
                 additional_directories: vec![state_dir.join("extra")],
-                mode: PermissionPosture::Ask,
+                mode: SessionBehavior::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
@@ -1609,7 +1667,7 @@ async fn load_session_restores_state_and_replays_history()
                 session_id: session_id.0.to_string(),
                 cwd: workspace.clone(),
                 additional_directories: vec![state_dir.join("extra")],
-                mode: PermissionPosture::AcceptEdits,
+                mode: SessionBehavior::Plan,
                 model: "deepseek-v4-flash".to_string(),
                 reasoning_effort: ReasoningEffort::Max,
                 max_tokens: None,
@@ -1634,6 +1692,10 @@ async fn load_session_restores_state_and_replays_history()
 
     assert!(response.modes.is_some());
     assert!(response.config_options.is_some());
+    let modes = response
+        .modes
+        .ok_or_else(agent_client_protocol::Error::internal_error)?;
+    assert_eq!(modes.current_mode_id.0.as_ref(), "plan");
     assert_eq!(notifications.len(), 4);
     let SessionUpdate::UserMessageChunk(user_chunk) = &notifications[0].update else {
         return Err(
@@ -1673,18 +1735,15 @@ async fn load_session_restores_state_and_replays_history()
         second_assistant_chunk.message_id
     );
 
-    let guard = store
-        .state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let restored = guard.sessions.get(&session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing restored session")
-    })?;
-    assert_eq!(restored.cwd, workspace);
-    assert_eq!(restored.mode, PermissionPosture::AcceptEdits);
-    assert_eq!(restored.model, "deepseek-v4-flash");
-    assert_eq!(restored.reasoning_effort, ReasoningEffort::Max);
-    assert_eq!(restored.history, history);
+    assert_stored_session_state(
+        &store,
+        &session_id,
+        workspace.as_path(),
+        SessionBehavior::Plan,
+        "deepseek-v4-flash",
+        ReasoningEffort::Max,
+        &history,
+    )?;
 
     Ok(())
 }
@@ -1709,7 +1768,7 @@ async fn resume_session_restores_state_without_replay() -> Result<(), agent_clie
                 session_id: session_id.0.to_string(),
                 cwd: workspace.clone(),
                 additional_directories: vec![state_dir.join("extra")],
-                mode: PermissionPosture::Yolo,
+                mode: SessionBehavior::Plan,
                 model: "deepseek-v4-flash".to_string(),
                 reasoning_effort: ReasoningEffort::Max,
                 max_tokens: None,
@@ -1729,18 +1788,19 @@ async fn resume_session_restores_state_without_replay() -> Result<(), agent_clie
 
     assert!(response.modes.is_some());
     assert!(response.config_options.is_some());
-    let guard = store
-        .state
-        .lock()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let restored = guard.sessions.get(&session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing resumed session")
-    })?;
-    assert_eq!(restored.cwd, workspace);
-    assert_eq!(restored.mode, PermissionPosture::Yolo);
-    assert_eq!(restored.model, "deepseek-v4-flash");
-    assert_eq!(restored.reasoning_effort, ReasoningEffort::Max);
-    assert_eq!(restored.history, history);
+    let modes = response
+        .modes
+        .ok_or_else(agent_client_protocol::Error::internal_error)?;
+    assert_eq!(modes.current_mode_id.0.as_ref(), "plan");
+    assert_stored_session_state(
+        &store,
+        &session_id,
+        workspace.as_path(),
+        SessionBehavior::Plan,
+        "deepseek-v4-flash",
+        ReasoningEffort::Max,
+        &history,
+    )?;
 
     Ok(())
 }
@@ -1779,7 +1839,7 @@ async fn load_session_rejects_mismatched_cwd() -> Result<(), agent_client_protoc
                 session_id: session_id.0.to_string(),
                 cwd: workspace,
                 additional_directories: Vec::new(),
-                mode: PermissionPosture::Ask,
+                mode: SessionBehavior::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
@@ -1859,7 +1919,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
             additional_directories: Vec::new(),
             history: Vec::new(),
             active_turn: Some(active_turn.clone()),
-            mode: PermissionPosture::Ask,
+            mode: SessionBehavior::Ask,
             model: "deepseek-v4-pro".to_string(),
             reasoning_effort: ReasoningEffort::High,
             max_tokens: None,
@@ -1876,7 +1936,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
                 session_id: session_id.0.to_string(),
                 cwd: workspace,
                 additional_directories: Vec::new(),
-                mode: PermissionPosture::Ask,
+                mode: SessionBehavior::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
@@ -2685,7 +2745,7 @@ async fn restore_persisted_session_rejects_mismatched_id()
                 session_id: session_id.0.to_string(),
                 cwd: workspace.clone(),
                 additional_directories: Vec::new(),
-                mode: PermissionPosture::Ask,
+                mode: SessionBehavior::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
@@ -2704,7 +2764,7 @@ async fn restore_persisted_session_rejects_mismatched_id()
         session_id: "session-restore-id-mismatched".to_string(),
         cwd: workspace.clone(),
         additional_directories: Vec::new(),
-        mode: PermissionPosture::Ask,
+        mode: SessionBehavior::Ask,
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::High,
         max_tokens: None,
@@ -2784,7 +2844,7 @@ async fn load_session_response_includes_history_jsonl_path_in_meta()
                 session_id: session_id.0.to_string(),
                 cwd: workspace.clone(),
                 additional_directories: Vec::new(),
-                mode: PermissionPosture::Ask,
+                mode: SessionBehavior::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
@@ -2840,7 +2900,7 @@ async fn resume_session_response_includes_history_jsonl_path_in_meta()
                 session_id: session_id.0.to_string(),
                 cwd: workspace.clone(),
                 additional_directories: Vec::new(),
-                mode: PermissionPosture::Ask,
+                mode: SessionBehavior::Ask,
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,

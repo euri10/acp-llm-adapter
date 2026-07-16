@@ -9,7 +9,7 @@ use deepseek_acp_adapter::deepseek::ChatMessage;
 use deepseek_acp_adapter::error::SessionPersistenceError;
 use serde::{Deserialize, Serialize};
 
-use crate::{PermissionPosture, ReasoningEffort};
+use crate::{ReasoningEffort, SessionBehavior};
 
 const SESSIONS_DIR: &str = "sessions";
 const META_FILE: &str = "meta.json";
@@ -31,8 +31,8 @@ pub(crate) struct PersistedSessionMeta {
     pub(crate) cwd: PathBuf,
     /// Additional directories available to the session.
     pub(crate) additional_directories: Vec<PathBuf>,
-    /// Permission mode active for the session.
-    pub(crate) mode: PermissionPosture,
+    /// Session mode active for the session.
+    pub(crate) mode: SessionBehavior,
     /// Model selected for the session.
     pub(crate) model: String,
     /// `DeepSeek` reasoning effort selected for the session.

@@ -28,10 +28,11 @@ use uuid::Uuid;
 use crate::tools::ToolRegistry;
 use crate::{
     ADAPTER_NAME, ADAPTER_VERSION, AdapterState, FilesystemSessionStore, McpSession,
-    PermissionPosture, ReasoningEffort, SESSION_CONFIG_MAX_TOKENS_ID, SESSION_CONFIG_MODE_ID,
-    SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionRecord, SessionStore,
+    ReasoningEffort, SESSION_CONFIG_MAX_TOKENS_ID, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
+    SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, SessionStore,
     adapter_available_commands, connect_mcp_sessions, default_session_modes,
-    max_tokens_from_value_id, session_notification, tool_raw_input, validate_session_model,
+    max_tokens_from_value_id, session_modes, session_notification, tool_raw_input,
+    validate_session_model,
 };
 
 pub(crate) mod requesters;
@@ -391,7 +392,7 @@ pub(crate) async fn handle_load_session_request(
     replay_session_history(&session_id, &history, &mut notify)?;
 
     let mut response = LoadSessionResponse::new()
-        .modes(default_session_modes())
+        .modes(session_modes(store.session_behavior(&session_id)?))
         .config_options(store.session_config_options(&session_id)?);
     if let Some(meta) = store.session_meta(&session_id) {
         response = response.meta(meta);
@@ -408,7 +409,7 @@ pub(crate) async fn handle_resume_session_request(
         restore_persisted_session(store, &request.session_id, &request.cwd).await?;
 
     let mut response = ResumeSessionResponse::new()
-        .modes(default_session_modes())
+        .modes(session_modes(store.session_behavior(&session_id)?))
         .config_options(store.session_config_options(&session_id)?);
     if let Some(meta) = store.session_meta(&session_id) {
         response = response.meta(meta);
@@ -493,7 +494,7 @@ fn insert_session_record(
             additional_directories: request.additional_directories.clone(),
             history: Vec::new(),
             active_turn: None,
-            mode: PermissionPosture::Ask,
+            mode: SessionBehavior::Ask,
             model: default_model,
             reasoning_effort: ReasoningEffort::High,
             max_tokens: None,
@@ -628,7 +629,7 @@ pub(crate) fn handle_set_session_mode_request_notifying(
     request: &SetSessionModeRequest,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
-    let Some(mode) = PermissionPosture::from_mode_id(&request.mode_id) else {
+    let Some(mode) = SessionBehavior::from_mode_id(&request.mode_id) else {
         return Err(agent_client_protocol::Error::invalid_params()
             .data(format!("unsupported session mode: {}", request.mode_id.0)));
     };
@@ -659,7 +660,7 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
     match request.config_id.0.as_ref() {
         SESSION_CONFIG_MODE_ID => {
             let mode_id = agent_client_protocol::schema::SessionModeId::new(value.0.clone());
-            let Some(mode) = PermissionPosture::from_mode_id(&mode_id) else {
+            let Some(mode) = SessionBehavior::from_mode_id(&mode_id) else {
                 return Err(agent_client_protocol::Error::invalid_params()
                     .data(format!("unsupported session mode: {}", value.0)));
             };

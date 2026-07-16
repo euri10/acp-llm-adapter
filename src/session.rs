@@ -38,6 +38,7 @@ pub(crate) const PERMISSION_REJECT_ONCE_OPTION_ID: &str = "reject_once";
 pub(crate) const PERMISSION_REJECT_ALWAYS_OPTION_ID: &str = "reject_always";
 pub(crate) const SESSION_MODE_ASK_ID: &str = "ask";
 pub(crate) const SESSION_MODE_ACCEPT_EDITS_ID: &str = "accept-edits";
+pub(crate) const SESSION_MODE_PLAN_ID: &str = "plan";
 pub(crate) const SESSION_MODE_YOLO_ID: &str = "yolo";
 pub(crate) const SESSION_CONFIG_MODE_ID: &str = "mode";
 pub(crate) const SESSION_CONFIG_MODEL_ID: &str = "model";
@@ -68,25 +69,27 @@ pub(crate) enum PermissionDecision {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum PermissionPosture {
+pub(crate) enum SessionBehavior {
     #[default]
     Ask,
     AcceptEdits,
+    Plan,
     Yolo,
 }
 
-impl PermissionPosture {
+impl SessionBehavior {
     pub(crate) fn mode_id(self) -> SessionModeId {
         match self {
             Self::Ask => SessionModeId::new(SESSION_MODE_ASK_ID),
             Self::AcceptEdits => SessionModeId::new(SESSION_MODE_ACCEPT_EDITS_ID),
+            Self::Plan => SessionModeId::new(SESSION_MODE_PLAN_ID),
             Self::Yolo => SessionModeId::new(SESSION_MODE_YOLO_ID),
         }
     }
 
     pub(crate) const fn allows_without_prompt(self, kind: ToolKind) -> bool {
         match self {
-            Self::Ask => false,
+            Self::Ask | Self::Plan => false,
             Self::AcceptEdits => matches!(kind, ToolKind::Edit),
             Self::Yolo => !matches!(
                 kind,
@@ -99,6 +102,7 @@ impl PermissionPosture {
         match mode_id.0.as_ref() {
             SESSION_MODE_ASK_ID => Some(Self::Ask),
             SESSION_MODE_ACCEPT_EDITS_ID => Some(Self::AcceptEdits),
+            SESSION_MODE_PLAN_ID => Some(Self::Plan),
             SESSION_MODE_YOLO_ID => Some(Self::Yolo),
             _ => None,
         }
@@ -161,9 +165,9 @@ pub(crate) async fn request_tool_permission(
         return Ok(PermissionDecision::AllowAlways);
     }
 
-    let posture = store.permission_posture(&context.session_id)?;
+    let behavior = store.session_behavior(&context.session_id)?;
 
-    if posture.allows_without_prompt(kind) {
+    if behavior.allows_without_prompt(kind) {
         return Ok(PermissionDecision::AllowByMode);
     }
 
@@ -292,27 +296,32 @@ impl PendingToolCall {
     }
 }
 
-pub(crate) fn default_session_modes() -> SessionModeState {
+pub(crate) fn session_modes(current_mode: SessionBehavior) -> SessionModeState {
     SessionModeState::new(
-        PermissionPosture::Ask.mode_id(),
+        current_mode.mode_id(),
         vec![
-            SessionMode::new(PermissionPosture::Ask.mode_id(), "Ask"),
-            SessionMode::new(PermissionPosture::AcceptEdits.mode_id(), "Accept edits"),
-            SessionMode::new(PermissionPosture::Yolo.mode_id(), "Yolo"),
+            SessionMode::new(SessionBehavior::Ask.mode_id(), "Ask"),
+            SessionMode::new(SessionBehavior::AcceptEdits.mode_id(), "Accept edits"),
+            SessionMode::new(SessionBehavior::Plan.mode_id(), "Plan"),
+            SessionMode::new(SessionBehavior::Yolo.mode_id(), "Yolo"),
         ],
     )
+}
+
+pub(crate) fn default_session_modes() -> SessionModeState {
+    session_modes(SessionBehavior::Ask)
 }
 
 pub(crate) fn session_config_options(session: &SessionRecord) -> Vec<SessionConfigOption> {
     vec![
         SessionConfigOption::select(
             SESSION_CONFIG_MODE_ID,
-            "Approval Preset",
+            "Session Mode",
             session.mode.mode_id().0,
             session_mode_select_options(),
         )
         .category(SessionConfigOptionCategory::Mode)
-        .description("Choose how the adapter requests permission for tools."),
+        .description("Choose how the adapter behaves for tools and planning."),
         SessionConfigOption::select(
             SESSION_CONFIG_MODEL_ID,
             "Model",
@@ -340,7 +349,7 @@ pub(crate) fn session_config_options(session: &SessionRecord) -> Vec<SessionConf
 }
 
 fn session_mode_select_options() -> Vec<SessionConfigSelectOption> {
-    default_session_modes()
+    session_modes(SessionBehavior::Ask)
         .available_modes
         .into_iter()
         .map(|mode| SessionConfigSelectOption::new(mode.id.0, mode.name))
@@ -551,7 +560,7 @@ pub(crate) struct SessionRecord {
     pub(crate) additional_directories: Vec<PathBuf>,
     pub(crate) history: Vec<ChatMessage>,
     pub(crate) active_turn: Option<CancellationToken>,
-    pub(crate) mode: PermissionPosture,
+    pub(crate) mode: SessionBehavior,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
     /// Maximum tokens `DeepSeek` may generate per response. `None` means use
@@ -878,11 +887,11 @@ impl SessionStore {
         })
     }
 
-    /// Return the current permission posture (mode) for a session.
-    pub(crate) fn permission_posture(
+    /// Return the current session behavior (mode) for a session.
+    pub(crate) fn session_behavior(
         &self,
         session_id: &SessionId,
-    ) -> Result<PermissionPosture, AdapterError> {
+    ) -> Result<SessionBehavior, AdapterError> {
         self.with_session(session_id, |session| Ok(session.mode))
     }
 
@@ -916,11 +925,11 @@ impl SessionStore {
         })
     }
 
-    /// Set the permission posture (mode) for a session.
+    /// Set the session behavior (mode) for a session.
     pub(crate) fn set_mode(
         &self,
         session_id: &SessionId,
-        mode: PermissionPosture,
+        mode: SessionBehavior,
     ) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
             session.mode = mode;

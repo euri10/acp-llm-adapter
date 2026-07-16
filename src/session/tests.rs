@@ -1,5 +1,5 @@
 #![allow(clippy::indexing_slicing)]
-use super::{PendingToolCalls, PermissionDecision, PermissionPosture, ReasoningEffort};
+use super::{PendingToolCalls, PermissionDecision, ReasoningEffort, SessionBehavior};
 use agent_client_protocol::schema::SessionModeId;
 
 #[test]
@@ -122,37 +122,43 @@ fn pending_tool_calls_require_complete_metadata() -> Result<(), agent_client_pro
 }
 
 #[test]
-fn permission_posture_helpers_cover_all_branches() {
+fn session_behavior_helpers_cover_all_branches() {
     use crate::mcp::{is_mcp_tool_name, mcp_tool_kind};
     use agent_client_protocol::schema::ToolKind;
 
-    assert_eq!(PermissionPosture::Ask.mode_id().0.as_ref(), "ask");
+    assert_eq!(SessionBehavior::Ask.mode_id().0.as_ref(), "ask");
     assert_eq!(
-        PermissionPosture::AcceptEdits.mode_id().0.as_ref(),
+        SessionBehavior::AcceptEdits.mode_id().0.as_ref(),
         "accept-edits"
     );
-    assert_eq!(PermissionPosture::Yolo.mode_id().0.as_ref(), "yolo");
+    assert_eq!(SessionBehavior::Plan.mode_id().0.as_ref(), "plan");
+    assert_eq!(SessionBehavior::Yolo.mode_id().0.as_ref(), "yolo");
     assert_eq!(
-        PermissionPosture::from_mode_id(&SessionModeId::new("ask")),
-        Some(PermissionPosture::Ask)
+        SessionBehavior::from_mode_id(&SessionModeId::new("ask")),
+        Some(SessionBehavior::Ask)
     );
     assert_eq!(
-        PermissionPosture::from_mode_id(&SessionModeId::new("accept-edits")),
-        Some(PermissionPosture::AcceptEdits)
+        SessionBehavior::from_mode_id(&SessionModeId::new("accept-edits")),
+        Some(SessionBehavior::AcceptEdits)
     );
     assert_eq!(
-        PermissionPosture::from_mode_id(&SessionModeId::new("yolo")),
-        Some(PermissionPosture::Yolo)
+        SessionBehavior::from_mode_id(&SessionModeId::new("plan")),
+        Some(SessionBehavior::Plan)
     );
     assert_eq!(
-        PermissionPosture::from_mode_id(&SessionModeId::new("bogus")),
+        SessionBehavior::from_mode_id(&SessionModeId::new("yolo")),
+        Some(SessionBehavior::Yolo)
+    );
+    assert_eq!(
+        SessionBehavior::from_mode_id(&SessionModeId::new("bogus")),
         None
     );
-    assert!(!PermissionPosture::Ask.allows_without_prompt(ToolKind::Edit));
-    assert!(PermissionPosture::AcceptEdits.allows_without_prompt(ToolKind::Edit));
-    assert!(!PermissionPosture::AcceptEdits.allows_without_prompt(ToolKind::Execute));
-    assert!(PermissionPosture::Yolo.allows_without_prompt(ToolKind::Execute));
-    assert!(!PermissionPosture::Yolo.allows_without_prompt(ToolKind::Read));
+    assert!(!SessionBehavior::Ask.allows_without_prompt(ToolKind::Edit));
+    assert!(SessionBehavior::AcceptEdits.allows_without_prompt(ToolKind::Edit));
+    assert!(!SessionBehavior::AcceptEdits.allows_without_prompt(ToolKind::Execute));
+    assert!(!SessionBehavior::Plan.allows_without_prompt(ToolKind::Execute));
+    assert!(SessionBehavior::Yolo.allows_without_prompt(ToolKind::Execute));
+    assert!(!SessionBehavior::Yolo.allows_without_prompt(ToolKind::Read));
     assert!(is_mcp_tool_name("mcp__server__tool"));
     assert_eq!(mcp_tool_kind(), ToolKind::Execute);
 }

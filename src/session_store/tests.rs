@@ -1,6 +1,6 @@
 #![allow(clippy::indexing_slicing)]
 use super::{FilesystemSessionStore, PersistedSessionMeta};
-use crate::{PermissionPosture, ReasoningEffort};
+use crate::{ReasoningEffort, SessionBehavior};
 use agent_client_protocol::schema::SessionId;
 use deepseek_acp_adapter::deepseek::ChatMessage;
 use uuid::Uuid;
@@ -16,7 +16,7 @@ fn round_trips_session_metadata_and_history()
         session_id: "session-roundtrip".to_string(),
         cwd: cwd.clone(),
         additional_directories: vec![state_dir.join("extra")],
-        mode: PermissionPosture::Yolo,
+        mode: SessionBehavior::Plan,
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::Max,
         max_tokens: Some(8_192),
@@ -53,7 +53,7 @@ fn delete_session_removes_persisted_record()
         session_id: "session-delete".to_string(),
         cwd,
         additional_directories: vec![state_dir.join("extra")],
-        mode: PermissionPosture::Ask,
+        mode: SessionBehavior::Ask,
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::High,
         max_tokens: None,
@@ -66,6 +66,28 @@ fn delete_session_removes_persisted_record()
     assert!(store.delete_session("session-delete")?);
     assert!(store.load_record("session-delete").is_err());
     assert!(!store.delete_session("session-delete")?);
+
+    Ok(())
+}
+
+#[test]
+fn persisted_session_meta_deserializes_existing_modes()
+-> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    for mode_id in ["ask", "accept-edits", "yolo"] {
+        let meta: PersistedSessionMeta = serde_json::from_value(serde_json::json!({
+            "session_id": "session-legacy",
+            "cwd": "/tmp/workspace",
+            "additional_directories": [],
+            "mode": mode_id,
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": "high",
+            "max_tokens": null,
+            "mcp_servers": [],
+            "title": null,
+            "updated_at": null,
+        }))?;
+        assert_eq!(meta.mode.mode_id().0.as_ref(), mode_id);
+    }
 
     Ok(())
 }
