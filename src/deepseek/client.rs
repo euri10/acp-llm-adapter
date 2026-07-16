@@ -7,7 +7,6 @@ use sse_reqwest_client::RequestBuilderExt as _;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::config::SystemEnvironment;
 use super::stream::run_stream_attempt;
 use super::types::{ChatRequest, WireMessage, WireToolDefinition};
 use super::{DeepSeekConfig, DeepSeekError, StreamEvent};
@@ -62,9 +61,7 @@ impl DeepSeekClient {
     /// # Ok::<(), deepseek_acp_adapter::deepseek::DeepSeekError>(())
     /// ```
     pub fn from_env() -> Result<Self, DeepSeekError> {
-        Ok(Self::new(DeepSeekConfig::from_environment(
-            &SystemEnvironment,
-        )?))
+        Ok(Self::new(DeepSeekConfig::from_env()?))
     }
 
     /// Return the client configuration.

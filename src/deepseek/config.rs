@@ -1,5 +1,3 @@
-use std::env;
-
 use super::DeepSeekError;
 
 /// Configuration for the `DeepSeek` client.
@@ -64,27 +62,33 @@ impl DeepSeekConfig {
     /// # Ok::<(), deepseek_acp_adapter::deepseek::DeepSeekError>(())
     /// ```
     pub fn from_env() -> Result<Self, DeepSeekError> {
-        Self::from_environment(&SystemEnvironment)
+        Self::from_env_fn(|key| std::env::var_os(key).and_then(|value| value.into_string().ok()))
     }
 
-    pub(crate) fn from_environment(env: &impl Environment) -> Result<Self, DeepSeekError> {
-        let api_key = env
-            .var("DEEPSEEK_API_KEY")
-            .ok_or(DeepSeekError::MissingApiKey)?;
+    /// Load config from a caller-provided environment-variable lookup.
+    ///
+    /// This is the testable core of [`from_env`]; production code should use
+    /// [`from_env`] directly.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_env`].
+    pub(crate) fn from_env_fn(
+        mut get_env: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, DeepSeekError> {
+        let api_key = get_env("DEEPSEEK_API_KEY").ok_or(DeepSeekError::MissingApiKey)?;
 
         let api_key = api_key.trim().to_string();
         if api_key.is_empty() {
             return Err(DeepSeekError::MissingApiKey);
         }
 
-        let base_url = env
-            .var("DEEPSEEK_BASE_URL")
+        let base_url = get_env("DEEPSEEK_BASE_URL")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| Self::DEFAULT_BASE_URL.to_string());
 
-        let model = env
-            .var("DEEPSEEK_MODEL")
+        let model = get_env("DEEPSEEK_MODEL")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| Self::DEFAULT_MODEL.to_string());
@@ -110,17 +114,5 @@ impl DeepSeekConfig {
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
-    }
-}
-
-pub(crate) trait Environment {
-    fn var(&self, key: &str) -> Option<String>;
-}
-
-pub(crate) struct SystemEnvironment;
-
-impl Environment for SystemEnvironment {
-    fn var(&self, key: &str) -> Option<String> {
-        env::var_os(key).and_then(|value| value.into_string().ok())
     }
 }

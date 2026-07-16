@@ -1,5 +1,4 @@
 #![allow(clippy::indexing_slicing)]
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
@@ -8,22 +7,12 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use super::client::{DeepSeekClient, LlmClient};
-use super::config::{DeepSeekConfig, Environment};
+use super::config::DeepSeekConfig;
 use super::stream::parse_chat_completion_chunk;
 use super::{
     ChatMessage, ChatRequest, DeepSeekError, FinishReason, MessageRole, StreamEvent, ToolCall,
     ToolCallDelta, ToolDefinition,
 };
-
-struct FakeEnvironment {
-    values: BTreeMap<&'static str, &'static str>,
-}
-
-impl Environment for FakeEnvironment {
-    fn var(&self, key: &str) -> Option<String> {
-        self.values.get(key).map(|value| (*value).to_string())
-    }
-}
 
 async fn spawn_sse_server(
     response_body: String,
@@ -108,20 +97,15 @@ async fn spawn_sse_server(
 
 #[test_log::test]
 fn config_uses_defaults_and_requires_key() -> Result<(), DeepSeekError> {
-    let environment = FakeEnvironment {
-        values: BTreeMap::from([("DEEPSEEK_API_KEY", "secret")]),
-    };
-
-    let config = DeepSeekConfig::from_environment(&environment)?;
+    let config = DeepSeekConfig::from_env_fn(|key| match key {
+        "DEEPSEEK_API_KEY" => Some("secret".to_string()),
+        _ => None,
+    })?;
 
     assert_eq!(config.base_url(), DeepSeekConfig::DEFAULT_BASE_URL);
     assert_eq!(config.model(), DeepSeekConfig::DEFAULT_MODEL);
 
-    let missing_key = FakeEnvironment {
-        values: BTreeMap::new(),
-    };
-
-    let Err(error) = DeepSeekConfig::from_environment(&missing_key) else {
+    let Err(error) = DeepSeekConfig::from_env_fn(|_| None) else {
         return Err(DeepSeekError::InvalidResponse(
             "expected missing API key to fail".to_string(),
         ));
@@ -135,15 +119,12 @@ fn config_uses_defaults_and_requires_key() -> Result<(), DeepSeekError> {
 
 #[test_log::test]
 fn config_trims_values_and_defaults_blank_entries() -> Result<(), DeepSeekError> {
-    let environment = FakeEnvironment {
-        values: BTreeMap::from([
-            ("DEEPSEEK_API_KEY", "  secret-token  "),
-            ("DEEPSEEK_BASE_URL", "   "),
-            ("DEEPSEEK_MODEL", "  custom-model  "),
-        ]),
-    };
-
-    let config = DeepSeekConfig::from_environment(&environment)?;
+    let config = DeepSeekConfig::from_env_fn(|key| match key {
+        "DEEPSEEK_API_KEY" => Some("  secret-token  ".to_string()),
+        "DEEPSEEK_BASE_URL" => Some("   ".to_string()),
+        "DEEPSEEK_MODEL" => Some("  custom-model  ".to_string()),
+        _ => None,
+    })?;
 
     assert_eq!(config.base_url(), DeepSeekConfig::DEFAULT_BASE_URL);
     assert_eq!(config.model(), "custom-model");
@@ -533,12 +514,11 @@ async fn retries_stream_on_connection_drop_before_events() -> Result<(), DeepSee
 
 #[test_log::test]
 fn deepseek_config_rejects_blank_api_key_from_environment() {
-    let environment = FakeEnvironment {
-        values: BTreeMap::from([("DEEPSEEK_API_KEY", "   ")]),
-    };
-
     assert!(matches!(
-        DeepSeekConfig::from_environment(&environment),
+        DeepSeekConfig::from_env_fn(|key| match key {
+            "DEEPSEEK_API_KEY" => Some("   ".to_string()),
+            _ => None,
+        }),
         Err(DeepSeekError::MissingApiKey)
     ));
 }
