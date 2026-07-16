@@ -1,18 +1,22 @@
 #![allow(clippy::indexing_slicing)]
 use super::{ModelRequestSettings, handle_prompt_request, stream_model_turn};
 use crate::acp::{
-    ToolCallRequester, handle_delete_session_request, handle_new_session_request,
-    handle_set_session_config_option_request,
+    CreateTerminalRequester, KillTerminalRequester, PermissionRequester, ReadTextFileRequester,
+    ReleaseTerminalRequester, TerminalOutputRequester, ToolCallRequester,
+    WaitForTerminalExitRequester, WriteTextFileRequester, handle_delete_session_request,
+    handle_new_session_request, handle_set_session_config_option_request,
 };
 use crate::session::{DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionBehavior, SessionStore};
 use crate::test_store;
+use crate::test_utils::FakePermissionRequester;
 use crate::tools::{
     AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry,
 };
 use agent_client_protocol::schema::{
-    CancelNotification, ContentBlock, DeleteSessionRequest, PromptRequest, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus,
-    ToolKind,
+    CancelNotification, ContentBlock, DeleteSessionRequest, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    StopReason, ToolCallContent, ToolCallStatus, ToolKind,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, MessageRole, StreamEvent,
@@ -116,6 +120,204 @@ impl LlmClient for PendingLlmClient {
             Result<StreamEvent, DeepSeekError>,
         >()))
     }
+}
+
+struct TransitionRequester {
+    permission: FakePermissionRequester,
+}
+
+impl TransitionRequester {
+    fn new(responses: Vec<RequestPermissionResponse>) -> Self {
+        Self {
+            permission: FakePermissionRequester::new(responses),
+        }
+    }
+
+    fn requests(&self) -> Arc<Mutex<Vec<RequestPermissionRequest>>> {
+        self.permission.requests()
+    }
+}
+
+impl PermissionRequester for TransitionRequester {
+    fn request_permission(
+        &self,
+        request: RequestPermissionRequest,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+        self.permission.request_permission(request)
+    }
+}
+
+impl ReadTextFileRequester for TransitionRequester {
+    fn read_text_file(
+        &self,
+        _request: agent_client_protocol::schema::ReadTextFileRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<agent_client_protocol::schema::ReadTextFileResponse, agent_client_protocol::Error>,
+    > {
+        Box::pin(async move {
+            Err(agent_client_protocol::Error::internal_error()
+                .data("unexpected read_text_file request"))
+        })
+    }
+}
+
+impl WriteTextFileRequester for TransitionRequester {
+    fn write_text_file(
+        &self,
+        _request: agent_client_protocol::schema::WriteTextFileRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<agent_client_protocol::schema::WriteTextFileResponse, agent_client_protocol::Error>,
+    > {
+        Box::pin(async move {
+            Err(agent_client_protocol::Error::internal_error()
+                .data("unexpected write_text_file request"))
+        })
+    }
+}
+
+impl CreateTerminalRequester for TransitionRequester {
+    fn create_terminal(
+        &self,
+        _request: agent_client_protocol::schema::CreateTerminalRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<agent_client_protocol::schema::CreateTerminalResponse, agent_client_protocol::Error>,
+    > {
+        Box::pin(async move {
+            Err(agent_client_protocol::Error::internal_error()
+                .data("unexpected create_terminal request"))
+        })
+    }
+}
+
+impl TerminalOutputRequester for TransitionRequester {
+    fn terminal_output(
+        &self,
+        _request: agent_client_protocol::schema::TerminalOutputRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<agent_client_protocol::schema::TerminalOutputResponse, agent_client_protocol::Error>,
+    > {
+        Box::pin(async move {
+            Err(agent_client_protocol::Error::internal_error()
+                .data("unexpected terminal_output request"))
+        })
+    }
+}
+
+impl WaitForTerminalExitRequester for TransitionRequester {
+    fn wait_for_terminal_exit(
+        &self,
+        _request: agent_client_protocol::schema::WaitForTerminalExitRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            agent_client_protocol::schema::WaitForTerminalExitResponse,
+            agent_client_protocol::Error,
+        >,
+    > {
+        Box::pin(async move {
+            Err(agent_client_protocol::Error::internal_error()
+                .data("unexpected wait_for_terminal_exit request"))
+        })
+    }
+}
+
+impl ReleaseTerminalRequester for TransitionRequester {
+    fn release_terminal(
+        &self,
+        _request: agent_client_protocol::schema::ReleaseTerminalRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            agent_client_protocol::schema::ReleaseTerminalResponse,
+            agent_client_protocol::Error,
+        >,
+    > {
+        Box::pin(async move {
+            Err(agent_client_protocol::Error::internal_error()
+                .data("unexpected release_terminal request"))
+        })
+    }
+}
+
+impl KillTerminalRequester for TransitionRequester {
+    fn kill_terminal(
+        &self,
+        _request: agent_client_protocol::schema::KillTerminalRequest,
+    ) -> BoxFuture<
+        '_,
+        Result<agent_client_protocol::schema::KillTerminalResponse, agent_client_protocol::Error>,
+    > {
+        Box::pin(async move {
+            Err(agent_client_protocol::Error::internal_error()
+                .data("unexpected kill_terminal request"))
+        })
+    }
+}
+
+fn assert_plan_exit_prompt(request: &ChatRequest) {
+    assert_eq!(request.messages()[0].role(), MessageRole::System);
+    assert!(request.messages()[0].content().contains("Plan mode"));
+    assert!(
+        request
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "exit_plan_mode")
+    );
+    assert!(
+        !request
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "write_file")
+    );
+    assert!(
+        !request
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "run_command")
+    );
+}
+
+fn assert_exit_mode_transition_request(request: &RequestPermissionRequest) {
+    assert_eq!(request.options.len(), 3);
+    assert_eq!(
+        request
+            .options
+            .iter()
+            .map(|option| option.option_id.0.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["ask", "accept-edits", "yolo"]
+    );
+}
+
+fn assert_normal_request(request: &ChatRequest) {
+    assert!(
+        request
+            .messages()
+            .iter()
+            .all(|message| message.role() != MessageRole::System)
+    );
+    assert!(
+        request
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "write_file")
+    );
+    assert!(
+        request
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "run_command")
+    );
+    assert!(
+        request
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == "update_plan")
+    );
 }
 
 struct FakeToolRegistry {
@@ -651,6 +853,116 @@ async fn leaving_plan_mode_restores_normal_request_assembly()
             "mcp__server__tool".to_string(),
         ]
     );
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+
+    let client = FakeLlmClient::with_streams(vec![
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                0,
+                Some("call-exit".to_string()),
+                Some("exit_plan_mode".to_string()),
+                Some("{}".to_string()),
+            )))),
+            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::ToolCalls))),
+        ],
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::Message("work complete".to_string()))),
+            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::EndTurn))),
+        ],
+    ]);
+    let requests = client.requests();
+    let requester = TransitionRequester::new(vec![RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("ask")),
+    )]);
+    let requester_requests = requester.requests();
+    let registry = AdapterToolRegistry;
+    let mut notifications = Vec::new();
+
+    let response = handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        Some(&requester as &dyn ToolCallRequester),
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("make a plan")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |notification| {
+            notifications.push(notification);
+            Ok(())
+        },
+    )
+    .await?;
+
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert!(notifications.iter().any(|notification| matches!(
+        notification.update,
+        SessionUpdate::CurrentModeUpdate(ref update)
+            if update.current_mode_id.0.as_ref() == "ask"
+    )));
+
+    {
+        let request_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(request_guard.len(), 1);
+        assert_plan_exit_prompt(&request_guard[0]);
+    }
+
+    {
+        let transition_guard = requester_requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(transition_guard.len(), 1);
+        assert_exit_mode_transition_request(&transition_guard[0]);
+    }
+
+    {
+        let state_guard = store
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let stored = state_guard
+            .sessions
+            .get(&session.session_id)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::internal_error()
+                    .data("missing stored session after transition")
+            })?;
+        assert_eq!(stored.mode, SessionBehavior::Ask);
+    }
+
+    handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        PromptRequest::new(session.session_id, vec![ContentBlock::from("do the work")]),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    {
+        let request_guard = requests
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        assert_eq!(request_guard.len(), 2);
+        assert_normal_request(&request_guard[1]);
+    }
 
     Ok(())
 }

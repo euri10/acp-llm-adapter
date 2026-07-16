@@ -419,6 +419,7 @@ async fn run_prompt_turn(
             break;
         }
 
+        let mut pending_mode_transition = None;
         for tool_call in &turn.tool_calls {
             let tool_kind = env.tool_registry.kind(tool_call.name());
             report_tool_call(&env.request.session_id, notify, tool_call, tool_kind)?;
@@ -440,16 +441,34 @@ async fn run_prompt_turn(
                 ))
             };
             report_tool_result(&env.request.session_id, notify, tool_call, &tool_result)?;
+            if let Some(mode) = transition_mode_from_tool_result(tool_call, &tool_result)? {
+                pending_mode_transition = Some(mode);
+            }
             messages.push(ChatMessage::tool_result(
                 tool_call.id(),
                 tool_result.content_for_model(),
             ));
         }
 
+        if let Some(mode) = pending_mode_transition {
+            env.store.set_mode(&env.request.session_id, mode)?;
+        }
+
         // Persist after every complete turn cycle (assistant text + tool results).
         // If the process crashes during the next LLM stream, history up to this
         // point is already on disk and can be resumed.
         env.store.save_history(&env.request.session_id, &messages)?;
+
+        if let Some(mode) = pending_mode_transition {
+            notify(session_notification(
+                env.request.session_id.clone(),
+                SessionUpdate::CurrentModeUpdate(
+                    agent_client_protocol::schema::CurrentModeUpdate::new(mode.mode_id()),
+                ),
+            ))?;
+            stop_reason = StopReason::EndTurn;
+            break;
+        }
     }
 
     let acp_usage = (accumulated_input_tokens > 0 || accumulated_output_tokens > 0).then(|| {
@@ -460,6 +479,33 @@ async fn run_prompt_turn(
         )
     });
     Ok(PromptResponse::new(stop_reason).usage(acp_usage))
+}
+
+fn transition_mode_from_tool_result(
+    call: &DeepSeekToolCall,
+    result: &ToolExecution,
+) -> Result<Option<SessionBehavior>, AdapterError> {
+    if call.name() != "exit_plan_mode" || !result.success {
+        return Ok(None);
+    }
+
+    let Some(mode_id) = result
+        .raw_output
+        .get("mode_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Err(AdapterError::Internal(
+            "exit_plan_mode result is missing a mode_id".to_string(),
+        ));
+    };
+
+    let Some(mode) = SessionBehavior::from_mode_id_str(mode_id) else {
+        return Err(AdapterError::Internal(format!(
+            "exit_plan_mode returned unsupported mode: {mode_id}"
+        )));
+    };
+
+    Ok(Some(mode))
 }
 
 /// Stream a single LLM turn, collecting assistant text and pending tool calls.

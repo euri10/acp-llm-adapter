@@ -21,6 +21,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::registry::{ToolContext, ToolEdit, ToolExecution};
+use crate::session::request_plan_mode_exit;
 use crate::{
     PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionStore,
     TerminalRequester, WriteTextFileRequester, request_tool_permission,
@@ -220,6 +221,18 @@ pub(crate) fn update_plan_tool_definition() -> ToolDefinition {
     )
 }
 
+pub(crate) fn exit_plan_mode_tool_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "exit_plan_mode",
+        "Exit Plan mode by choosing another session mode.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }),
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct UpdatePlanArguments {
     entries: Vec<UpdatePlanEntryArguments>,
@@ -258,6 +271,40 @@ pub(crate) fn update_plan_tool_execution(call: &DeepSeekToolCall) -> ToolExecuti
         Err(error) => {
             ToolExecution::failed(format!("failed to serialize update_plan result: {error}"))
         }
+    }
+}
+
+pub(crate) async fn exit_plan_mode_tool_execution(
+    store: &SessionStore,
+    call: &DeepSeekToolCall,
+    context: &ToolContext,
+    requester: Option<&dyn PermissionRequester>,
+) -> ToolExecution {
+    let _arguments = match serde_json::from_str::<serde_json::Value>(call.arguments()) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return ToolExecution::failed(format!("invalid exit_plan_mode arguments: {error}"));
+        }
+    };
+
+    let Some(requester) = requester else {
+        return ToolExecution::failed(
+            "exit_plan_mode requires a client connection that can request permissions",
+        );
+    };
+
+    match request_plan_mode_exit(store, context, call, requester).await {
+        Ok(Some(mode)) => ToolExecution {
+            content: format!("switched to {} mode", mode.name()),
+            raw_output: serde_json::json!({
+                "mode_id": mode.mode_id().0,
+                "mode_name": mode.name(),
+            }),
+            success: true,
+            edit: None,
+        },
+        Ok(None) => ToolExecution::failed("plan mode exit was cancelled"),
+        Err(error) => ToolExecution::failed(format!("failed to exit plan mode: {error}")),
     }
 }
 

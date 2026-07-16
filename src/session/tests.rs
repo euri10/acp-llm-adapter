@@ -127,15 +127,23 @@ fn session_behavior_helpers_cover_all_branches() {
     use agent_client_protocol::schema::ToolKind;
 
     assert_eq!(SessionBehavior::Ask.mode_id().0.as_ref(), "ask");
+    assert_eq!(SessionBehavior::Ask.name(), "Ask");
     assert_eq!(
         SessionBehavior::AcceptEdits.mode_id().0.as_ref(),
         "accept-edits"
     );
+    assert_eq!(SessionBehavior::AcceptEdits.name(), "Accept edits");
     assert_eq!(SessionBehavior::Plan.mode_id().0.as_ref(), "plan");
+    assert_eq!(SessionBehavior::Plan.name(), "Plan");
     assert_eq!(SessionBehavior::Yolo.mode_id().0.as_ref(), "yolo");
+    assert_eq!(SessionBehavior::Yolo.name(), "Yolo");
     assert_eq!(
         SessionBehavior::from_mode_id(&SessionModeId::new("ask")),
         Some(SessionBehavior::Ask)
+    );
+    assert_eq!(
+        SessionBehavior::from_mode_id_str("accept-edits"),
+        Some(SessionBehavior::AcceptEdits)
     );
     assert_eq!(
         SessionBehavior::from_mode_id(&SessionModeId::new("accept-edits")),

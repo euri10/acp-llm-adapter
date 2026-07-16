@@ -10,8 +10,9 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::execution::{
-    edit_file_tool_definition, edit_file_tool_execution, glob_tool_definition, glob_tool_execution,
-    grep_tool_definition, grep_tool_execution, list_dir_tool_definition, list_dir_tool_execution,
+    edit_file_tool_definition, edit_file_tool_execution, exit_plan_mode_tool_definition,
+    exit_plan_mode_tool_execution, glob_tool_definition, glob_tool_execution, grep_tool_definition,
+    grep_tool_execution, list_dir_tool_definition, list_dir_tool_execution,
     read_file_tool_definition, read_file_tool_execution, run_command_tool_definition,
     run_command_tool_execution, update_plan_tool_definition, update_plan_tool_execution,
     write_file_tool_definition, write_file_tool_execution,
@@ -102,6 +103,9 @@ impl ToolRegistry for AdapterToolRegistry {
             run_command_tool_definition(),
             update_plan_tool_definition(),
         ];
+        if store.session_behavior(&context.session_id)? == crate::SessionBehavior::Plan {
+            definitions.push(exit_plan_mode_tool_definition());
+        }
         definitions.extend(store.mcp_definitions(&context.session_id)?);
         Ok(definitions)
     }
@@ -112,7 +116,7 @@ impl ToolRegistry for AdapterToolRegistry {
             "glob" | "grep" => ToolKind::Search,
             "write_file" | "edit_file" => ToolKind::Edit,
             "run_command" => ToolKind::Execute,
-            "update_plan" => ToolKind::Think,
+            "update_plan" | "exit_plan_mode" => ToolKind::Think,
             name if crate::is_mcp_tool_name(name) => crate::mcp_tool_kind(),
             _ => ToolKind::Other,
         }
@@ -173,6 +177,15 @@ impl ToolRegistry for AdapterToolRegistry {
                     .await
                 }
                 "update_plan" => update_plan_tool_execution(call),
+                "exit_plan_mode" => {
+                    exit_plan_mode_tool_execution(
+                        store,
+                        call,
+                        context,
+                        connection.map(|requester| requester as &dyn crate::PermissionRequester),
+                    )
+                    .await
+                }
                 name if crate::is_mcp_tool_name(name) => {
                     crate::mcp_tool_execution(store, call, context).await
                 }
@@ -402,10 +415,11 @@ mod tests {
     }
 
     #[test]
-    fn adapter_registry_definitions_include_update_plan() -> Result<(), AdapterError> {
+    fn adapter_registry_definitions_include_plan_tools() -> Result<(), AdapterError> {
         let registry = AdapterToolRegistry;
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        store.set_mode(&session.session_id, crate::SessionBehavior::Plan)?;
         let context = ToolContext {
             session_id: session.session_id,
             cwd: std::path::PathBuf::from("/tmp"),
@@ -419,7 +433,13 @@ mod tests {
                 .iter()
                 .any(|definition| definition.name() == "update_plan")
         );
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.name() == "exit_plan_mode")
+        );
         assert_eq!(registry.kind("update_plan"), ToolKind::Think);
+        assert_eq!(registry.kind("exit_plan_mode"), ToolKind::Think);
         Ok(())
     }
 

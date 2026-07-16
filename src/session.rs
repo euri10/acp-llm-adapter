@@ -78,12 +78,31 @@ pub(crate) enum SessionBehavior {
 }
 
 impl SessionBehavior {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask",
+            Self::AcceptEdits => "Accept edits",
+            Self::Plan => "Plan",
+            Self::Yolo => "Yolo",
+        }
+    }
+
     pub(crate) fn mode_id(self) -> SessionModeId {
         match self {
             Self::Ask => SessionModeId::new(SESSION_MODE_ASK_ID),
             Self::AcceptEdits => SessionModeId::new(SESSION_MODE_ACCEPT_EDITS_ID),
             Self::Plan => SessionModeId::new(SESSION_MODE_PLAN_ID),
             Self::Yolo => SessionModeId::new(SESSION_MODE_YOLO_ID),
+        }
+    }
+
+    pub(crate) fn from_mode_id_str(mode_id: &str) -> Option<Self> {
+        match mode_id {
+            SESSION_MODE_ASK_ID => Some(Self::Ask),
+            SESSION_MODE_ACCEPT_EDITS_ID => Some(Self::AcceptEdits),
+            SESSION_MODE_PLAN_ID => Some(Self::Plan),
+            SESSION_MODE_YOLO_ID => Some(Self::Yolo),
+            _ => None,
         }
     }
 
@@ -109,13 +128,7 @@ impl SessionBehavior {
     }
 
     pub(crate) fn from_mode_id(mode_id: &SessionModeId) -> Option<Self> {
-        match mode_id.0.as_ref() {
-            SESSION_MODE_ASK_ID => Some(Self::Ask),
-            SESSION_MODE_ACCEPT_EDITS_ID => Some(Self::AcceptEdits),
-            SESSION_MODE_PLAN_ID => Some(Self::Plan),
-            SESSION_MODE_YOLO_ID => Some(Self::Yolo),
-            _ => None,
-        }
+        Self::from_mode_id_str(mode_id.0.as_ref())
     }
 }
 
@@ -225,6 +238,66 @@ pub(crate) async fn request_tool_permission(
     Ok(decision)
 }
 
+/// Ask the client which mode should replace Plan mode and return the choice.
+///
+/// # Errors
+///
+/// Returns an [`AdapterError`] when the session is not in Plan mode, the
+/// permission request cannot be sent, or the client returns an unrecognized
+/// outcome.
+pub(crate) async fn request_plan_mode_exit(
+    store: &SessionStore,
+    context: &ToolContext,
+    call: &DeepSeekToolCall,
+    requester: &dyn PermissionRequester,
+) -> Result<Option<SessionBehavior>, AdapterError> {
+    if store.session_behavior(&context.session_id)? != SessionBehavior::Plan {
+        return Err(AdapterError::InvalidRequest(
+            "plan mode exit is only available while in Plan mode".to_string(),
+        ));
+    }
+
+    let request = RequestPermissionRequest::new(
+        context.session_id.clone(),
+        ToolCallUpdate::new(
+            call.id().to_string(),
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::Think)
+                .status(ToolCallStatus::Pending)
+                .title("Exit plan mode")
+                .raw_input(tool_raw_input(call)),
+        ),
+        plan_mode_exit_options(),
+    );
+
+    let response = requester
+        .request_permission(request)
+        .await
+        .map_err(|error| AdapterError::Internal(error.to_string()))?;
+
+    match response.outcome {
+        RequestPermissionOutcome::Cancelled => Ok(None),
+        RequestPermissionOutcome::Selected(selected) => {
+            let Some(mode) = SessionBehavior::from_mode_id_str(selected.option_id.0.as_ref())
+            else {
+                return Err(AdapterError::InvalidParams(format!(
+                    "unknown plan mode transition option selected: {}",
+                    selected.option_id.0
+                )));
+            };
+            if mode == SessionBehavior::Plan {
+                return Err(AdapterError::InvalidParams(
+                    "plan mode exit cannot select Plan mode".to_string(),
+                ));
+            }
+            Ok(Some(mode))
+        }
+        _ => Err(AdapterError::InvalidParams(
+            "unsupported permission outcome variant".to_string(),
+        )),
+    }
+}
+
 fn permission_options() -> Vec<PermissionOption> {
     vec![
         PermissionOption::new(
@@ -248,6 +321,23 @@ fn permission_options() -> Vec<PermissionOption> {
             PermissionOptionKind::RejectAlways,
         ),
     ]
+}
+
+fn plan_mode_exit_options() -> Vec<PermissionOption> {
+    [
+        SessionBehavior::Ask,
+        SessionBehavior::AcceptEdits,
+        SessionBehavior::Yolo,
+    ]
+    .into_iter()
+    .map(|mode| {
+        PermissionOption::new(
+            mode.mode_id().0.to_string(),
+            mode.name().to_string(),
+            PermissionOptionKind::AllowOnce,
+        )
+    })
+    .collect()
 }
 
 #[derive(Debug, Default)]
@@ -310,10 +400,19 @@ pub(crate) fn session_modes(current_mode: SessionBehavior) -> SessionModeState {
     SessionModeState::new(
         current_mode.mode_id(),
         vec![
-            SessionMode::new(SessionBehavior::Ask.mode_id(), "Ask"),
-            SessionMode::new(SessionBehavior::AcceptEdits.mode_id(), "Accept edits"),
-            SessionMode::new(SessionBehavior::Plan.mode_id(), "Plan"),
-            SessionMode::new(SessionBehavior::Yolo.mode_id(), "Yolo"),
+            SessionMode::new(SessionBehavior::Ask.mode_id(), SessionBehavior::Ask.name()),
+            SessionMode::new(
+                SessionBehavior::AcceptEdits.mode_id(),
+                SessionBehavior::AcceptEdits.name(),
+            ),
+            SessionMode::new(
+                SessionBehavior::Plan.mode_id(),
+                SessionBehavior::Plan.name(),
+            ),
+            SessionMode::new(
+                SessionBehavior::Yolo.mode_id(),
+                SessionBehavior::Yolo.name(),
+            ),
         ],
     )
 }
