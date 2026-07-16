@@ -573,6 +573,89 @@ async fn plan_mode_refuses_disallowed_tool_calls_before_execution()
 }
 
 #[test_log::test(tokio::test)]
+async fn leaving_plan_mode_restores_normal_request_assembly()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+    )?;
+    let client = FakeLlmClient::with_streams(vec![
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::Message("plan complete".to_string()))),
+            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::EndTurn))),
+        ],
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::Message("work complete".to_string()))),
+            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::EndTurn))),
+        ],
+    ]);
+    let requests = client.requests();
+    let registry = PlanModeToolRegistry::new();
+
+    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+    handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("make a plan")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    store.set_mode(&session.session_id, SessionBehavior::Ask)?;
+    handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        PromptRequest::new(session.session_id, vec![ContentBlock::from("do the work")]),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    let request_guard = requests
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    assert_eq!(request_guard.len(), 2);
+    assert_eq!(request_guard[0].messages().len(), 2);
+    assert_eq!(request_guard[0].messages()[0].role(), MessageRole::System);
+    assert!(
+        request_guard[1]
+            .messages()
+            .iter()
+            .all(|message| message.role() != MessageRole::System)
+    );
+    assert_eq!(
+        request_guard[1].messages().last().map(ChatMessage::content),
+        Some("do the work")
+    );
+    let tool_names = request_guard[1]
+        .tools()
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_names,
+        vec![
+            "read_file".to_string(),
+            "update_plan".to_string(),
+            "write_file".to_string(),
+            "run_command".to_string(),
+            "mcp__server__tool".to_string(),
+        ]
+    );
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let session = handle_new_session_request(
