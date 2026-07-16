@@ -3,7 +3,7 @@
 //! These traits abstract over ACP client connections so that tool execution and
 //! permission logic can be unit-tested without a real transport.
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionRequest, RequestPermissionResponse, TerminalOutputRequest,

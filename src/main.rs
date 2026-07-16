@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
     SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
 };
@@ -359,7 +359,7 @@ fn text_from_prompt(prompt: &[ContentBlock]) -> Result<String, AdapterError> {
     Ok(text)
 }
 
-fn resource_link_prompt_text(link: &agent_client_protocol::schema::ResourceLink) -> String {
+fn resource_link_prompt_text(link: &agent_client_protocol::schema::v1::ResourceLink) -> String {
     let display_name = link.title.as_deref().unwrap_or(link.name.as_str());
     let mut rendered = String::new();
     rendered.push_str("[resource] ");
@@ -377,7 +377,7 @@ fn resource_link_prompt_text(link: &agent_client_protocol::schema::ResourceLink)
 }
 
 fn resource_text_prompt_text(
-    contents: &agent_client_protocol::schema::TextResourceContents,
+    contents: &agent_client_protocol::schema::v1::TextResourceContents,
 ) -> String {
     let mut rendered = String::new();
     rendered.push_str("[resource] <");
@@ -388,7 +388,7 @@ fn resource_text_prompt_text(
 }
 
 fn session_notification(
-    session_id: agent_client_protocol::schema::SessionId,
+    session_id: agent_client_protocol::schema::v1::SessionId,
     update: SessionUpdate,
 ) -> SessionNotification {
     SessionNotification::new(session_id, update)
@@ -423,7 +423,7 @@ mod tests {
         text_from_prompt,
     };
     use crate::acp::validate_session_paths;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
         ImageContent, NewSessionRequest, ResourceLink, StopReason, TextResourceContents,
     };
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn session_notification_creates_correct_notification() {
         use super::session_notification;
-        use agent_client_protocol::schema::{CurrentModeUpdate, SessionId, SessionUpdate};
+        use agent_client_protocol::schema::v1::{CurrentModeUpdate, SessionId, SessionUpdate};
 
         let session_id = SessionId::new("test-session");
         let update = SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("chat"));
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn resource_text_prompt_text_renders_uri_and_content() {
         use super::resource_text_prompt_text;
-        use agent_client_protocol::schema::TextResourceContents;
+        use agent_client_protocol::schema::v1::TextResourceContents;
 
         let contents = TextResourceContents::new("file body", "file:///tmp/notes.txt");
         let rendered = resource_text_prompt_text(&contents);
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn resource_link_prompt_text_without_description() {
         use super::resource_link_prompt_text;
-        use agent_client_protocol::schema::ResourceLink;
+        use agent_client_protocol::schema::v1::ResourceLink;
         let link = ResourceLink::new("docs_name", "file:///ref.md");
         let rendered = resource_link_prompt_text(&link);
         assert!(rendered.contains("docs_name"));
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn resource_text_prompt_text_basic() {
         use super::resource_text_prompt_text;
-        use agent_client_protocol::schema::TextResourceContents;
+        use agent_client_protocol::schema::v1::TextResourceContents;
         let contents = TextResourceContents::new("body text", "file:///ctx.md");
         let rendered = resource_text_prompt_text(&contents);
         assert!(rendered.contains("[resource]"));

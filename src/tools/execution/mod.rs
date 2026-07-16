@@ -5,7 +5,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, KillTerminalRequest, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, ReadTextFileRequest, ReleaseTerminalRequest, SessionId, TerminalOutputRequest,
     ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,

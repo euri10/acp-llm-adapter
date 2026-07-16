@@ -4,16 +4,17 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, DeleteSessionRequest,
     DeleteSessionResponse, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, MessageId,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion,
-    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
     SessionDeleteCapabilities, SessionId, SessionListCapabilities, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
@@ -659,7 +660,7 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
 
     match request.config_id.0.as_ref() {
         SESSION_CONFIG_MODE_ID => {
-            let mode_id = agent_client_protocol::schema::SessionModeId::new(value.0.clone());
+            let mode_id = agent_client_protocol::schema::v1::SessionModeId::new(value.0.clone());
             let Some(mode) = SessionBehavior::from_mode_id(&mode_id) else {
                 return Err(agent_client_protocol::Error::invalid_params()
                     .data(format!("unsupported session mode: {}", value.0)));
@@ -738,7 +739,8 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
             AgentCapabilities::new()
                 .load_session(true)
                 .prompt_capabilities(
-                    agent_client_protocol::schema::PromptCapabilities::new().embedded_context(true),
+                    agent_client_protocol::schema::v1::PromptCapabilities::new()
+                        .embedded_context(true),
                 )
                 .mcp_capabilities(McpCapabilities::new().http(true))
                 .session_capabilities(

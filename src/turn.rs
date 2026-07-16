@@ -2,7 +2,7 @@
 
 use std::num::NonZeroUsize;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     ContentChunk, Diff, MessageId, Plan, PromptRequest, PromptResponse, SessionId,
     SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason, ToolCall as AcpToolCall,
     ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
@@ -463,7 +463,7 @@ async fn run_prompt_turn(
             notify(session_notification(
                 env.request.session_id.clone(),
                 SessionUpdate::CurrentModeUpdate(
-                    agent_client_protocol::schema::CurrentModeUpdate::new(mode.mode_id()),
+                    agent_client_protocol::schema::v1::CurrentModeUpdate::new(mode.mode_id()),
                 ),
             ))?;
             stop_reason = StopReason::EndTurn;

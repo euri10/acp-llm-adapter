@@ -1,6 +1,6 @@
 #![allow(clippy::indexing_slicing)]
 use super::{PendingToolCalls, PermissionDecision, ReasoningEffort, SessionBehavior};
-use agent_client_protocol::schema::SessionModeId;
+use agent_client_protocol::schema::v1::SessionModeId;
 
 #[test]
 fn permission_decision_debug_impl_is_callable() {
@@ -36,16 +36,16 @@ fn reasoning_effort_name_and_description() {
 #[test]
 fn reasoning_effort_from_value_id_rejects_unknown() {
     assert!(
-        ReasoningEffort::from_value_id(&agent_client_protocol::schema::SessionConfigValueId::new(
-            "bogus",
-        ))
+        ReasoningEffort::from_value_id(
+            &agent_client_protocol::schema::v1::SessionConfigValueId::new("bogus")
+        )
         .is_none()
     );
 }
 
 #[test]
 fn max_tokens_value_id_round_trips_default_and_preset() {
-    use agent_client_protocol::schema::SessionConfigValueId;
+    use agent_client_protocol::schema::v1::SessionConfigValueId;
 
     assert_eq!(super::max_tokens_value_id(None), "default");
     assert_eq!(super::max_tokens_value_id(Some(8_192)), "8192");
@@ -62,7 +62,7 @@ fn max_tokens_value_id_round_trips_default_and_preset() {
 
 #[test]
 fn max_tokens_from_value_id_rejects_zero_and_non_numeric() {
-    use agent_client_protocol::schema::SessionConfigValueId;
+    use agent_client_protocol::schema::v1::SessionConfigValueId;
 
     assert!(super::max_tokens_from_value_id(&SessionConfigValueId::new("0")).is_err());
     assert!(super::max_tokens_from_value_id(&SessionConfigValueId::new("bogus")).is_err());
@@ -124,7 +124,7 @@ fn pending_tool_calls_require_complete_metadata() -> Result<(), agent_client_pro
 #[test]
 fn session_behavior_helpers_cover_all_branches() {
     use crate::mcp::{is_mcp_tool_name, mcp_tool_kind};
-    use agent_client_protocol::schema::ToolKind;
+    use agent_client_protocol::schema::v1::ToolKind;
 
     assert_eq!(SessionBehavior::Ask.mode_id().0.as_ref(), "ask");
     assert_eq!(SessionBehavior::Ask.name(), "Ask");

@@ -11,11 +11,12 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PermissionOptionKind, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, SessionUpdate, StopReason,
+    NewSessionResponse, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+    StopReason,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Client, ConnectTo, SessionMessage};
@@ -279,7 +280,7 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
         &store,
         &context,
         &call,
-        agent_client_protocol::schema::ToolKind::Edit,
+        agent_client_protocol::schema::v1::ToolKind::Edit,
         &MockPermissionRequester,
     )
     .await?;
@@ -313,10 +314,11 @@ mod tests {
     use crate::session::DEFAULT_MAX_TURN_REQUESTS;
     use crate::tools::EmptyToolRegistry;
     use agent_client_protocol::Channel;
-    use agent_client_protocol::schema::{
-        McpServer, PermissionOption, PermissionOptionKind, ProtocolVersion,
-        RequestPermissionOutcome, RequestPermissionRequest, SessionId, StopReason, ToolCallStatus,
-        ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::schema::v1::{
+        McpServer, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
+        RequestPermissionRequest, SessionId, StopReason, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields, ToolKind,
     };
     use deepseek_acp_adapter::deepseek::{
         ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent,
@@ -417,7 +419,7 @@ mod tests {
     fn print_dev_smoke_result_is_callable() {
         let result = DevSmokeResult {
             initialize_response: build_initialize_response(ProtocolVersion::LATEST),
-            new_session_response: agent_client_protocol::schema::NewSessionResponse::new(
+            new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
                 "session-1",
             ),
             updates: vec!["update-1".to_string()],
@@ -608,7 +610,7 @@ mod tests {
     fn dev_smoke_result_clones() {
         let original = DevSmokeResult {
             initialize_response: build_initialize_response(ProtocolVersion::LATEST),
-            new_session_response: agent_client_protocol::schema::NewSessionResponse::new(
+            new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
                 "session-clone",
             ),
             updates: vec!["clone-me".to_string()],
@@ -633,7 +635,7 @@ mod tests {
     fn print_dev_smoke_result_handles_empty_updates() {
         let result = DevSmokeResult {
             initialize_response: build_initialize_response(ProtocolVersion::LATEST),
-            new_session_response: agent_client_protocol::schema::NewSessionResponse::new(
+            new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
                 "session-empty",
             ),
             updates: vec![],

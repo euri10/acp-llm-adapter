@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     ClientCapabilities, McpServer, PermissionOption, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,

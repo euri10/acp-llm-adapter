@@ -1,7 +1,7 @@
 #![allow(clippy::indexing_slicing)]
 use super::{FilesystemSessionStore, PersistedSessionMeta};
 use crate::{ReasoningEffort, SessionBehavior};
-use agent_client_protocol::schema::SessionId;
+use agent_client_protocol::schema::v1::SessionId;
 use deepseek_acp_adapter::deepseek::ChatMessage;
 use uuid::Uuid;
 

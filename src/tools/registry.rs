@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use agent_client_protocol::schema::{SessionId, ToolCallStatus, ToolKind};
+use agent_client_protocol::schema::v1::{SessionId, ToolCallStatus, ToolKind};
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
 use deepseek_acp_adapter::error::AdapterError;
 use futures_util::future::BoxFuture;
@@ -24,7 +24,7 @@ pub(crate) struct ToolContext {
     pub(crate) session_id: SessionId,
     pub(crate) cwd: PathBuf,
     pub(crate) additional_directories: Vec<PathBuf>,
-    pub(crate) client_capabilities: Option<agent_client_protocol::schema::ClientCapabilities>,
+    pub(crate) client_capabilities: Option<agent_client_protocol::schema::v1::ClientCapabilities>,
 }
 
 /// Registry for tools the model can call during a turn.
@@ -254,7 +254,7 @@ mod tests {
     use crate::acp::handle_new_session_request;
     use crate::session::PERMISSION_ALLOW_ONCE_OPTION_ID;
     use crate::test_store;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         ClientCapabilities, CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities,
         KillTerminalRequest, KillTerminalResponse, NewSessionRequest, ReadTextFileRequest,
         ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
@@ -391,7 +391,7 @@ mod tests {
 
     fn registry_context(cwd: std::path::PathBuf) -> ToolContext {
         ToolContext {
-            session_id: agent_client_protocol::schema::SessionId::new("session-registry-test"),
+            session_id: agent_client_protocol::schema::v1::SessionId::new("session-registry-test"),
             cwd,
             additional_directories: Vec::new(),
             client_capabilities: None,

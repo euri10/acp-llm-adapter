@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionRequest, RequestPermissionResponse, SessionConfigKind, SessionConfigOption,
@@ -159,7 +159,7 @@ impl PermissionRequester for FakePermissionRequester {
 
 pub(crate) type PermissionModeFixture = (
     SessionStore,
-    agent_client_protocol::schema::SessionId,
+    agent_client_protocol::schema::v1::SessionId,
     ToolContext,
     DeepSeekToolCall,
     DeepSeekToolCall,
@@ -171,7 +171,7 @@ pub(crate) fn permission_mode_fixture()
     let store = test_store();
     let session = crate::acp::handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
     )?;
     let context = ToolContext {
         session_id: session.session_id.clone(),

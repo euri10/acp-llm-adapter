@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use agent_client_protocol::schema::{McpServer, SessionId, SessionInfo};
+use agent_client_protocol::schema::v1::{McpServer, SessionId, SessionInfo};
 use deepseek_acp_adapter::deepseek::ChatMessage;
 use deepseek_acp_adapter::error::SessionPersistenceError;
 use serde::{Deserialize, Serialize};

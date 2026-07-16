@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     HttpHeader, McpServer, McpServerHttp, McpServerStdio, ToolKind,
 };
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
