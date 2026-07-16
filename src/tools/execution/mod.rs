@@ -29,6 +29,13 @@ use crate::{
 const TOOL_OUTPUT_LIMIT: usize = 200;
 const TOOL_OUTPUT_LIMIT_U32: u32 = 200;
 const COMMAND_OUTPUT_LIMIT: usize = 20_000;
+/// Character ceiling for file-content tool results (`read_file`, `grep`).
+///
+/// The line/entry caps ([`TOOL_OUTPUT_LIMIT`]) already bound normal files. This
+/// is a safety net for pathological wide-line inputs (e.g. minified assets)
+/// whose single lines would otherwise add multi-megabyte tool results to the
+/// conversation history and eventually 400 the `DeepSeek` API.
+const FILE_OUTPUT_LIMIT: usize = 65_536;
 
 #[derive(Debug, Deserialize)]
 struct ReadFileArguments {
@@ -307,7 +314,7 @@ pub(crate) async fn read_file_tool_execution(
 
     match file_result {
         Ok(file_slice) => ToolExecution {
-            content: file_slice,
+            content: truncate_tool_output(&file_slice, FILE_OUTPUT_LIMIT).0,
             raw_output: serde_json::json!({
                 "path": resolved_path,
                 "line": start_line,
@@ -842,7 +849,7 @@ pub(crate) fn grep_tool_execution(call: &DeepSeekToolCall, context: &ToolContext
     let output_text = render_tool_lines(&lines, truncated, "matches", TOOL_OUTPUT_LIMIT);
 
     ToolExecution {
-        content: output_text,
+        content: truncate_tool_output(&output_text, FILE_OUTPUT_LIMIT).0,
         raw_output: serde_json::json!({
             "pattern": parsed_arguments.pattern,
             "matches": lines,

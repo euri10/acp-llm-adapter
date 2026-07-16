@@ -1975,3 +1975,78 @@ fn collect_directory_entries_inner_read_error_path() {
         let _ = result;
     }
 }
+
+#[test_log::test(tokio::test)]
+async fn read_file_tool_byte_caps_pathological_wide_line()
+-> Result<(), agent_client_protocol::Error> {
+    // Regression test for daa-8q1: a minified-style file is few lines but each
+    // line is huge. The line-count cap alone lets a single line add a multi-MB
+    // tool result to history; FILE_OUTPUT_LIMIT must bound it.
+    let temp_root = std::env::temp_dir().join(format!(
+        "deepseek-acp-adapter-widecap-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&temp_root)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let huge_line = "x".repeat(FILE_OUTPUT_LIMIT * 4);
+    std::fs::write(temp_root.join("min.js"), format!("{huge_line}\n"))
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    let context = ToolContext {
+        session_id: agent_client_protocol::schema::SessionId::new("session-widecap"),
+        cwd: temp_root.clone(),
+        additional_directories: Vec::new(),
+        client_capabilities: None,
+    };
+    let call = DeepSeekToolCall::new(
+        "call-widecap",
+        "read_file",
+        serde_json::json!({ "path": "min.js" }).to_string(),
+    );
+
+    let result = read_file_tool_execution(&call, &context, None).await;
+
+    assert!(result.success);
+    assert!(result.content.chars().count() <= FILE_OUTPUT_LIMIT + 64);
+    assert!(result.content.contains("... truncated after"));
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn grep_tool_byte_caps_wide_matches() -> Result<(), agent_client_protocol::Error> {
+    // Regression test for daa-8q1: grep emits full match lines. Matching in a
+    // minified file yields enormous per-line matches; FILE_OUTPUT_LIMIT bounds
+    // the content that reaches the model and history.
+    let temp_root = std::env::temp_dir().join(format!(
+        "deepseek-acp-adapter-grepcap-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&temp_root)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let huge_line = format!("needle{}", "x".repeat(FILE_OUTPUT_LIMIT * 4));
+    std::fs::write(temp_root.join("min.js"), format!("{huge_line}\n"))
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    let context = ToolContext {
+        session_id: agent_client_protocol::schema::SessionId::new("session-grepcap"),
+        cwd: temp_root.clone(),
+        additional_directories: Vec::new(),
+        client_capabilities: None,
+    };
+
+    let result = grep_tool_execution(
+        &DeepSeekToolCall::new(
+            "call-grepcap",
+            "grep",
+            serde_json::json!({ "pattern": "needle" }).to_string(),
+        ),
+        &context,
+    );
+
+    assert!(result.success);
+    assert!(result.content.chars().count() <= FILE_OUTPUT_LIMIT + 64);
+    assert!(result.content.contains("... truncated after"));
+
+    Ok(())
+}
