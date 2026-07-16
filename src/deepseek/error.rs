@@ -1,3 +1,5 @@
+use std::error::Error as StdError;
+
 use thiserror::Error;
 
 /// Errors returned by `DeepSeek` configuration, request setup, or SSE parsing.
@@ -6,12 +8,9 @@ pub enum DeepSeekError {
     /// The `DEEPSEEK_API_KEY` environment variable was not set or was empty.
     #[error("DEEPSEEK_API_KEY is not set")]
     MissingApiKey,
-    /// The request could not be cloned for SSE streaming.
-    #[error("failed to clone DeepSeek streaming request: {0}")]
-    RequestClone(#[from] reqwest_eventsource::CannotCloneRequestError),
     /// The SSE transport failed while streaming events.
     #[error("`DeepSeek` SSE transport error: {0}")]
-    Transport(Box<reqwest_eventsource::Error>),
+    Transport(#[source] Box<dyn StdError + Send + Sync>),
     /// The model returned a chunk that could not be decoded.
     #[error("invalid DeepSeek response: {0}")]
     InvalidResponse(String),
@@ -20,8 +19,14 @@ pub enum DeepSeekError {
     Json(#[from] serde_json::Error),
 }
 
-impl From<reqwest_eventsource::Error> for DeepSeekError {
-    fn from(error: reqwest_eventsource::Error) -> Self {
+impl From<reqwest::Error> for DeepSeekError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(Box::new(error))
+    }
+}
+
+impl From<sse_reqwest_client::Error> for DeepSeekError {
+    fn from(error: sse_reqwest_client::Error) -> Self {
         Self::Transport(Box::new(error))
     }
 }

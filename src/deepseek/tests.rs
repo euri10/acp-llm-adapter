@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::client::{DeepSeekClient, LlmClient};
 use super::config::{DeepSeekConfig, Environment};
-use super::stream::{is_retryable_transport_error, parse_chat_completion_chunk};
+use super::stream::parse_chat_completion_chunk;
 use super::{
     ChatMessage, ChatRequest, DeepSeekError, FinishReason, MessageRole, StreamEvent, ToolCall,
     ToolCallDelta, ToolDefinition,
@@ -445,26 +445,16 @@ async fn deepseek_client_reports_stream_end_without_finish_reason() -> Result<()
 
 #[test_log::test]
 fn deepseek_error_from_event_source_error_uses_transport_variant() {
-    let error = DeepSeekError::from(reqwest_eventsource::Error::StreamEnded);
+    let error = DeepSeekError::from(sse_reqwest_client::Error::Status(
+        http::StatusCode::BAD_REQUEST,
+    ));
 
     assert!(matches!(error, DeepSeekError::Transport(_)));
-    assert_eq!(
-        error.to_string(),
-        "`DeepSeek` SSE transport error: Stream ended"
+    assert!(
+        error
+            .to_string()
+            .contains("`DeepSeek` SSE transport error: unexpected HTTP status code")
     );
-}
-
-#[test_log::test]
-fn is_retryable_transport_error_returns_false_for_non_transport_errors() {
-    assert!(!is_retryable_transport_error(
-        &reqwest_eventsource::Error::StreamEnded
-    ));
-    let Err(utf8_error) = String::from_utf8(vec![0xFF_u8]) else {
-        return;
-    };
-    assert!(!is_retryable_transport_error(
-        &reqwest_eventsource::Error::Utf8(utf8_error)
-    ));
 }
 
 #[test_log::test(tokio::test)]

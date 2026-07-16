@@ -3,13 +3,13 @@ use futures_util::{
     stream::{self, BoxStream},
 };
 use reqwest::Client as HttpClient;
-use reqwest_eventsource::EventSource;
 use serde::Serialize;
+use sse_reqwest_client::RequestBuilderExt as _;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::config::SystemEnvironment;
-use super::stream::{StreamAttemptOutcome, run_stream_attempt};
+use super::stream::run_stream_attempt;
 use super::types::{ChatRequest, WireMessage, WireToolDefinition};
 use super::{DeepSeekConfig, DeepSeekError, StreamEvent};
 
@@ -158,68 +158,30 @@ impl LlmClient for DeepSeekClient {
         let (tx, rx) = mpsc::unbounded_channel::<Result<StreamEvent, DeepSeekError>>();
 
         tokio::spawn(async move {
-            const MAX_RETRIES: u32 = 3;
+            let event_source = http
+                .post(&url)
+                .bearer_auth(&api_key)
+                .json(&body)
+                .into_event_source();
 
-            for attempt in 0..=MAX_RETRIES {
-                if attempt > 0 {
-                    let delay_ms = 100_u64 * (1_u64 << (attempt - 1));
-                    tracing::warn!(
-                        attempt,
-                        delay_ms,
-                        "retrying DeepSeek SSE stream after retryable transport error"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                }
+            tracing::debug!(
+                url = %url,
+                model = %body.model,
+                message_count = body.messages.len(),
+                tool_count = body.tools.len(),
+                stream = body.stream,
+                reasoning_effort = ?body.reasoning_effort,
+                max_tokens = ?body.max_tokens,
+                "sending chat completion request to DeepSeek"
+            );
 
-                let request = http.post(&url).bearer_auth(&api_key).json(&body);
-
-                tracing::debug!(
-                    url = %url,
-                    model = %body.model,
-                    message_count = body.messages.len(),
-                    tool_count = body.tools.len(),
-                    stream = body.stream,
-                    reasoning_effort = ?body.reasoning_effort,
-                    max_tokens = ?body.max_tokens,
-                    "sending chat completion request to DeepSeek"
-                );
-
-                if tracing::enabled!(tracing::Level::TRACE)
-                    && let Ok(request_json) = serde_json::to_string(&body)
-                {
-                    tracing::trace!(request_body = %request_json, "DeepSeek request body");
-                }
-
-                let event_source = match EventSource::new(request) {
-                    Ok(es) => {
-                        tracing::debug!("successfully created SSE event source");
-                        es
-                    }
-                    Err(error) => {
-                        // Note: EventSource::new() does not capture HTTP error response bodies.
-                        // If debugging a non-2xx error (e.g., 400 Bad Request), enable TRACE-level
-                        // logging above to see the full request JSON, or improve error handling
-                        // to manually send the request and read error responses.
-                        tracing::error!(error = ?error, "failed to create SSE event source");
-                        let _ = tx.send(Err(DeepSeekError::from(error)));
-                        return;
-                    }
-                };
-
-                if !matches!(
-                    run_stream_attempt(
-                        event_source,
-                        &tx,
-                        &cancellation_token,
-                        attempt,
-                        MAX_RETRIES
-                    )
-                    .await,
-                    StreamAttemptOutcome::ShouldRetry
-                ) {
-                    return;
-                }
+            if tracing::enabled!(tracing::Level::TRACE)
+                && let Ok(request_json) = serde_json::to_string(&body)
+            {
+                tracing::trace!(request_body = %request_json, "DeepSeek request body");
             }
+
+            let _ = run_stream_attempt(event_source, &tx, &cancellation_token).await;
         });
 
         Ok(stream::unfold(rx, |mut rx| async move {

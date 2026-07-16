@@ -1,8 +1,6 @@
-use std::error::Error as StdError;
-
 use futures_util::StreamExt;
-use reqwest_eventsource::{Event, EventSource};
 use serde::Deserialize;
+use sse_reqwest_client::{EventSource, SseEvent};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -11,15 +9,12 @@ use super::{DeepSeekError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
 pub(super) enum StreamAttemptOutcome {
     Complete,
     Cancelled,
-    ShouldRetry,
 }
 
 pub(super) async fn run_stream_attempt(
     mut event_source: EventSource,
     tx: &mpsc::UnboundedSender<Result<StreamEvent, DeepSeekError>>,
     cancellation_token: &CancellationToken,
-    attempt: u32,
-    max_retries: u32,
 ) -> StreamAttemptOutcome {
     let mut saw_finish = false;
     let mut events_sent: u32 = 0;
@@ -35,12 +30,13 @@ pub(super) async fn run_stream_attempt(
         };
 
         match event {
-            Ok(Event::Open) => {}
-            Ok(Event::Message(message)) => {
-                if message.data.trim() == "[DONE]" {
+            Ok(SseEvent::Open) => {}
+            Ok(SseEvent::Message(message)) => {
+                let data = message.data.as_str();
+                if data.trim() == "[DONE]" {
                     break;
                 }
-                match parse_chat_completion_chunk(&message.data) {
+                match parse_chat_completion_chunk(data) {
                     Ok(updates) => {
                         for update in updates {
                             if matches!(update, StreamEvent::Finished(_)) {
@@ -58,23 +54,11 @@ pub(super) async fn run_stream_attempt(
                     }
                 }
             }
+            Ok(SseEvent::Error(error)) => {
+                tracing::warn!(error = ?error, events_sent, "SSE stream dropped; reconnecting");
+            }
             Err(error) => {
-                if events_sent == 0 && attempt < max_retries && is_retryable_transport_error(&error)
-                {
-                    tracing::warn!(
-                        error = ?error,
-                        attempt,
-                        max_retries,
-                        "retryable transport error, will retry"
-                    );
-                    return StreamAttemptOutcome::ShouldRetry;
-                }
-                tracing::error!(
-                    error = ?error,
-                    events_sent,
-                    attempt,
-                    "non-retryable stream error or max retries exceeded"
-                );
+                tracing::error!(error = ?error, events_sent, "terminal SSE stream error");
                 let _ = tx.send(Err(error.into()));
                 return StreamAttemptOutcome::Cancelled;
             }
@@ -87,44 +71,6 @@ pub(super) async fn run_stream_attempt(
         )));
     }
     StreamAttemptOutcome::Complete
-}
-
-/// Returns true when a transport error is safe to retry before any events are emitted.
-///
-/// Only `Transport`-variant errors carrying network-level conditions qualify - these
-/// arise from stale pooled connections, server-side shutdowns, and TCP disconnects.
-/// Parse errors, status errors, and redirect loops are not retryable.
-///
-/// Two broad categories are accepted:
-/// - `is_connect()` / `is_request()`: server dropped the connection before any HTTP
-///   response arrived (e.g. `hyper::Error(IncompleteMessage)` on a stale pool reuse).
-/// - Body/decode errors whose source chain contains a retryable IO kind
-///   (`BrokenPipe`, `ConnectionReset`, `UnexpectedEof`, `ConnectionAborted`): TCP dropped
-///   mid-stream, which is safe to restart only while `events_sent == 0` (guarded by
-///   the caller).
-pub(crate) fn is_retryable_transport_error(error: &reqwest_eventsource::Error) -> bool {
-    let reqwest_eventsource::Error::Transport(ref reqwest_error) = *error else {
-        return false;
-    };
-
-    if reqwest_error.is_connect() || reqwest_error.is_request() {
-        return true;
-    }
-
-    let mut current: Option<&(dyn StdError + 'static)> = (reqwest_error as &dyn StdError).source();
-    while let Some(err) = current {
-        if let Some(io) = err.downcast_ref::<std::io::Error>() {
-            return matches!(
-                io.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionAborted
-            );
-        }
-        current = err.source();
-    }
-    false
 }
 
 #[derive(Debug, Deserialize)]
