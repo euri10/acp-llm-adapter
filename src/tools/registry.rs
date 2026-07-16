@@ -331,7 +331,7 @@ mod tests {
         }
     }
 
-    impl crate::acp::CreateTerminalRequester for RecordingToolCallRequester {
+    impl crate::acp::TerminalRequester for RecordingToolCallRequester {
         fn create_terminal(
             &self,
             _request: CreateTerminalRequest,
@@ -343,9 +343,7 @@ mod tests {
                 )))
             })
         }
-    }
 
-    impl crate::acp::TerminalOutputRequester for RecordingToolCallRequester {
         fn terminal_output(
             &self,
             _request: TerminalOutputRequest,
@@ -353,9 +351,7 @@ mod tests {
             self.terminal_output.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(TerminalOutputResponse::new("terminal output", false)) })
         }
-    }
 
-    impl crate::acp::WaitForTerminalExitRequester for RecordingToolCallRequester {
         fn wait_for_terminal_exit(
             &self,
             _request: WaitForTerminalExitRequest,
@@ -368,9 +364,7 @@ mod tests {
                 ))
             })
         }
-    }
 
-    impl crate::acp::ReleaseTerminalRequester for RecordingToolCallRequester {
         fn release_terminal(
             &self,
             _request: ReleaseTerminalRequest,
@@ -378,9 +372,7 @@ mod tests {
             self.terminal_release.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(ReleaseTerminalResponse::new()) })
         }
-    }
 
-    impl crate::acp::KillTerminalRequester for RecordingToolCallRequester {
         fn kill_terminal(
             &self,
             _request: KillTerminalRequest,

@@ -1991,9 +1991,8 @@ fn logout_request_returns_ok() -> Result<(), agent_client_protocol::Error> {
 // wrappers* while a client role responds, so the wrappers'
 // `self.send_request(request).block_task()` bodies are genuinely covered.
 use super::{
-    CreateTerminalRequester, KillTerminalRequester, PermissionRequester, ReadTextFileRequester,
-    ReleaseTerminalRequester, TerminalOutputRequester, WaitForTerminalExitRequester,
-    WriteTextFileRequester, recover_null_write_response,
+    PermissionRequester, ReadTextFileRequester, TerminalRequester, WriteTextFileRequester,
+    recover_null_write_response,
 };
 use agent_client_protocol::Agent;
 use agent_client_protocol::schema::v1::{

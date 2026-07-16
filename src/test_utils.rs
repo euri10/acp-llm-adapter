@@ -21,9 +21,7 @@ use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
 use futures_util::future::BoxFuture;
 
 use crate::acp::{
-    CreateTerminalRequester, KillTerminalRequester, PermissionRequester, ReadTextFileRequester,
-    ReleaseTerminalRequester, TerminalOutputRequester, WaitForTerminalExitRequester,
-    WriteTextFileRequester,
+    PermissionRequester, ReadTextFileRequester, TerminalRequester, WriteTextFileRequester,
 };
 use crate::session::SessionStore;
 use crate::tools::ToolContext;
@@ -234,7 +232,7 @@ pub(crate) struct FakeTerminalRequester {
     pub(crate) release_error: Option<String>,
 }
 
-impl CreateTerminalRequester for FakeTerminalRequester {
+impl TerminalRequester for FakeTerminalRequester {
     fn create_terminal(
         &self,
         _request: CreateTerminalRequest,
@@ -248,9 +246,7 @@ impl CreateTerminalRequester for FakeTerminalRequester {
             Ok(CreateTerminalResponse::new(TerminalId::new(terminal_id)))
         })
     }
-}
 
-impl TerminalOutputRequester for FakeTerminalRequester {
     fn terminal_output(
         &self,
         _request: TerminalOutputRequest,
@@ -265,9 +261,7 @@ impl TerminalOutputRequester for FakeTerminalRequester {
             Ok(TerminalOutputResponse::new(output, truncated))
         })
     }
-}
 
-impl WaitForTerminalExitRequester for FakeTerminalRequester {
     fn wait_for_terminal_exit(
         &self,
         _request: WaitForTerminalExitRequest,
@@ -282,9 +276,7 @@ impl WaitForTerminalExitRequester for FakeTerminalRequester {
             Ok(WaitForTerminalExitResponse::new(status))
         })
     }
-}
 
-impl ReleaseTerminalRequester for FakeTerminalRequester {
     fn release_terminal(
         &self,
         _request: ReleaseTerminalRequest,
@@ -297,9 +289,7 @@ impl ReleaseTerminalRequester for FakeTerminalRequester {
             Ok(ReleaseTerminalResponse::new())
         })
     }
-}
 
-impl KillTerminalRequester for FakeTerminalRequester {
     fn kill_terminal(
         &self,
         _request: KillTerminalRequest,
@@ -316,34 +306,28 @@ pub(crate) struct CancelTracker {
     pub(crate) releases: Arc<AtomicUsize>,
 }
 
-impl CreateTerminalRequester for CancelTracker {
+impl TerminalRequester for CancelTracker {
     fn create_terminal(
         &self,
         _request: CreateTerminalRequest,
     ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
         Box::pin(async move { Ok(CreateTerminalResponse::new(TerminalId::new("term-cancel"))) })
     }
-}
 
-impl TerminalOutputRequester for CancelTracker {
     fn terminal_output(
         &self,
         _request: TerminalOutputRequest,
     ) -> BoxFuture<'_, Result<TerminalOutputResponse, agent_client_protocol::Error>> {
         Box::pin(async move { Ok(TerminalOutputResponse::new(String::new(), false)) })
     }
-}
 
-impl WaitForTerminalExitRequester for CancelTracker {
     fn wait_for_terminal_exit(
         &self,
         _request: WaitForTerminalExitRequest,
     ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>> {
         Box::pin(std::future::pending())
     }
-}
 
-impl ReleaseTerminalRequester for CancelTracker {
     fn release_terminal(
         &self,
         _request: ReleaseTerminalRequest,
@@ -354,9 +338,7 @@ impl ReleaseTerminalRequester for CancelTracker {
             Ok(ReleaseTerminalResponse::new())
         })
     }
-}
 
-impl KillTerminalRequester for CancelTracker {
     fn kill_terminal(
         &self,
         _request: KillTerminalRequest,
