@@ -183,6 +183,60 @@ fn validate_tool_results(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         .collect()
 }
 
+/// Repair a filtered message list into a shape the `DeepSeek` chat API accepts.
+///
+/// Size-based filtering ([`filter_messages_by_size`]) drops assistant+tool
+/// groups from the middle of the conversation, leaving two artifacts that
+/// `DeepSeek` rejects with 400 Bad Request:
+///
+/// - **Empty assistant messages** (no content and no tool calls), which
+///   serialize to `{"role":"assistant"}` and violate the API contract. These
+///   can also be carried in unfiltered from history.
+/// - **Consecutive same-role user/assistant messages**, produced when the
+///   groups that separated them were dropped, breaking role alternation.
+///
+/// This pass drops empty assistant messages and coalesces adjacent same-role
+/// user/assistant text messages, joining their content. Tool messages and
+/// assistant messages that carry tool calls are never merged or dropped, so the
+/// tool-call/result pairing established by [`filter_messages_truncate`] and
+/// [`validate_tool_results`] is preserved.
+fn sanitize_conversation(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut sanitized: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for message in messages {
+        // Drop empty assistant messages: nothing to say and no tool call to make.
+        if message.role() == MessageRole::Assistant
+            && message.tool_calls().is_empty()
+            && message.content().trim().is_empty()
+        {
+            continue;
+        }
+
+        // Coalesce with the previous message when both are plain-text messages of
+        // the same role (user, or assistant without tool calls). This repairs the
+        // consecutive-role runs that truncation introduces. Tool messages and
+        // assistant-with-tool-calls are excluded, so pairing stays intact.
+        let mergeable = matches!(message.role(), MessageRole::User | MessageRole::Assistant)
+            && message.tool_calls().is_empty();
+        if mergeable
+            && let Some(previous) = sanitized.last()
+            && previous.role() == message.role()
+            && previous.tool_calls().is_empty()
+        {
+            let merged = format!("{}\n\n{}", previous.content(), message.content());
+            let rebuilt = match message.role() {
+                MessageRole::User => ChatMessage::user(merged),
+                _ => ChatMessage::assistant(merged),
+            };
+            sanitized.pop();
+            sanitized.push(rebuilt);
+            continue;
+        }
+
+        sanitized.push(message);
+    }
+    sanitized
+}
+
 /// Estimate the size of a message in bytes for filtering purposes.
 ///
 /// Accounts for JSON serialization overhead (quotes, escapes, delimiters).
@@ -405,6 +459,11 @@ pub(crate) async fn stream_model_turn(
             "truncated conversation history to fit request size limit"
         );
     }
+
+    // Repair the structural artifacts that size filtering (and history) can
+    // leave behind - consecutive same-role messages and empty assistant
+    // messages - which DeepSeek otherwise rejects with 400 Bad Request.
+    let filtered_messages = sanitize_conversation(filtered_messages);
 
     let mut chat_request = ChatRequest::new(filtered_messages)
         .with_tools(tool_definitions.to_vec())

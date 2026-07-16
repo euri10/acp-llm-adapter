@@ -1308,3 +1308,74 @@ fn validate_tool_results_drops_orphaned_tool_result() {
 
     assert_eq!(validated, vec![messages[0].clone()]);
 }
+
+#[test]
+fn sanitize_conversation_merges_consecutive_users() {
+    // Regression test for daa-rts: truncation drops the assistant turns between
+    // user messages, leaving a run of consecutive users that DeepSeek 400s on.
+    let messages = vec![
+        ChatMessage::user("first"),
+        ChatMessage::user("ok"),
+        ChatMessage::user("continue"),
+    ];
+
+    let sanitized = super::sanitize_conversation(messages);
+
+    assert_eq!(
+        sanitized,
+        vec![ChatMessage::user("first\n\nok\n\ncontinue")]
+    );
+}
+
+#[test]
+fn sanitize_conversation_drops_empty_assistant_and_merges_around_it() {
+    // Regression test for daa-rts: an empty assistant message serializes to
+    // `{"role":"assistant"}` (no content, no tool calls) and is rejected. After
+    // dropping it, the two surrounding users must also coalesce.
+    let messages = vec![
+        ChatMessage::user("before"),
+        ChatMessage::assistant(""),
+        ChatMessage::user("after"),
+    ];
+
+    let sanitized = super::sanitize_conversation(messages);
+
+    assert_eq!(sanitized, vec![ChatMessage::user("before\n\nafter")]);
+}
+
+#[test]
+fn sanitize_conversation_preserves_tool_calls_and_results() {
+    // Tool messages and assistant-with-tool-calls must never be merged or
+    // dropped, so tool-call/result pairing stays intact. Parallel tool results
+    // (consecutive tool messages) are a valid shape and left untouched.
+    let assistant_call = ChatMessage::assistant_with_tool_calls(
+        "checking",
+        vec![
+            DeepSeekToolCall::new("call-1", "read_file", r#"{"path":"a"}"#),
+            DeepSeekToolCall::new("call-2", "read_file", r#"{"path":"b"}"#),
+        ],
+    );
+    let messages = vec![
+        ChatMessage::user("go"),
+        assistant_call.clone(),
+        ChatMessage::tool_result("call-1", "content a"),
+        ChatMessage::tool_result("call-2", "content b"),
+    ];
+
+    let sanitized = super::sanitize_conversation(messages.clone());
+
+    assert_eq!(sanitized, messages);
+}
+
+#[test]
+fn sanitize_conversation_leaves_valid_alternation_unchanged() {
+    let messages = vec![
+        ChatMessage::user("hi"),
+        ChatMessage::assistant("hello"),
+        ChatMessage::user("bye"),
+    ];
+
+    let sanitized = super::sanitize_conversation(messages.clone());
+
+    assert_eq!(sanitized, messages);
+}
