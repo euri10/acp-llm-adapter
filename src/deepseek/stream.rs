@@ -6,22 +6,18 @@ use tokio_util::sync::CancellationToken;
 
 use super::{DeepSeekError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
 
-pub(super) enum StreamAttemptOutcome {
-    Complete,
-    Cancelled,
-}
-
 pub(super) async fn run_stream_attempt(
     mut event_source: EventSource,
     tx: &mpsc::UnboundedSender<Result<StreamEvent, DeepSeekError>>,
     cancellation_token: &CancellationToken,
-) -> StreamAttemptOutcome {
+) -> bool {
+    // Returns `true` if the stream was cancelled, `false` if it completed normally.
     let mut saw_finish = false;
     let mut events_sent: u32 = 0;
 
     loop {
         let event = tokio::select! {
-            () = cancellation_token.cancelled() => return StreamAttemptOutcome::Cancelled,
+            () = cancellation_token.cancelled() => return true,
             event = event_source.next() => event,
         };
 
@@ -44,13 +40,13 @@ pub(super) async fn run_stream_attempt(
                             }
                             events_sent += 1;
                             if tx.send(Ok(update)).is_err() {
-                                return StreamAttemptOutcome::Cancelled;
+                                return true;
                             }
                         }
                     }
                     Err(error) => {
                         let _ = tx.send(Err(error));
-                        return StreamAttemptOutcome::Cancelled;
+                        return true;
                     }
                 }
             }
@@ -60,7 +56,7 @@ pub(super) async fn run_stream_attempt(
             Err(error) => {
                 tracing::error!(error = ?error, events_sent, "terminal SSE stream error");
                 let _ = tx.send(Err(error.into()));
-                return StreamAttemptOutcome::Cancelled;
+                return true;
             }
         }
     }
@@ -70,7 +66,7 @@ pub(super) async fn run_stream_attempt(
             "stream ended before a finish reason was received".to_string(),
         )));
     }
-    StreamAttemptOutcome::Complete
+    false
 }
 
 #[derive(Debug, Deserialize)]
