@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4](https://github.com/euri10/deepseek-acp-adapter/compare/v0.5.3...v0.5.4) - 2026-07-16
+
+### Added
+
+- switch to caret deps + add Renovate config for automated upgrades
+- upgrade agent-client-protocol
+- add plan exit transition (daa-h3s)
+- enforce plan mode in turns
+- add plan session mode
+
+### Fixed
+
+- fix rmcp 2.2 api break
+- *(deps)* update rust crate http to ^1.4.2 ([#16](https://github.com/euri10/deepseek-acp-adapter/pull/16))
+- *(deps)* update rust crate grep to ^0.4.1 ([#22](https://github.com/euri10/deepseek-acp-adapter/pull/22))
+- *(deps)* update rust crate thiserror to ^2.0.18 ([#19](https://github.com/euri10/deepseek-acp-adapter/pull/19))
+- *(deps)* update rust crate ignore to ^0.4.29 ([#17](https://github.com/euri10/deepseek-acp-adapter/pull/17))
+- *(deps)* update rust crate uuid to ^1.24.0 ([#20](https://github.com/euri10/deepseek-acp-adapter/pull/20))
+- *(deps)* update rust crate rmcp to ^1.8.0 ([#18](https://github.com/euri10/deepseek-acp-adapter/pull/18))
+- *(deps)* update rust crate globset to ^0.4.19 ([#15](https://github.com/euri10/deepseek-acp-adapter/pull/15))
+- *(deps)* update rust crate clap to ^4.6.2 ([#14](https://github.com/euri10/deepseek-acp-adapter/pull/14))
+
+### Other
+
+- fix reqwest upgrade
+- *(ci)* fix upgrade
+- *(deps)* update dependency rust to 1.97 ([#21](https://github.com/euri10/deepseek-acp-adapter/pull/21))
+- *(deps)* update actions/checkout action to v7 ([#24](https://github.com/euri10/deepseek-acp-adapter/pull/24))
+- *(deps)* update rust crate axum to ^0.8.9 ([#13](https://github.com/euri10/deepseek-acp-adapter/pull/13))
+- cover plan mode transition
+
 ## [0.5.3](https://github.com/euri10/deepseek-acp-adapter/compare/v0.5.2...v0.5.3) - 2026-07-16
 
 ### Fixed
