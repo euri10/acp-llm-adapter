@@ -6,22 +6,22 @@ use tokio_util::sync::CancellationToken;
 
 use super::{DeepSeekError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
 
-/// Run a single SSE stream attempt.
+/// Run a single SSE stream attempt, forwarding events into `tx`.
 ///
-/// Returns `true` if the stream was aborted early (cancellation, parse error,
-/// channel closed, or transport error) and `false` if it completed normally
-/// (EOF, `[DONE]` marker, or `finish_reason` received).
+/// Returns when the stream completes, the cancellation token fires, or a
+/// terminal error occurs. Errors are sent into `tx`; the caller does not
+/// need to inspect the return value.
 pub(super) async fn run_stream_attempt(
     mut event_source: EventSource,
     tx: &mpsc::UnboundedSender<Result<StreamEvent, DeepSeekError>>,
     cancellation_token: &CancellationToken,
-) -> bool {
+) {
     let mut saw_finish = false;
     let mut events_sent: u32 = 0;
 
     loop {
         let event = tokio::select! {
-            () = cancellation_token.cancelled() => return true,
+            () = cancellation_token.cancelled() => return,
             event = event_source.next() => event,
         };
 
@@ -44,13 +44,13 @@ pub(super) async fn run_stream_attempt(
                             }
                             events_sent += 1;
                             if tx.send(Ok(update)).is_err() {
-                                return true;
+                                return;
                             }
                         }
                     }
                     Err(error) => {
                         let _ = tx.send(Err(error));
-                        return true;
+                        return;
                     }
                 }
             }
@@ -60,7 +60,7 @@ pub(super) async fn run_stream_attempt(
             Err(error) => {
                 tracing::error!(error = ?error, events_sent, "terminal SSE stream error");
                 let _ = tx.send(Err(error.into()));
-                return true;
+                return;
             }
         }
     }
@@ -70,7 +70,6 @@ pub(super) async fn run_stream_attempt(
             "stream ended before a finish reason was received".to_string(),
         )));
     }
-    false
 }
 
 #[derive(Debug, Deserialize)]

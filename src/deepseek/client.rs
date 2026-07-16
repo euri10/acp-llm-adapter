@@ -178,7 +178,7 @@ impl LlmClient for DeepSeekClient {
                 }
             }
 
-            let _ = run_stream_attempt(event_source, &tx, &cancellation_token).await;
+            run_stream_attempt(event_source, &tx, &cancellation_token).await;
         });
 
         Ok(stream::unfold(rx, |mut rx| async move {
