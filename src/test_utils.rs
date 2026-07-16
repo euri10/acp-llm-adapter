@@ -17,14 +17,11 @@ use agent_client_protocol::schema::v1::{
     WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
-use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
 use futures_util::future::BoxFuture;
 
 use crate::acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, WriteTextFileRequester,
 };
-use crate::session::SessionStore;
-use crate::tools::ToolContext;
 
 // ── CountingReadTextFileRequester ───────────────────────────
 
@@ -151,50 +148,6 @@ impl PermissionRequester for FakePermissionRequester {
 
         Box::pin(async move { response })
     }
-}
-
-// ── PermissionModeFixture & permission_mode_fixture ─────────
-
-pub(crate) type PermissionModeFixture = (
-    SessionStore,
-    agent_client_protocol::schema::v1::SessionId,
-    ToolContext,
-    DeepSeekToolCall,
-    DeepSeekToolCall,
-);
-
-pub(crate) fn permission_mode_fixture()
--> Result<PermissionModeFixture, agent_client_protocol::Error> {
-    use crate::test_store;
-    let store = test_store();
-    let session = crate::acp::handle_new_session_request(
-        &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
-    )?;
-    let context = ToolContext {
-        session_id: session.session_id.clone(),
-        cwd: std::path::PathBuf::from("/tmp"),
-        additional_directories: Vec::new(),
-        client_capabilities: None,
-    };
-    let edit_call = DeepSeekToolCall::new(
-        "call-edit",
-        "write_file",
-        serde_json::json!({ "path": "file.txt" }).to_string(),
-    );
-    let shell_call = DeepSeekToolCall::new(
-        "call-shell",
-        "run_command",
-        serde_json::json!({ "command": "echo hi" }).to_string(),
-    );
-
-    Ok((
-        store.clone(),
-        session.session_id,
-        context,
-        edit_call,
-        shell_call,
-    ))
 }
 
 // ── select_current_value ────────────────────────────────────

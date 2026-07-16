@@ -2,6 +2,56 @@
 use super::{PendingToolCalls, PermissionDecision, ReasoningEffort, SessionBehavior};
 use agent_client_protocol::schema::v1::SessionModeId;
 
+/// Return type for [`permission_mode_fixture`].
+pub(crate) type PermissionModeFixture = (
+    crate::session::SessionStore,
+    agent_client_protocol::schema::v1::SessionId,
+    crate::tools::ToolContext,
+    deepseek_acp_adapter::deepseek::ToolCall,
+    deepseek_acp_adapter::deepseek::ToolCall,
+);
+
+/// Create a fully wired permission-mode test environment.
+///
+/// Returns `(store, session_id, context, edit_call, shell_call)`.
+///
+/// # Errors
+///
+/// Propagates errors from session creation.
+pub(crate) fn permission_mode_fixture()
+-> Result<PermissionModeFixture, agent_client_protocol::Error> {
+    use crate::test_store;
+    let store = test_store();
+    let session = crate::acp::handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+    )?;
+    let context = crate::tools::ToolContext {
+        session_id: session.session_id.clone(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        additional_directories: Vec::new(),
+        client_capabilities: None,
+    };
+    let edit_call = deepseek_acp_adapter::deepseek::ToolCall::new(
+        "call-edit",
+        "write_file",
+        serde_json::json!({ "path": "file.txt" }).to_string(),
+    );
+    let shell_call = deepseek_acp_adapter::deepseek::ToolCall::new(
+        "call-shell",
+        "run_command",
+        serde_json::json!({ "command": "echo hi" }).to_string(),
+    );
+
+    Ok((
+        store.clone(),
+        session.session_id,
+        context,
+        edit_call,
+        shell_call,
+    ))
+}
+
 #[test]
 fn permission_decision_debug_impl_is_callable() {
     let decisions = [

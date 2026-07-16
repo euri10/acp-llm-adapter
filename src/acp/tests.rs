@@ -12,6 +12,7 @@ use super::{
     validate_session_paths,
 };
 use crate::dev::MockLlmClient;
+use crate::session::tests::permission_mode_fixture;
 use crate::session::{
     AdapterState, DEFAULT_MAX_TURN_REQUESTS, PERMISSION_ALLOW_ALWAYS_OPTION_ID,
     PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision,
