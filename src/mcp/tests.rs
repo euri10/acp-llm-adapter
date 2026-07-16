@@ -18,7 +18,7 @@ use agent_client_protocol::schema::v1::{
 use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
 use futures_util::future::BoxFuture;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content as McpContent, ListToolsResult,
+    CallToolRequestParams, CallToolResult, ContentBlock as McpContent, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RoleServer};

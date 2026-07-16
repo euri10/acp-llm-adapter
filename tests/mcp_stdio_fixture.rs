@@ -16,7 +16,7 @@
 use std::error::Error;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content as McpContent, ListToolsResult,
+    CallToolRequestParams, CallToolResult, ContentBlock as McpContent, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RoleServer};

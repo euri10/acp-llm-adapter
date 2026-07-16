@@ -7,7 +7,7 @@ use agent_client_protocol::schema::v1::{
 };
 use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
 use http::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, Content as McpContent, JsonObject, Tool as McpTool};
+use rmcp::model::{CallToolRequestParams, ContentBlock as McpContent, JsonObject, Tool as McpTool};
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
@@ -131,9 +131,9 @@ pub(crate) fn mcp_tool_result_text(content: &[McpContent]) -> String {
     let parts = content
         .iter()
         .map(|content| {
-            content.raw.as_text().map_or_else(
+            content.as_text().map_or_else(
                 || {
-                    serde_json::to_string(&content.raw)
+                    serde_json::to_string(content)
                         .unwrap_or_else(|error| format!("failed to serialize MCP content: {error}"))
                 },
                 |text| text.text.clone(),
