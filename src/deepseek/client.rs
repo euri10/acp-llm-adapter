@@ -127,14 +127,22 @@ impl LlmClient for DeepSeekClient {
         let wire_tools: Vec<WireToolDefinition> =
             tools.iter().map(WireToolDefinition::from).collect();
 
-        let body = serde_json::json!({
-            "model": model,
-            "messages": wire_messages,
-            "tools": wire_tools,
-            "stream": true,
-            "reasoning_effort": reasoning_effort,
-            "max_tokens": max_tokens,
-        });
+        // Build the body using a map so that empty/null fields are omitted
+        // (matching the previous `#[serde(skip_serializing_if = "...")]` behavior).
+        let mut fields = serde_json::Map::new();
+        fields.insert("model".to_string(), serde_json::json!(model));
+        fields.insert("messages".to_string(), serde_json::json!(wire_messages));
+        fields.insert("stream".to_string(), serde_json::json!(true));
+        if !wire_tools.is_empty() {
+            fields.insert("tools".to_string(), serde_json::json!(wire_tools));
+        }
+        if let Some(ref effort) = reasoning_effort {
+            fields.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+        }
+        if let Some(ref tokens) = max_tokens {
+            fields.insert("max_tokens".to_string(), serde_json::json!(tokens));
+        }
+        let body = serde_json::Value::Object(fields);
 
         let http = self.http.clone();
         let url = format!(

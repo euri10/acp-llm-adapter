@@ -6,12 +6,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::{DeepSeekError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
 
+/// Run a single SSE stream attempt.
+///
+/// Returns `true` if the stream was aborted early (cancellation, parse error,
+/// channel closed, or transport error) and `false` if it completed normally
+/// (EOF, `[DONE]` marker, or `finish_reason` received).
 pub(super) async fn run_stream_attempt(
     mut event_source: EventSource,
     tx: &mpsc::UnboundedSender<Result<StreamEvent, DeepSeekError>>,
     cancellation_token: &CancellationToken,
 ) -> bool {
-    // Returns `true` if the stream was cancelled, `false` if it completed normally.
     let mut saw_finish = false;
     let mut events_sent: u32 = 0;
 
