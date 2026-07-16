@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3](https://github.com/euri10/deepseek-acp-adapter/compare/v0.5.2...v0.5.3) - 2026-07-16
+
+### Fixed
+
+- byte-cap grep/read_file tool output to bound history (daa-8q1)
+- sanitize conversation before DeepSeek send to avoid 400 (daa-rts)
+- reduce message budget and improve size estimation to avoid 400 errors
+
+### Other
+
+- DeepSeek 400 Bad Request regression fixed (daa-gvo)
+- DeepSeek API 400 Bad Request regression (daa-gvo)
+
 ## [0.5.2](https://github.com/euri10/deepseek-acp-adapter/compare/v0.5.1...v0.5.2) - 2026-07-15
 
 ### Added
