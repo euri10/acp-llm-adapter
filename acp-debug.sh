@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codecompanion-acp"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/acp-llm-adapter"
 mkdir -p "$LOG_DIR"
 
 ACP_BINARY="$1"
@@ -21,3 +21,4 @@ echo "RUST_LOG: $RUST_LOG" >> "$STDERR_LOG"
 # stdout is ACP JSON-RPC, so tee it without adding anything.
 # stderr is safe to redirect to a log file.
 exec "$@" 2>>"$STDERR_LOG" | tee -a "$STDOUT_LOG"
+
