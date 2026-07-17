@@ -6,7 +6,8 @@
 #   2. release-plz-release — When the release PR is merged, publishes to
 #                           crates.io and creates a GitHub release + git tag.
 #
-# Tag format: <crate_name>-v<version>  (e.g. acp-llm-adapter-v0.4.0)
+# Tag format: v<version>  (e.g. v0.7.0) — single-crate repo, so release-plz
+# uses the bare `v{version}` tag, not the `<crate_name>-v<version>` workspace form.
 #
 # ---------------------------------------------------------------------------
 # PREREQUISITES (one-time setup)
@@ -18,9 +19,18 @@
 #      ☑ Read and write permissions
 #      ☑ Allow GitHub Actions to create and approve pull requests
 #
-# B. crates.io Trusted Publishing (OIDC) — already configured
+# B. crates.io Trusted Publishing (OIDC)
 #    Release-plz obtains a short-lived token via OIDC when `id-token: write`
 #    is present on the job. No static secrets needed.
+#
+#    NOTE: Trusted Publishing is configured per-crate and cannot bootstrap a
+#    crate that does not exist yet. The crate `acp-llm-adapter` was renamed
+#    from `deepseek-acp-adapter`, so its first version had to be published
+#    manually with an API token to claim the name; only then could a trusted
+#    publisher (owner `euri10`, repo `acp-llm-adapter`, workflow
+#    `release-plz.yml`) be added at
+#    https://crates.io/crates/acp-llm-adapter/settings — after which OIDC
+#    handles every subsequent release.
 #
 # ---------------------------------------------------------------------------
 
