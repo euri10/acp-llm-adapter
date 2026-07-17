@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acp-llm-adapter"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "agent-client-protocol",
  "axum",
