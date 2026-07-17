@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/euri10/acp-llm-adapter/compare/v0.7.0...v0.7.1) - 2026-07-17
+
+### Added
+
+- require backend and enable MCP SSE
+
+### Fixed
+
+- rename debug log dir from codecompanion-acp to acp-llm-adapter
+
 ## [0.7.0] - 2026-07-16
 
 ### Added
