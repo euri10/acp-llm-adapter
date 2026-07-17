@@ -86,11 +86,13 @@ require("codecompanion").setup({
               "/home/lotso/code/acp-llm-adapter/acp-debug.sh",
               "acp-llm-adapter",
               "serve",
+              "--backend",
+              "deepseek"
             },
           },
           env = {
-            LLM_API_KEY = os.getenv "LLM_API_KEY",
-            RUST_LOG = "deepseek_acp_adapter::deepseek=trace,debug",
+            LLM_API_KEY = os.getenv "DEEPSEEK_API_KEY",
+            RUST_LOG = "acp_llm_adapter::llm=trace,debug",
           },
           defaults = {
             mcpServers = {},
@@ -208,13 +210,13 @@ The adapter bridges two independent channels:
 
 **Library Modules** (`llm` - reusable client):
 
-| Module                               | Responsibility                                                                        |
-| ------------------------------------ | ------------------------------------------------------------------------------------- |
-| [`llm/types.rs`](src/llm/types.rs)   | Chat message, request, tool definition, and stream-event types (public facade)        |
-| [`llm/client.rs`](src/llm/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `ChatClient` impl                      |
-| [`llm/stream.rs`](src/llm/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping                  |
-| [`llm/config.rs`](src/llm/config.rs) | Environment-driven config (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`) |
-| [`llm/error.rs`](src/llm/error.rs)   | Typed error enum (config, HTTP, SSE, JSON, transport)                                 |
+| Module                               | Responsibility                                                                 |
+| ------------------------------------ | ------------------------------------------------------------------------------ |
+| [`llm/types.rs`](src/llm/types.rs)   | Chat message, request, tool definition, and stream-event types (public facade) |
+| [`llm/client.rs`](src/llm/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `ChatClient` impl               |
+| [`llm/stream.rs`](src/llm/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping           |
+| [`llm/config.rs`](src/llm/config.rs) | Environment-driven config (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`)         |
+| [`llm/error.rs`](src/llm/error.rs)   | Typed error enum (config, HTTP, SSE, JSON, transport)                          |
 
 ### Design Principles
 
