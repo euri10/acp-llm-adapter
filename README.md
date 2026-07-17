@@ -11,10 +11,149 @@
 cargo install acp-llm-adapter
 ```
 
+## Editor Setup
+
+### CodeCompanion
+
+CodeCompanion uses ACP adapters for chat interactions. Extend the adapter config with this server and select it for chat.
+
+For the DeepSeek backend:
+
+```lua
+require("codecompanion").setup({
+  adapters = {
+    acp = {
+      glm_acp = function()
+        local helpers = require "codecompanion.adapters.acp.helpers"
+        return {
+          name = "glm_acp",
+          formatted_name = "GLM ACP",
+          type = "acp",
+          roles = {
+            llm = "assistant",
+            user = "user",
+          },
+          commands = {
+            default = {
+              "acp-llm-adapter",
+              "serve",
+              "--backend",
+              "glm",
+            },
+          },
+          env = {
+            LLM_API_KEY = os.getenv "Z_AI_API_KEY",
+          },
+          defaults = {
+            mcpServers = {},
+          },
+          parameters = {
+            protocolVersion = 1,
+            clientCapabilities = {
+              fs = { readTextFile = true, writeTextFile = true },
+            },
+            clientInfo = {
+              name = "CodeCompanion.nvim with acp-llm-adapter (GLM backend)",
+              version = "1.0.0",
+            },
+          },
+          handlers = {
+            setup = function(_)
+              return true
+            end,
+            auth = function(_)
+              return true
+            end,
+            form_messages = function(self, messages, capabilities)
+              return helpers.form_messages(self, messages, capabilities)
+            end,
+            on_exit = function(_, _) end,
+          },
+        }
+      end,
+      deepseek_acp = function()
+        local helpers = require "codecompanion.adapters.acp.helpers"
+        return {
+          name = "deepseek_acp",
+          formatted_name = "DeepSeek ACP",
+          type = "acp",
+          roles = {
+            llm = "assistant",
+            user = "user",
+          },
+          commands = {
+            default = {
+              "/home/lotso/code/acp-llm-adapter/acp-debug.sh",
+              "acp-llm-adapter",
+              "serve",
+            },
+          },
+          env = {
+            LLM_API_KEY = os.getenv "LLM_API_KEY",
+            RUST_LOG = "deepseek_acp_adapter::deepseek=trace,debug",
+          },
+          defaults = {
+            mcpServers = {},
+            timeout = 20000, -- 20 seconds
+          },
+          parameters = {
+            protocolVersion = 1,
+            clientCapabilities = {
+              fs = { readTextFile = true, writeTextFile = true },
+            },
+            clientInfo = {
+              name = "CodeCompanion.nvim with acp-llm-adapter",
+              version = "1.0.0",
+            },
+          },
+          handlers = {
+            setup = function(_)
+              return true
+            end,
+            auth = function(_)
+              return true
+            end,
+            form_messages = function(self, messages, capabilities)
+              return helpers.form_messages(self, messages, capabilities)
+            end,
+            on_exit = function(_, _) end,
+          },
+        }
+      end,
+    },
+  },
+})
+```
+
+### Zed
+
+Zed can run any ACP-capable agent as an external agent. Put the adapter command and its environment in `settings.json` under `agent_servers`.
+
+```json
+{
+  "agent_servers": {
+    "DeepSeek ACP": {
+      "type": "custom",
+      "command": "acp-llm-adapter",
+      "args": ["serve", "--backend", "deepseek"],
+      "env": {
+        "LLM_API_KEY": "your-api-key"
+      }
+    }
+  }
+}
+```
+
+To use GLM instead, change `--backend` to `"glm"`. The API key is read from `LLM_API_KEY`.
+
+If Zed is launched from a GUI app launcher, it may not inherit your shell environment. Set the adapter env vars in Zed's agent server config instead of relying on your terminal session.
+
+> [!WARNING]
+> I don't have Zed so this is totally untested
+
 ## Debugging
 
 For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending streams to `.local/state/acp-llm-adapter` using filenames like `20260610-080836-32451-acp-llm-adapter-deepseek-stderr.log` and `20260610-080836-32451-codex-acp-stdout-jsonrpc.log` (`<timestamp>-<pid>-<binary>[-<label>]...`). The label is `ACP_DEBUG_LABEL` when set; otherwise it is auto-derived from `--backend` (supports both `--backend value` and `--backend=value`).
-
 
 ## Architecture
 
@@ -48,34 +187,34 @@ The adapter bridges two independent channels:
 
 **Right side** — the adapter speaks HTTPS + Server-Sent Events to the provider's OpenAI-compatible `/chat/completions` endpoint via a thin client owned by this crate in [`src/llm/`](src/llm/). A [`LlmClient`](src/llm/client.rs) trait provides the mock seam for testing without a live API key.
 
-**Middle** — the adapter is the translator *and* the agent harness. [`turn.rs`](src/turn.rs) orchestrates the prompt→tool-call→execute→feed-back loop. [`tools.rs`](src/tools.rs) registers built-in tools (read/write/edit files, glob, grep, shell commands) and routes execution to the right backend. [`mcp.rs`](src/mcp.rs) connects to external MCP servers and exposes their tools through the same loop. [`session_store.rs`](src/session_store.rs) provides optional filesystem persistence so sessions survive process restarts.
+**Middle** — the adapter is the translator _and_ the agent harness. [`turn.rs`](src/turn.rs) orchestrates the prompt→tool-call→execute→feed-back loop. [`tools.rs`](src/tools.rs) registers built-in tools (read/write/edit files, glob, grep, shell commands) and routes execution to the right backend. [`mcp.rs`](src/mcp.rs) connects to external MCP servers and exposes their tools through the same loop. [`session_store.rs`](src/session_store.rs) provides optional filesystem persistence so sessions survive process restarts.
 
 ### Module Map
 
 **Binary Modules** (adapter runtime):
 
-| Module | Responsibility |
-|--------|---------------|
-| [`acp/`](src/acp/) | ACP transport registration, request handler dispatch, response builders, permission requesters |
-| [`session.rs`](src/session.rs) | Session state, permission model, in-memory session store, session lifecycle |
-| [`turn.rs`](src/turn.rs) | Prompt-turn orchestration: LLM streaming, tool-call accumulation, loop control, cancellation |
-| [`tools/`](src/tools/) | Built-in tool execution with two submodules: |
-| [`registry.rs`](src/tools/registry.rs) | `ToolRegistry` trait, `ToolContext`, `AdapterToolRegistry` impl, tool metadata |
-| [`execution/`](src/tools/execution) | Tool definitions, argument parsing, execution (read/write/edit/grep/glob/command), output truncation |
-| [`mcp.rs`](src/mcp.rs) | MCP server connection (stdio + HTTP streamable), tool-name mapping, invocation, result rendering |
-| [`session_store.rs`](src/session_store.rs) | Filesystem-backed session metadata and JSONL chat-history persistence |
-| [`dev.rs`](src/dev.rs) | Development utilities, smoke tests, CLI testing backends |
-| [`error.rs`](src/error.rs) | Unified domain error type (adapter crate root) |
+| Module                                     | Responsibility                                                                                       |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| [`acp/`](src/acp/)                         | ACP transport registration, request handler dispatch, response builders, permission requesters       |
+| [`session.rs`](src/session.rs)             | Session state, permission model, in-memory session store, session lifecycle                          |
+| [`turn.rs`](src/turn.rs)                   | Prompt-turn orchestration: LLM streaming, tool-call accumulation, loop control, cancellation         |
+| [`tools/`](src/tools/)                     | Built-in tool execution with two submodules:                                                         |
+| [`registry.rs`](src/tools/registry.rs)     | `ToolRegistry` trait, `ToolContext`, `AdapterToolRegistry` impl, tool metadata                       |
+| [`execution/`](src/tools/execution)        | Tool definitions, argument parsing, execution (read/write/edit/grep/glob/command), output truncation |
+| [`mcp.rs`](src/mcp.rs)                     | MCP server connection (stdio + HTTP streamable), tool-name mapping, invocation, result rendering     |
+| [`session_store.rs`](src/session_store.rs) | Filesystem-backed session metadata and JSONL chat-history persistence                                |
+| [`dev.rs`](src/dev.rs)                     | Development utilities, smoke tests, CLI testing backends                                             |
+| [`error.rs`](src/error.rs)                 | Unified domain error type (adapter crate root)                                                       |
 
 **Library Modules** (`llm` - reusable client):
 
-| Module | Responsibility |
-|--------|---------------|
-| [`llm/types.rs`](src/llm/types.rs) | Chat message, request, tool definition, and stream-event types (public facade) |
-| [`llm/client.rs`](src/llm/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `ChatClient` impl |
-| [`llm/stream.rs`](src/llm/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping |
-| [`llm/config.rs`](src/llm/config.rs) | Environment-driven config (`DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`) |
-| [`llm/error.rs`](src/llm/error.rs) | Typed error enum (config, HTTP, SSE, JSON, transport) |
+| Module                               | Responsibility                                                                        |
+| ------------------------------------ | ------------------------------------------------------------------------------------- |
+| [`llm/types.rs`](src/llm/types.rs)   | Chat message, request, tool definition, and stream-event types (public facade)        |
+| [`llm/client.rs`](src/llm/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `ChatClient` impl                      |
+| [`llm/stream.rs`](src/llm/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping                  |
+| [`llm/config.rs`](src/llm/config.rs) | Environment-driven config (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`) |
+| [`llm/error.rs`](src/llm/error.rs)   | Typed error enum (config, HTTP, SSE, JSON, transport)                                 |
 
 ### Design Principles
 
@@ -87,81 +226,11 @@ The adapter bridges two independent channels:
 ## Requirements
 
 - Rust stable
-- `DEEPSEEK_API_KEY` (required for both DeepSeek and GLM backends)
-- Optional: `DEEPSEEK_BASE_URL` (defaults to `https://api.deepseek.com` when using `--backend deepseek`)
-- Optional: `DEEPSEEK_MODEL` (defaults to `deepseek-v4-pro` for DeepSeek, `glm-4.6` for GLM)
-- Optional: `GLM_MODEL` (checked when `--backend glm`)
+- `LLM_API_KEY` (required for both DeepSeek and GLM backends)
+- Optional: `LLM_BASE_URL` (overrides the provider's default base URL)
+- Optional: `LLM_MODEL` (overrides the provider's default model)
 
 Select a provider with `--backend deepseek|glm|mock`. On both `serve` and `dev`, `--backend` is required. The `mock` backend requires no API key and is useful for local testing.
-
-
-## Editor Setup
-
-### CodeCompanion
-
-CodeCompanion uses ACP adapters for chat interactions. Extend the adapter config with this server and select it for chat.
-
-For the DeepSeek backend:
-
-```lua
-require("codecompanion").setup({
-  adapters = {
-    acp = {
-      deepseek_acp = function()
-        return require("codecompanion.adapters").extend("deepseek_acp", {
-          commands = {
-            default = {
-              "acp-llm-adapter",
-              "serve",
-              "--backend", "deepseek",
-            },
-          },
-          env = {
-            DEEPSEEK_API_KEY = "your-api-key",
-            DEEPSEEK_BASE_URL = "https://api.deepseek.com",
-            DEEPSEEK_MODEL = "deepseek-v4-pro",
-          },
-        })
-      end,
-    },
-  },
-  interactions = {
-    chat = {
-      adapter = "deepseek_acp",
-    },
-  },
-})
-```
-
-For the GLM backend, swap `--backend deepseek` for `--backend glm` and set `GLM_MODEL` (defaults to `glm-4.6`):
-
-### Zed
-
-Zed can run any ACP-capable agent as an external agent. Put the adapter command and its environment in `settings.json` under `agent_servers`.
-
-```json
-{
-  "agent_servers": {
-    "DeepSeek ACP": {
-      "type": "custom",
-      "command": "acp-llm-adapter",
-      "args": ["serve", "--backend", "deepseek"],
-      "env": {
-        "DEEPSEEK_API_KEY": "your-api-key",
-        "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
-        "DEEPSEEK_MODEL": "deepseek-v4-pro"
-      }
-    }
-  }
-}
-```
-
-To use GLM instead, change `--backend` to `"glm"` and set `GLM_MODEL` (defaults to `glm-4.6`). The API key is still read from `DEEPSEEK_API_KEY`.
-
-If Zed is launched from a GUI app launcher, it may not inherit your shell environment. Set the adapter env vars in Zed's agent server config instead of relying on your terminal session.
-
-> [!WARNING]
-> I don't have Zed so this is totally untested
 
 ## Supported Modes
 
@@ -187,30 +256,30 @@ than a filesystem sandbox.
 
 ## ACP Protocol Coverage
 
-| Feature | Status |
-|---------|--------|
-| `initialize` | ✅ Full |
-| `authenticate` | ✅ No-op (no auth required) |
-| `session/new` | ✅ Full (async path with MCP startup) |
-| `session/list` | ✅ Full |
-| `session/close` | ✅ Full |
-| `session/delete` | ✅ Full |
-| `session/load` | ✅ Full (restores persisted state and replays history) |
-| `session/resume` | ✅ Full (restores persisted state without replay) |
-| `session/prompt` | ✅ Full (text-only, tool loop, cancellation, plan/thought streaming) |
-| `session/cancel` | ✅ Full |
-| `session/set_mode` | ✅ Full |
-| `session/set_config_option` | ✅ Full |
-| `session/request_permission` | ✅ Full |
-| `agent_plan` / `current_mode_update` / `config_option_update` / `available_commands_update` | ✅ Emitted |
-| `session_info_update` | ✅ Emitted |
-| `logout` | ✅ No-op |
-| `fs/read_text_file` | ✅ Client fs or local fallback |
-| `fs/write_text_file` | ✅ Client fs or local fallback |
-| `terminal/*` | ✅ Used for `run_command` when the client advertises terminal support |
-| MCP tools (stdio) | ✅ Full |
-| MCP tools (streamable HTTP) | ✅ Full |
-| MCP tools (SSE) | ✅ Full |
+| Feature                                                                                     | Status                                                                |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `initialize`                                                                                | ✅ Full                                                               |
+| `authenticate`                                                                              | ✅ No-op (no auth required)                                           |
+| `session/new`                                                                               | ✅ Full (async path with MCP startup)                                 |
+| `session/list`                                                                              | ✅ Full                                                               |
+| `session/close`                                                                             | ✅ Full                                                               |
+| `session/delete`                                                                            | ✅ Full                                                               |
+| `session/load`                                                                              | ✅ Full (restores persisted state and replays history)                |
+| `session/resume`                                                                            | ✅ Full (restores persisted state without replay)                     |
+| `session/prompt`                                                                            | ✅ Full (text-only, tool loop, cancellation, plan/thought streaming)  |
+| `session/cancel`                                                                            | ✅ Full                                                               |
+| `session/set_mode`                                                                          | ✅ Full                                                               |
+| `session/set_config_option`                                                                 | ✅ Full                                                               |
+| `session/request_permission`                                                                | ✅ Full                                                               |
+| `agent_plan` / `current_mode_update` / `config_option_update` / `available_commands_update` | ✅ Emitted                                                            |
+| `session_info_update`                                                                       | ✅ Emitted                                                            |
+| `logout`                                                                                    | ✅ No-op                                                              |
+| `fs/read_text_file`                                                                         | ✅ Client fs or local fallback                                        |
+| `fs/write_text_file`                                                                        | ✅ Client fs or local fallback                                        |
+| `terminal/*`                                                                                | ✅ Used for `run_command` when the client advertises terminal support |
+| MCP tools (stdio)                                                                           | ✅ Full                                                               |
+| MCP tools (streamable HTTP)                                                                 | ✅ Full                                                               |
+| MCP tools (SSE)                                                                             | ✅ Full                                                               |
 
 ## Current Limitations
 

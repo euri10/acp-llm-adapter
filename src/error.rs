@@ -191,7 +191,7 @@ mod tests {
         let err = AdapterError::Llm(deepseek_err);
         let msg = err.to_string();
         assert!(msg.contains("LLM API error"));
-        assert!(msg.contains("DEEPSEEK_API_KEY is not set"));
+        assert!(msg.contains("LLM_API_KEY is not set"));
     }
 
     #[test_log::test]
@@ -282,7 +282,7 @@ mod tests {
         let acp_err: agent_client_protocol::Error = adapter_err.into();
         let msg = acp_err.to_string();
         // LLM variant hits the `other => into_internal_error` arm.
-        assert!(msg.contains("DEEPSEEK_API_KEY is not set") || msg.contains("MissingApiKey"));
+        assert!(msg.contains("LLM_API_KEY is not set") || msg.contains("MissingApiKey"));
     }
 
     #[test_log::test]

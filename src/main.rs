@@ -23,7 +23,7 @@ use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
 
 use acp_llm_adapter::error::AdapterError;
-use acp_llm_adapter::llm::FinishReason;
+use acp_llm_adapter::llm::{ChatConfig, FinishReason};
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
     SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
@@ -286,7 +286,7 @@ async fn serve(
     // base URL and the API key from the process environment so the endpoint
     // always matches the provider (DeepSeek → api.deepseek.com, GLM → api.z.ai).
     if backend != Backend::Mock {
-        let api_key = std::env::var("DEEPSEEK_API_KEY")
+        let api_key = std::env::var(ChatConfig::ENV_API_KEY)
             .ok()
             .filter(|v| !v.trim().is_empty());
 

@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ChatError {
     /// The API key environment variable was not set or was empty.
-    #[error("DEEPSEEK_API_KEY is not set")]
+    #[error("LLM_API_KEY is not set")]
     MissingApiKey,
     /// The SSE transport failed while streaming events.
     #[error("LLM SSE transport error: {0}")]

@@ -92,13 +92,29 @@ pub(crate) fn llm_client_for_backend(
             ChatClient::from_env().map_err(agent_client_protocol::Error::into_internal_error)?,
         )),
         Backend::Glm => {
-            let config = ChatConfig::from_env()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
-            let config = ChatConfig::new(
-                config.api_key().to_string(),
-                backend.default_base_url(),
-                backend.default_model(),
-            );
+            // GLM uses a different base URL and default model. The API key
+            // is read from the same `LLM_API_KEY` env var as every backend.
+            let api_key = std::env::var(ChatConfig::ENV_API_KEY)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    agent_client_protocol::Error::internal_error().data("LLM_API_KEY is not set")
+                })?;
+
+            let base_url = std::env::var(ChatConfig::ENV_BASE_URL)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| backend.default_base_url().to_string());
+
+            let model = std::env::var(ChatConfig::ENV_MODEL)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| backend.default_model().to_string());
+
+            let config = ChatConfig::new(api_key, base_url, model);
             Ok(Arc::new(ChatClient::new(config)))
         }
         Backend::Mock => Ok(Arc::new(MockLlmClient)),
@@ -350,7 +366,9 @@ mod tests {
     };
     use crate::session::DEFAULT_MAX_TURN_REQUESTS;
     use crate::tools::EmptyToolRegistry;
-    use acp_llm_adapter::llm::{ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent};
+    use acp_llm_adapter::llm::{
+        ChatConfig, ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent,
+    };
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
@@ -500,7 +518,7 @@ mod tests {
     fn llm_client_for_backend_deepseek_uses_process_environment()
     -> Result<(), agent_client_protocol::Error> {
         assert!(crate::init_tracing().is_err());
-        assert!(std::env::var("DEEPSEEK_API_KEY").is_ok());
+        assert!(std::env::var(ChatConfig::ENV_API_KEY).is_ok());
 
         let client = acp_llm_adapter::llm::ChatClient::from_env()
             .map_err(agent_client_protocol::Error::into_internal_error)?;

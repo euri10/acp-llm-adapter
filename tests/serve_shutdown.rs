@@ -26,7 +26,7 @@ use tokio::process::Command;
 
 /// Closing the child's stdin must make `serve` exit promptly.
 ///
-/// Uses the `mock` backend so no `DEEPSEEK_API_KEY` is required to reach the
+/// Uses the `mock` backend so no `LLM_API_KEY` is required to reach the
 /// serve loop. If the dangling-process hang ever regresses, the `timeout`
 /// elapses and the test fails instead of blocking the suite.
 ///

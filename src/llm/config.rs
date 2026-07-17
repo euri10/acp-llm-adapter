@@ -32,6 +32,13 @@ impl ChatConfig {
     /// Default model used by the adapter.
     pub const DEFAULT_MODEL: &str = "deepseek-v4-pro";
 
+    /// Name of the environment variable holding the LLM API key.
+    pub const ENV_API_KEY: &str = "LLM_API_KEY";
+    /// Name of the environment variable overriding the base URL.
+    pub const ENV_BASE_URL: &str = "LLM_BASE_URL";
+    /// Name of the environment variable overriding the model name.
+    pub const ENV_MODEL: &str = "LLM_MODEL";
+
     /// Create a config from explicit values.
     #[must_use]
     pub fn new(
@@ -46,10 +53,12 @@ impl ChatConfig {
         }
     }
 
-    /// Load config from `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, and `DEEPSEEK_MODEL`.
+    /// Load config from `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL`.
     ///
-    /// For the GLM backend, the API key is still read from `DEEPSEEK_API_KEY`;
-    /// the base URL and model are overridden by the backend defaults.
+    /// All three environment variables are provider-agnostic: the same var
+    /// names work regardless of which `--backend` is selected. The backend
+    /// only controls the *defaults* for base URL and model; these env vars
+    /// override them.
     ///
     /// # Errors
     ///
@@ -79,19 +88,19 @@ impl ChatConfig {
     pub(crate) fn from_env_fn(
         mut get_env: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ChatError> {
-        let api_key = get_env("DEEPSEEK_API_KEY").ok_or(ChatError::MissingApiKey)?;
+        let api_key = get_env(Self::ENV_API_KEY).ok_or(ChatError::MissingApiKey)?;
 
         let api_key = api_key.trim().to_string();
         if api_key.is_empty() {
             return Err(ChatError::MissingApiKey);
         }
 
-        let base_url = get_env("DEEPSEEK_BASE_URL")
+        let base_url = get_env(Self::ENV_BASE_URL)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| Self::DEFAULT_BASE_URL.to_string());
 
-        let model = get_env("DEEPSEEK_MODEL")
+        let model = get_env(Self::ENV_MODEL)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| Self::DEFAULT_MODEL.to_string());

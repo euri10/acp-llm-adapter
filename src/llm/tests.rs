@@ -132,7 +132,7 @@ async fn spawn_sse_server(
 #[test_log::test]
 fn config_uses_defaults_and_requires_key() -> Result<(), ChatError> {
     let config = ChatConfig::from_env_fn(|key| match key {
-        "DEEPSEEK_API_KEY" => Some("secret".to_string()),
+        "LLM_API_KEY" => Some("secret".to_string()),
         _ => None,
     })?;
 
@@ -146,7 +146,7 @@ fn config_uses_defaults_and_requires_key() -> Result<(), ChatError> {
     };
 
     assert!(matches!(error, ChatError::MissingApiKey));
-    assert_eq!(error.to_string(), "DEEPSEEK_API_KEY is not set");
+    assert_eq!(error.to_string(), "LLM_API_KEY is not set");
 
     Ok(())
 }
@@ -154,9 +154,9 @@ fn config_uses_defaults_and_requires_key() -> Result<(), ChatError> {
 #[test_log::test]
 fn config_trims_values_and_defaults_blank_entries() -> Result<(), ChatError> {
     let config = ChatConfig::from_env_fn(|key| match key {
-        "DEEPSEEK_API_KEY" => Some("  secret-token  ".to_string()),
-        "DEEPSEEK_BASE_URL" => Some("   ".to_string()),
-        "DEEPSEEK_MODEL" => Some("  custom-model  ".to_string()),
+        "LLM_API_KEY" => Some("  secret-token  ".to_string()),
+        "LLM_BASE_URL" => Some("   ".to_string()),
+        "LLM_MODEL" => Some("  custom-model  ".to_string()),
         _ => None,
     })?;
 
@@ -550,7 +550,7 @@ async fn retries_stream_on_connection_drop_before_events() -> Result<(), ChatErr
 fn deepseek_config_rejects_blank_api_key_from_environment() {
     assert!(matches!(
         ChatConfig::from_env_fn(|key| match key {
-            "DEEPSEEK_API_KEY" => Some("   ".to_string()),
+            "LLM_API_KEY" => Some("   ".to_string()),
             _ => None,
         }),
         Err(ChatError::MissingApiKey)

@@ -978,7 +978,7 @@ fn model_select_options_includes_custom_model_when_unknown() {
         .iter()
         .find(|opt| opt.value.0.as_ref() == "my-custom-model");
     let description = custom.and_then(|opt| opt.description.as_deref());
-    assert_eq!(description, Some("Current model from DEEPSEEK_MODEL."));
+    assert_eq!(description, Some("Current model from LLM_MODEL."));
 }
 
 #[test]
@@ -995,7 +995,7 @@ fn model_select_options_omits_custom_model_when_known() {
     assert!(
         !options
             .iter()
-            .any(|opt| opt.description.as_deref() == Some("Current model from DEEPSEEK_MODEL."))
+            .any(|opt| opt.description.as_deref() == Some("Current model from LLM_MODEL."))
     );
 }
 

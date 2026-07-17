@@ -402,7 +402,7 @@ pub(crate) fn model_select_options(
     if !is_known_model(current_model, available_models) {
         options.push(
             SessionConfigSelectOption::new(current_model.to_string(), current_model.to_string())
-                .description("Current model from DEEPSEEK_MODEL."),
+                .description("Current model from LLM_MODEL."),
         );
     }
 
@@ -493,15 +493,12 @@ fn is_known_model(model: &str, available_models: &[String]) -> bool {
 
 /// Return the model the adapter should default to at startup.
 ///
-/// Checks `DEEPSEEK_MODEL` first, then `GLM_MODEL`, then falls back to
-/// `fallback_model`.
+/// Checks `LLM_MODEL` first, then falls back to `fallback_model`.
 pub(crate) fn initial_model(fallback_model: impl Into<String>) -> String {
-    for var in &["DEEPSEEK_MODEL", "GLM_MODEL"] {
-        if let Ok(value) = std::env::var(var) {
-            let trimmed = value.trim().to_string();
-            if !trimmed.is_empty() {
-                return trimmed;
-            }
+    if let Ok(value) = std::env::var(ChatConfig::ENV_MODEL) {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
         }
     }
     fallback_model.into()

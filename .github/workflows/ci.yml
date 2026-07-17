@@ -63,7 +63,7 @@ jobs:
         run: cargo test --all-targets --all-features
         env:
           # Prevent accidental network calls in tests that would hang in CI.
-          DEEPSEEK_API_KEY: "skip-ci-no-key"
+          LLM_API_KEY: "skip-ci-no-key"
 
       - name: cargo test (doc-tests)
         run: cargo test --doc --all-features
