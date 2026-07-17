@@ -1,4 +1,4 @@
-//! Command-line entrypoint for the `DeepSeek` `ACP` adapter.
+//! Command-line entrypoint for the `acp-llm-adapter`.
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -68,7 +68,7 @@ pub(crate) use session::{
 const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");
 const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Returns the list of available slash commands for the `DeepSeek` adapter.
+/// Returns the list of available slash commands for the ACP LLM adapter.
 ///
 /// These commands are advertised to the client via `AvailableCommandsUpdate`
 /// after session creation, letting users invoke common workflows.
@@ -105,7 +105,7 @@ fn adapter_available_commands() -> Vec<AvailableCommand> {
 #[command(
     name = "acp-llm-adapter",
     version,
-    about = "ACP stdio adapter for DeepSeek-backed coding sessions"
+    about = "ACP stdio adapter for LLM-backed coding sessions (DeepSeek, GLM)"
 )]
 struct Cli {
     #[command(subcommand)]

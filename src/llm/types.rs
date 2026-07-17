@@ -25,7 +25,7 @@ impl MessageRole {
     }
 }
 
-/// A single chat message passed to `DeepSeek`.
+/// A single chat message passed to the LLM.
 ///
 /// Use constructor helpers such as [`ChatMessage::system`] and
 /// [`ChatMessage::tool_result`] to keep role-specific fields consistent.
@@ -165,7 +165,7 @@ impl From<&ChatMessage> for WireMessage {
     }
 }
 
-/// A callable function advertised to `DeepSeek`.
+/// A callable function advertised to the LLM.
 ///
 /// The `parameters` value should be a JSON Schema object describing the
 /// expected argument shape.
@@ -349,7 +349,7 @@ pub(crate) type ChatRequestParts = (
     Option<u32>,
 );
 
-/// A chat-completions request that can be streamed from `DeepSeek`.
+/// A chat-completions request that can be streamed from the LLM.
 ///
 /// Requests are immutable builder values: start with [`ChatRequest::new`]
 /// and then add optional tools, model overrides, or reasoning effort.
@@ -470,7 +470,7 @@ pub struct UsageData {
     pub context_length: u64,
 }
 
-/// A normalized update emitted while streaming a `DeepSeek` response.
+/// A normalized update emitted while streaming an LLM response.
 ///
 /// This flattens provider wire chunks into events the adapter can consume
 /// incrementally without exposing the raw SSE schema.
@@ -543,7 +543,7 @@ impl ToolCallDelta {
     }
 }
 
-/// Terminal finish reasons returned by `DeepSeek`.
+/// Terminal finish reasons returned by the LLM.
 ///
 /// These are normalized from provider-specific strings and can be mapped to
 /// the adapter's higher-level stop reasons.

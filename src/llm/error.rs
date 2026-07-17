@@ -5,7 +5,7 @@ use thiserror::Error;
 /// Errors returned by LLM client configuration, request setup, or SSE parsing.
 #[derive(Debug, Error)]
 pub enum ChatError {
-    /// The `DEEPSEEK_API_KEY` environment variable was not set or was empty.
+    /// The API key environment variable was not set or was empty.
     #[error("DEEPSEEK_API_KEY is not set")]
     MissingApiKey,
     /// The SSE transport failed while streaming events.

@@ -11,10 +11,10 @@ use super::stream::run_stream_attempt;
 use super::types::{ChatRequest, WireMessage, WireToolDefinition};
 use super::{ChatConfig, ChatError, StreamEvent};
 
-/// A `DeepSeek` chat-completions client.
+/// An OpenAI-compatible chat-completions client.
 ///
 /// The client implements [`LlmClient`] and streams normalized
-/// [`StreamEvent`] values from `DeepSeek`'s OpenAI-compatible chat endpoint.
+/// [`StreamEvent`] values from the provider's OpenAI-compatible chat endpoint.
 ///
 /// # Examples
 ///
@@ -233,13 +233,13 @@ impl LlmClient for ChatClient {
                 stream = true,
                 reasoning_effort = ?reasoning_effort,
                 max_tokens = ?max_tokens,
-                "sending chat completion request to DeepSeek"
+                "sending chat completion request to LLM provider"
             );
 
             if tracing::enabled!(tracing::Level::TRACE) {
                 // Serialize the full body for trace-level debugging
                 if let Ok(request_json) = serde_json::to_string(&body) {
-                    tracing::trace!(request_body = %request_json, "DeepSeek request body");
+                    tracing::trace!(request_body = %request_json, "LLM request body");
                 }
             }
 

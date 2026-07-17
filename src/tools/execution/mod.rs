@@ -34,7 +34,7 @@ const COMMAND_OUTPUT_LIMIT: usize = 20_000;
 /// The line/entry caps ([`TOOL_OUTPUT_LIMIT`]) already bound normal files. This
 /// is a safety net for pathological wide-line inputs (e.g. minified assets)
 /// whose single lines would otherwise add multi-megabyte tool results to the
-/// conversation history and eventually 400 the `DeepSeek` API.
+/// conversation history and eventually 400 the LLM API.
 const FILE_OUTPUT_LIMIT: usize = 65_536;
 
 #[derive(Debug, Deserialize)]

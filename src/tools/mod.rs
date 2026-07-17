@@ -1,4 +1,4 @@
-//! Built-in tool execution for the `DeepSeek` `ACP` adapter.
+//! Built-in tool execution for the `acp-llm-adapter`.
 //!
 //! Modules:
 //! - `registry`: `ToolContext`, `ToolRegistry`, registry impls, `ToolExecution`

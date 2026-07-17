@@ -49,7 +49,7 @@ pub(crate) const REASONING_EFFORT_MAX_ID: &str = "max";
 pub(crate) const MAX_TOKENS_DEFAULT_ID: &str = "default";
 /// Preset `max_tokens` values offered in the session config selector.
 ///
-/// `DeepSeek`'s chat-completions API accepts any positive integer for
+/// The provider's chat-completions API accepts any positive integer for
 /// `max_tokens` (bounded by the model's max output), but ACP session config
 /// options only support fixed selectable values, not freeform text input.
 /// These presets cover common output-length budgets.
@@ -155,8 +155,8 @@ impl ReasoningEffort {
 
     pub(crate) const fn description(self) -> &'static str {
         match self {
-            Self::High => "Default DeepSeek thinking effort.",
-            Self::Max => "Maximum DeepSeek thinking effort for complex agent work.",
+            Self::High => "Default reasoning effort.",
+            Self::Max => "Maximum reasoning effort for complex agent work.",
         }
     }
 
@@ -431,11 +431,11 @@ fn reasoning_effort_select_options() -> Vec<SessionConfigSelectOption> {
 }
 
 /// Selectable `max_tokens` values, plus a `default` entry meaning "unset -
-/// let `DeepSeek` use its own default output length".
+/// let the provider use its own default output length".
 fn max_tokens_select_options() -> Vec<SessionConfigSelectOption> {
     let mut options = vec![
         SessionConfigSelectOption::new(MAX_TOKENS_DEFAULT_ID, "Default")
-            .description("Use DeepSeek's own default output length."),
+            .description("Use the provider's own default output length."),
     ];
     options.extend(
         MAX_TOKENS_PRESETS
@@ -633,7 +633,7 @@ pub(crate) struct SessionRecord {
     pub(crate) mode: SessionBehavior,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
-    /// Maximum tokens `DeepSeek` may generate per response. `None` means use
+    /// Maximum tokens the LLM may generate per response. `None` means use
     /// the model's own default (the parameter is omitted from the request).
     pub(crate) max_tokens: Option<u32>,
     pub(crate) permission_allow_always: HashSet<String>,

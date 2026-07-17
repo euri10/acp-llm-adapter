@@ -1,4 +1,4 @@
-//! Shared test utilities for the `DeepSeek` `ACP` adapter.
+//! Shared test utilities for the `acp-llm-adapter`.
 //!
 //! This module provides fakes and helpers that are used by unit tests across
 //! multiple source files.  It is only compiled in `#[cfg(test)]` mode.

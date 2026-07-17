@@ -295,7 +295,7 @@ pub(crate) fn mcp_tool_mappings(server_name: &str, tools: Vec<McpTool>) -> Vec<M
                 || format!("MCP tool '{original_name}' from server '{server_name}'"),
                 |description| description.to_string(),
             );
-            // DeepSeek API requires tool parameters to have type: "object" at the root.
+            // The OpenAI-compatible API requires tool parameters to have type: "object" at the root.
             // MCP schemas might not have this structure, so we ensure it's properly wrapped.
             let schema = validate_tool_schema(tool.input_schema.as_ref());
             let definition = ToolDefinition::new(exposed_name.clone(), description, schema);
@@ -309,9 +309,9 @@ pub(crate) fn mcp_tool_mappings(server_name: &str, tools: Vec<McpTool>) -> Vec<M
         .collect()
 }
 
-/// Validate and normalize a tool schema for `DeepSeek` API compatibility.
+/// Validate and normalize a tool schema for provider API compatibility.
 ///
-/// `DeepSeek` requires tool parameters to be a JSON schema with `type: "object"` at the root.
+/// The provider requires tool parameters to be a JSON schema with `type: "object"` at the root.
 /// If the schema doesn't have this structure, wrap it appropriately.
 fn validate_tool_schema(schema: &JsonObject) -> Value {
     let schema_value = Value::Object(schema.clone());

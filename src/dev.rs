@@ -1,7 +1,7 @@
 //! Dev/smoke-test harness for local adapter development.
 //!
 //! Mocks the LLM client and permission requester so the full ACP adapter
-//! pipeline can be exercised without hitting the `DeepSeek` API.
+//! pipeline can be exercised without hitting a live LLM API.
 
 // stdout is the JSON-RPC wire; this harness is the only place where
 // developer-facing output is intentionally printed to stdout.

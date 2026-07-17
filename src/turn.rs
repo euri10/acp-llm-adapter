@@ -51,7 +51,7 @@ struct PromptTurnEnvironment<'a> {
 
 /// Filter messages to fit within a byte budget, keeping the first and most recent messages.
 ///
-/// `CloudFront` (the CDN in front of `DeepSeek` API) enforces a ~1MB request size limit.
+/// The provider API enforces a request size limit (e.g. ~1MB for CloudFront-backed endpoints).
 /// We filter messages to stay well under this limit (512KB budget) to ensure requests
 /// complete successfully. The filter keeps the first message and as many recent
 /// tool-call units as fit within the budget, dropping older messages if needed. A
@@ -117,7 +117,7 @@ fn filter_messages_truncate(messages: &[ChatMessage], max_bytes: usize) -> Vec<C
 
     // Validate tool result messages: only keep tool results if the corresponding
     // tool call is present in the filtered messages. This prevents orphaned tool
-    // results from causing 400 Bad Request errors from DeepSeek.
+    // results from causing 400 Bad Request errors from the LLM API.
     validate_tool_results(&filtered)
 }
 
@@ -150,7 +150,7 @@ fn group_tool_call_units(messages: &[ChatMessage]) -> Vec<Vec<ChatMessage>> {
 ///
 /// Removes any tool result messages whose referenced `tool_call_id` doesn't appear
 /// in an assistant message within the filtered history. This prevents orphaned
-/// tool responses which violate the `OpenAI`/`DeepSeek` API contract.
+/// tool responses which violate the OpenAI-compatible API contract.
 #[allow(clippy::indexing_slicing)]
 fn validate_tool_results(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     // Collect all tool call IDs from assistant messages
@@ -184,11 +184,11 @@ fn validate_tool_results(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         .collect()
 }
 
-/// Repair a filtered message list into a shape the `DeepSeek` chat API accepts.
+/// Repair a filtered message list into a shape the provider's chat API accepts.
 ///
 /// Size-based filtering ([`filter_messages_by_size`]) drops assistant+tool
 /// groups from the middle of the conversation, leaving two artifacts that
-/// `DeepSeek` rejects with 400 Bad Request:
+/// the provider rejects with 400 Bad Request:
 ///
 /// - **Empty assistant messages** (no content and no tool calls), which
 ///   serialize to `{"role":"assistant"}` and violate the API contract. These
@@ -558,7 +558,7 @@ pub(crate) async fn stream_model_turn(
 
     // Repair the structural artifacts that size filtering (and history) can
     // leave behind - consecutive same-role messages and empty assistant
-    // messages - which DeepSeek otherwise rejects with 400 Bad Request.
+    // messages - which the provider otherwise rejects with 400 Bad Request.
     let filtered_messages = sanitize_conversation(filtered_messages);
 
     let mut chat_request = ChatRequest::new(filtered_messages)
@@ -675,7 +675,7 @@ pub(crate) struct ModelTurn {
     pub(crate) assistant_text: String,
     /// Fully assembled tool calls emitted by the model.
     pub(crate) tool_calls: Vec<ChatToolCall>,
-    /// Raw finish reason reported by `DeepSeek`.
+    /// Raw finish reason reported by the LLM.
     pub(crate) finish_reason: FinishReason,
     /// ACP stop reason derived for the client.
     pub(crate) stop_reason: StopReason,
@@ -806,9 +806,10 @@ pub(crate) fn tool_raw_input(call: &ChatToolCall) -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::Value::String(call.arguments().to_string()))
 }
 
-/// Get the context window size for a `DeepSeek` model.
+/// Get the context window size for a model.
 ///
 /// Returns the context window size in tokens. Falls back to `1_000_000` for unknown models.
+/// Only `deepseek-chat` has an explicit override; GLM models fall through to the default.
 /// See: <https://api-docs.deepseek.com/quick_start/pricing>
 #[must_use]
 fn get_context_length_for_model(model: &str) -> u64 {

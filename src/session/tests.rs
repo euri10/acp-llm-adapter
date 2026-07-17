@@ -74,12 +74,12 @@ fn reasoning_effort_name_and_description() {
     assert!(
         ReasoningEffort::High
             .description()
-            .contains("Default DeepSeek")
+            .contains("Default reasoning")
     );
     assert!(
         ReasoningEffort::Max
             .description()
-            .contains("Maximum DeepSeek")
+            .contains("Maximum reasoning")
     );
 }
 

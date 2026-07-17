@@ -1,6 +1,6 @@
 use super::ChatError;
 
-/// Configuration for the `DeepSeek` client.
+/// Configuration for the LLM client.
 ///
 /// Values can be provided explicitly with [`ChatConfig::new`] or loaded
 /// from the process environment with [`ChatConfig::from_env`].
@@ -27,7 +27,7 @@ pub struct ChatConfig {
 }
 
 impl ChatConfig {
-    /// Default `DeepSeek` OpenAI-compatible base URL.
+    /// Default `DeepSeek` base URL (used when `--backend deepseek`).
     pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
     /// Default model used by the adapter.
     pub const DEFAULT_MODEL: &str = "deepseek-v4-pro";
@@ -47,6 +47,9 @@ impl ChatConfig {
     }
 
     /// Load config from `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, and `DEEPSEEK_MODEL`.
+    ///
+    /// For the GLM backend, the API key is still read from `DEEPSEEK_API_KEY`;
+    /// the base URL and model are overridden by the backend defaults.
     ///
     /// # Errors
     ///

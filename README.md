@@ -1,6 +1,6 @@
-# DeepSeek ACP Adapter
+# ACP LLM Adapter
 
-`acp-llm-adapter` is a headless ACP server that exposes DeepSeek as an agent to ACP-capable editors.
+`acp-llm-adapter` is a headless ACP server that exposes LLM providers (DeepSeek, GLM) as agents to ACP-capable editors.
 
 > [!WARNING]
 > This is alpha software. Expect breaking changes, incomplete ACP coverage, and rough edges while the adapter is still being shaped.
@@ -25,10 +25,10 @@ The adapter bridges two independent channels:
 │                         acp-llm-adapter                                           │
 │                                                                                        │
 │  Editor ──ACP/stdio──▶ ┌─────────────────┐  ┌─────────────────┐                        │
-│  (Zed,      JSON-RPC   │  acp.rs         │  │  deepseek/*     │                        │
-│   Neovim,   frames  ◀──│  ACP transport  │  │  HTTPS + SSE    │──▶ DeepSeek API        │
-│   ...)                 │  + request      │  │  client, types, │  │  api.deepseek.com   │
-│                        │  handlers       │  │  stream parser  │  │ /chat/completions   │
+│  (Zed,      JSON-RPC   │  acp.rs         │  │  llm/*          │                        │
+│   Neovim,   frames  ◀──│  ACP transport  │  │  HTTPS + SSE    │──▶ LLM Provider API    │
+│   ...)                 │  + request      │  │  client, types, │  │  (DeepSeek / GLM)    │
+│                        │  handlers       │  │  stream parser  │  │ /chat/completions    │
 │                        └─────────┬───────┘  └────────┬────────┘                        │
 │                                  │                   │                                 │
 │                           ┌──────▼───────────────────▼──────────────────┐              │
@@ -44,9 +44,9 @@ The adapter bridges two independent channels:
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Left side** — the adapter speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio as JSON-RPC 2.0 frames. The `agent-client-protocol` crate handles the wire protocol; [`acp.rs`](src/acp.rs) registers request handlers and translates between ACP schema types and the adapter's internal types.
+**Left side** — the adapter speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio as JSON-RPC 2.0 frames. The `agent-client-protocol` crate handles the wire protocol; [`acp/`](src/acp/) registers request handlers and translates between ACP schema types and the adapter's internal types.
 
-**Right side** — the adapter speaks HTTPS + Server-Sent Events to DeepSeek's OpenAI-compatible `/chat/completions` endpoint via a thin client owned by this crate in [`src/deepseek/`](src/deepseek/). A [`LlmClient`](src/deepseek/client.rs) trait provides the mock seam for testing without a live API key.
+**Right side** — the adapter speaks HTTPS + Server-Sent Events to the provider's OpenAI-compatible `/chat/completions` endpoint via a thin client owned by this crate in [`src/llm/`](src/llm/). A [`LlmClient`](src/llm/client.rs) trait provides the mock seam for testing without a live API key.
 
 **Middle** — the adapter is the translator *and* the agent harness. [`turn.rs`](src/turn.rs) orchestrates the prompt→tool-call→execute→feed-back loop. [`tools.rs`](src/tools.rs) registers built-in tools (read/write/edit files, glob, grep, shell commands) and routes execution to the right backend. [`mcp.rs`](src/mcp.rs) connects to external MCP servers and exposes their tools through the same loop. [`session_store.rs`](src/session_store.rs) provides optional filesystem persistence so sessions survive process restarts.
 
@@ -67,15 +67,15 @@ The adapter bridges two independent channels:
 | [`dev.rs`](src/dev.rs) | Development utilities, smoke tests, CLI testing backends |
 | [`error.rs`](src/error.rs) | Unified domain error type (adapter crate root) |
 
-**Library Modules** (`deepseek` - reusable client):
+**Library Modules** (`llm` - reusable client):
 
 | Module | Responsibility |
 |--------|---------------|
-| [`deepseek/types.rs`](src/deepseek/types.rs) | Chat message, request, tool definition, and stream-event types (public facade) |
-| [`deepseek/client.rs`](src/deepseek/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `ChatClient` impl |
-| [`deepseek/stream.rs`](src/deepseek/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping |
-| [`deepseek/config.rs`](src/deepseek/config.rs) | Environment-driven config (`DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`) |
-| [`deepseek/error.rs`](src/deepseek/error.rs) | Typed error enum (config, HTTP, SSE, JSON, transport) |
+| [`llm/types.rs`](src/llm/types.rs) | Chat message, request, tool definition, and stream-event types (public facade) |
+| [`llm/client.rs`](src/llm/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `ChatClient` impl |
+| [`llm/stream.rs`](src/llm/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping |
+| [`llm/config.rs`](src/llm/config.rs) | Environment-driven config (`DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`) |
+| [`llm/error.rs`](src/llm/error.rs) | Typed error enum (config, HTTP, SSE, JSON, transport) |
 
 ### Design Principles
 
@@ -87,12 +87,12 @@ The adapter bridges two independent channels:
 ## Requirements
 
 - Rust stable
-- `DEEPSEEK_API_KEY`
-- Optional: `DEEPSEEK_BASE_URL`
-- Optional: `DEEPSEEK_MODEL`
+- `DEEPSEEK_API_KEY` (required for both DeepSeek and GLM backends)
+- Optional: `DEEPSEEK_BASE_URL` (defaults to `https://api.deepseek.com` when using `--backend deepseek`)
+- Optional: `DEEPSEEK_MODEL` (defaults to `deepseek-v4-pro` for DeepSeek, `glm-4.6` for GLM)
+- Optional: `GLM_MODEL` (checked when `--backend glm`)
 
-If `DEEPSEEK_BASE_URL` is unset, the adapter uses `https://api.deepseek.com`.
-If `DEEPSEEK_MODEL` is unset, the adapter uses `deepseek-v4-pro`.
+Select a provider with `--backend deepseek|glm|mock`. The `mock` backend requires no API key and is useful for local testing.
 
 
 ## Editor Setup
@@ -100,6 +100,8 @@ If `DEEPSEEK_MODEL` is unset, the adapter uses `deepseek-v4-pro`.
 ### CodeCompanion
 
 CodeCompanion uses ACP adapters for chat interactions. Extend the adapter config with this server and select it for chat.
+
+For the DeepSeek backend:
 
 ```lua
 require("codecompanion").setup({
@@ -111,6 +113,7 @@ require("codecompanion").setup({
             default = {
               "acp-llm-adapter",
               "serve",
+              "--backend", "deepseek",
             },
           },
           env = {
@@ -130,6 +133,8 @@ require("codecompanion").setup({
 })
 ```
 
+For the GLM backend, swap `--backend deepseek` for `--backend glm` and set `GLM_MODEL` (defaults to `glm-4.6`):
+
 ### Zed
 
 Zed can run any ACP-capable agent as an external agent. Put the adapter command and its environment in `settings.json` under `agent_servers`.
@@ -140,7 +145,7 @@ Zed can run any ACP-capable agent as an external agent. Put the adapter command 
     "DeepSeek ACP": {
       "type": "custom",
       "command": "acp-llm-adapter",
-      "args": ["serve"],
+      "args": ["serve", "--backend", "deepseek"],
       "env": {
         "DEEPSEEK_API_KEY": "your-api-key",
         "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
@@ -150,6 +155,8 @@ Zed can run any ACP-capable agent as an external agent. Put the adapter command 
   }
 }
 ```
+
+To use GLM instead, change `--backend` to `"glm"` and set `GLM_MODEL` (defaults to `glm-4.6`). The API key is still read from `DEEPSEEK_API_KEY`.
 
 If Zed is launched from a GUI app launcher, it may not inherit your shell environment. Set the adapter env vars in Zed's agent server config instead of relying on your terminal session.
 
@@ -214,7 +221,7 @@ than a filesystem sandbox.
 
 ## Library API
 
-The crate also exposes a reusable `deepseek` module for request construction and
+The crate also exposes a reusable `llm` module for request construction and
 streaming response handling. Generate the API docs locally with:
 
 ```bash
@@ -223,16 +230,16 @@ cargo doc --no-deps
 
 Typical library entry points:
 
-- `deepseek::ChatMessage` for system, user, assistant, and tool-result messages
-- `deepseek::ChatRequest` for model/tool request construction
-- `deepseek::ToolDefinition` for JSON-schema tool advertisement
-- `deepseek::StreamEvent` for normalized streamed output
-- `deepseek::ChatClient` for HTTP-backed streaming requests
+- `llm::ChatMessage` for system, user, assistant, and tool-result messages
+- `llm::ChatRequest` for model/tool request construction
+- `llm::ToolDefinition` for JSON-schema tool advertisement
+- `llm::StreamEvent` for normalized streamed output
+- `llm::ChatClient` for HTTP-backed streaming requests
 
 Minimal streaming example:
 
 ```rust,no_run
-use acp_llm_adapter::deepseek::{ChatMessage, ChatRequest, ChatClient, LlmClient};
+use acp_llm_adapter::llm::{ChatMessage, ChatRequest, ChatClient, LlmClient};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
