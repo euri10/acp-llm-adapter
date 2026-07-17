@@ -1,7 +1,7 @@
 #![allow(clippy::indexing_slicing)]
 use super::*;
 use crate::acp::handle_new_session_request;
-use crate::session::PERMISSION_ALLOW_ONCE_OPTION_ID;
+use crate::session::{PERMISSION_ALLOW_ONCE_OPTION_ID, SessionBehavior};
 use crate::test_store;
 use crate::test_utils::{
     CancelTracker, CountingReadTextFileRequester, FailingWriteRequester, FakePermissionRequester,
@@ -1962,6 +1962,40 @@ fn update_plan_tool_execution_rejects_invalid_json() {
 
     assert!(!result.success);
     assert!(result.content.contains("invalid update_plan arguments"));
+}
+
+#[test_log::test(tokio::test)]
+async fn exit_plan_mode_tool_execution_switches_to_accept_edits()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+
+    let context = ToolContext {
+        session_id: session.session_id.clone(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        additional_directories: Vec::new(),
+        client_capabilities: None,
+    };
+    let call = DeepSeekToolCall::new("exit-plan", "exit_plan_mode", "{}");
+
+    let result = exit_plan_mode_tool_execution(&store, &call, &context).await;
+
+    assert!(result.success);
+    assert_eq!(result.content, "switched to Accept edits mode");
+    assert_eq!(result.raw_output["mode_id"], "accept-edits");
+    assert_eq!(result.raw_output["mode_name"], "Accept edits");
+
+    let guard = store
+        .state
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("missing stored session")
+    })?;
+    assert_eq!(stored.mode, SessionBehavior::AcceptEdits);
+
+    Ok(())
 }
 
 #[test]

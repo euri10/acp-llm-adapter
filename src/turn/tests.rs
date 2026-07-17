@@ -5,17 +5,19 @@ use crate::acp::{
     WriteTextFileRequester, handle_delete_session_request, handle_new_session_request,
     handle_set_session_config_option_request,
 };
-use crate::session::{DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionBehavior, SessionStore};
+use crate::session::{
+    DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SESSION_CONFIG_MODE_ID, SessionBehavior,
+    SessionStore,
+};
 use crate::test_store;
-use crate::test_utils::FakePermissionRequester;
+use crate::test_utils::{FakePermissionRequester, select_current_value};
 use crate::tools::{
     AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry,
 };
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, DeleteSessionRequest, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    StopReason, ToolCallContent, ToolCallStatus, ToolKind,
+    RequestPermissionRequest, RequestPermissionResponse, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, MessageRole, StreamEvent,
@@ -264,41 +266,6 @@ impl TerminalRequester for TransitionRequester {
     }
 }
 
-fn assert_plan_exit_prompt(request: &ChatRequest) {
-    assert_eq!(request.messages()[0].role(), MessageRole::System);
-    assert!(request.messages()[0].content().contains("Plan mode"));
-    assert!(
-        request
-            .tools()
-            .iter()
-            .any(|tool| tool.name() == "exit_plan_mode")
-    );
-    assert!(
-        !request
-            .tools()
-            .iter()
-            .any(|tool| tool.name() == "write_file")
-    );
-    assert!(
-        !request
-            .tools()
-            .iter()
-            .any(|tool| tool.name() == "run_command")
-    );
-}
-
-fn assert_exit_mode_transition_request(request: &RequestPermissionRequest) {
-    assert_eq!(request.options.len(), 3);
-    assert_eq!(
-        request
-            .options
-            .iter()
-            .map(|option| option.option_id.0.as_ref())
-            .collect::<Vec<_>>(),
-        vec!["ask", "accept-edits", "yolo"]
-    );
-}
-
 fn assert_normal_request(request: &ChatRequest) {
     assert!(
         request
@@ -324,6 +291,30 @@ fn assert_normal_request(request: &ChatRequest) {
             .iter()
             .any(|tool| tool.name() == "update_plan")
     );
+}
+
+fn assert_plan_mode_exit_notifications(notifications: &[SessionNotification]) {
+    assert!(notifications.iter().any(|notification| matches!(
+        notification.update,
+        SessionUpdate::CurrentModeUpdate(ref update)
+            if update.current_mode_id.0.as_ref() == "accept-edits"
+    )));
+    assert!(notifications.iter().any(|notification| matches!(
+        notification.update,
+        SessionUpdate::ConfigOptionUpdate(ref update)
+            if select_current_value(&update.config_options, SESSION_CONFIG_MODE_ID)
+                .is_ok_and(|value| value == "accept-edits")
+    )));
+}
+
+fn assert_no_permission_requests(
+    requests: &Arc<Mutex<Vec<RequestPermissionRequest>>>,
+) -> Result<(), agent_client_protocol::Error> {
+    let request_guard = requests
+        .lock()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    assert_eq!(request_guard.len(), 0);
+    Ok(())
 }
 
 struct FakeToolRegistry {
@@ -889,9 +880,7 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
         ],
     ]);
     let requests = client.requests();
-    let requester = TransitionRequester::new(vec![RequestPermissionResponse::new(
-        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("ask")),
-    )]);
+    let requester = TransitionRequester::new(vec![]);
     let requester_requests = requester.requests();
     let registry = AdapterToolRegistry;
     let mut notifications = Vec::new();
@@ -914,27 +903,22 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
     .await?;
 
     assert_eq!(response.stop_reason, StopReason::EndTurn);
-    assert!(notifications.iter().any(|notification| matches!(
-        notification.update,
-        SessionUpdate::CurrentModeUpdate(ref update)
-            if update.current_mode_id.0.as_ref() == "ask"
-    )));
+    assert_plan_mode_exit_notifications(&notifications);
 
     {
         let request_guard = requests
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         assert_eq!(request_guard.len(), 1);
-        assert_plan_exit_prompt(&request_guard[0]);
+        assert!(
+            request_guard[0]
+                .tools()
+                .iter()
+                .any(|tool| tool.name() == "exit_plan_mode")
+        );
     }
 
-    {
-        let transition_guard = requester_requests
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        assert_eq!(transition_guard.len(), 1);
-        assert_exit_mode_transition_request(&transition_guard[0]);
-    }
+    assert_no_permission_requests(&requester_requests)?;
 
     {
         let state_guard = store
@@ -948,7 +932,7 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
                 agent_client_protocol::Error::internal_error()
                     .data("missing stored session after transition")
             })?;
-        assert_eq!(stored.mode, SessionBehavior::Ask);
+        assert_eq!(stored.mode, SessionBehavior::AcceptEdits);
     }
 
     handle_prompt_request(

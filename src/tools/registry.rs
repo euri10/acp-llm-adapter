@@ -177,15 +177,7 @@ impl ToolRegistry for AdapterToolRegistry {
                     .await
                 }
                 "update_plan" => update_plan_tool_execution(call),
-                "exit_plan_mode" => {
-                    exit_plan_mode_tool_execution(
-                        store,
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn crate::PermissionRequester),
-                    )
-                    .await
-                }
+                "exit_plan_mode" => exit_plan_mode_tool_execution(store, call, context).await,
                 name if crate::is_mcp_tool_name(name) => {
                     crate::mcp_tool_execution(store, call, context).await
                 }

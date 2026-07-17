@@ -238,66 +238,6 @@ pub(crate) async fn request_tool_permission(
     Ok(decision)
 }
 
-/// Ask the client which mode should replace Plan mode and return the choice.
-///
-/// # Errors
-///
-/// Returns an [`AdapterError`] when the session is not in Plan mode, the
-/// permission request cannot be sent, or the client returns an unrecognized
-/// outcome.
-pub(crate) async fn request_plan_mode_exit(
-    store: &SessionStore,
-    context: &ToolContext,
-    call: &DeepSeekToolCall,
-    requester: &dyn PermissionRequester,
-) -> Result<Option<SessionBehavior>, AdapterError> {
-    if store.session_behavior(&context.session_id)? != SessionBehavior::Plan {
-        return Err(AdapterError::InvalidRequest(
-            "plan mode exit is only available while in Plan mode".to_string(),
-        ));
-    }
-
-    let request = RequestPermissionRequest::new(
-        context.session_id.clone(),
-        ToolCallUpdate::new(
-            call.id().to_string(),
-            ToolCallUpdateFields::new()
-                .kind(ToolKind::Think)
-                .status(ToolCallStatus::Pending)
-                .title("Exit plan mode")
-                .raw_input(tool_raw_input(call)),
-        ),
-        plan_mode_exit_options(),
-    );
-
-    let response = requester
-        .request_permission(request)
-        .await
-        .map_err(|error| AdapterError::Internal(error.to_string()))?;
-
-    match response.outcome {
-        RequestPermissionOutcome::Cancelled => Ok(None),
-        RequestPermissionOutcome::Selected(selected) => {
-            let Some(mode) = SessionBehavior::from_mode_id_str(selected.option_id.0.as_ref())
-            else {
-                return Err(AdapterError::InvalidParams(format!(
-                    "unknown plan mode transition option selected: {}",
-                    selected.option_id.0
-                )));
-            };
-            if mode == SessionBehavior::Plan {
-                return Err(AdapterError::InvalidParams(
-                    "plan mode exit cannot select Plan mode".to_string(),
-                ));
-            }
-            Ok(Some(mode))
-        }
-        _ => Err(AdapterError::InvalidParams(
-            "unsupported permission outcome variant".to_string(),
-        )),
-    }
-}
-
 fn permission_options() -> Vec<PermissionOption> {
     vec![
         PermissionOption::new(
@@ -321,23 +261,6 @@ fn permission_options() -> Vec<PermissionOption> {
             PermissionOptionKind::RejectAlways,
         ),
     ]
-}
-
-fn plan_mode_exit_options() -> Vec<PermissionOption> {
-    [
-        SessionBehavior::Ask,
-        SessionBehavior::AcceptEdits,
-        SessionBehavior::Yolo,
-    ]
-    .into_iter()
-    .map(|mode| {
-        PermissionOption::new(
-            mode.mode_id().0.to_string(),
-            mode.name().to_string(),
-            PermissionOptionKind::AllowOnce,
-        )
-    })
-    .collect()
 }
 
 #[derive(Debug, Default)]

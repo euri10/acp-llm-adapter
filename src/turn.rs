@@ -3,10 +3,10 @@
 use std::num::NonZeroUsize;
 
 use agent_client_protocol::schema::v1::{
-    ContentChunk, Diff, MessageId, Plan, PromptRequest, PromptResponse, SessionId,
-    SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason, ToolCall as AcpToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind, Usage, UsageUpdate,
+    ConfigOptionUpdate, ContentChunk, Diff, MessageId, Plan, PromptRequest, PromptResponse,
+    SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
+    ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
 };
 use deepseek_acp_adapter::deepseek::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
@@ -460,12 +460,7 @@ async fn run_prompt_turn(
         env.store.save_history(&env.request.session_id, &messages)?;
 
         if let Some(mode) = pending_mode_transition {
-            notify(session_notification(
-                env.request.session_id.clone(),
-                SessionUpdate::CurrentModeUpdate(
-                    agent_client_protocol::schema::v1::CurrentModeUpdate::new(mode.mode_id()),
-                ),
-            ))?;
+            emit_mode_transition_notifications(env.store, &env.request.session_id, mode, notify)?;
             stop_reason = StopReason::EndTurn;
             break;
         }
@@ -506,6 +501,26 @@ fn transition_mode_from_tool_result(
     };
 
     Ok(Some(mode))
+}
+
+fn emit_mode_transition_notifications(
+    store: &SessionStore,
+    session_id: &SessionId,
+    mode: SessionBehavior,
+    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<(), agent_client_protocol::Error> {
+    notify(session_notification(
+        session_id.clone(),
+        SessionUpdate::CurrentModeUpdate(
+            agent_client_protocol::schema::v1::CurrentModeUpdate::new(mode.mode_id()),
+        ),
+    ))?;
+    let config_options = store.session_config_options(session_id)?;
+    notify(session_notification(
+        session_id.clone(),
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
+    ))?;
+    Ok(())
 }
 
 /// Stream a single LLM turn, collecting assistant text and pending tool calls.

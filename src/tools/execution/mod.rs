@@ -21,9 +21,8 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::registry::{ToolContext, ToolEdit, ToolExecution};
-use crate::session::request_plan_mode_exit;
 use crate::{
-    PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionStore,
+    PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionBehavior, SessionStore,
     TerminalRequester, WriteTextFileRequester, request_tool_permission,
 };
 
@@ -278,7 +277,6 @@ pub(crate) async fn exit_plan_mode_tool_execution(
     store: &SessionStore,
     call: &DeepSeekToolCall,
     context: &ToolContext,
-    requester: Option<&dyn PermissionRequester>,
 ) -> ToolExecution {
     let _arguments = match serde_json::from_str::<serde_json::Value>(call.arguments()) {
         Ok(arguments) => arguments,
@@ -287,24 +285,28 @@ pub(crate) async fn exit_plan_mode_tool_execution(
         }
     };
 
-    let Some(requester) = requester else {
-        return ToolExecution::failed(
-            "exit_plan_mode requires a client connection that can request permissions",
-        );
-    };
+    match store.session_behavior(&context.session_id) {
+        Ok(SessionBehavior::Plan) => {}
+        Ok(_) => {
+            return ToolExecution::failed("exit_plan_mode is only available while in Plan mode");
+        }
+        Err(error) => {
+            return ToolExecution::failed(format!("failed to exit plan mode: {error}"));
+        }
+    }
 
-    match request_plan_mode_exit(store, context, call, requester).await {
-        Ok(Some(mode)) => ToolExecution {
-            content: format!("switched to {} mode", mode.name()),
-            raw_output: serde_json::json!({
-                "mode_id": mode.mode_id().0,
-                "mode_name": mode.name(),
-            }),
-            success: true,
-            edit: None,
-        },
-        Ok(None) => ToolExecution::failed("plan mode exit was cancelled"),
-        Err(error) => ToolExecution::failed(format!("failed to exit plan mode: {error}")),
+    if let Err(error) = store.set_mode(&context.session_id, SessionBehavior::AcceptEdits) {
+        return ToolExecution::failed(format!("failed to exit plan mode: {error}"));
+    }
+
+    ToolExecution {
+        content: format!("switched to {} mode", SessionBehavior::AcceptEdits.name()),
+        raw_output: serde_json::json!({
+            "mode_id": SessionBehavior::AcceptEdits.mode_id().0,
+            "mode_name": SessionBehavior::AcceptEdits.name(),
+        }),
+        success: true,
+        edit: None,
     }
 }
 
