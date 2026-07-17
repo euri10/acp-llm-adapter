@@ -13,7 +13,7 @@ cargo install acp-llm-adapter
 
 ## Debugging
 
-For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending the adapter's streams to `.local/state/acp-llm-adapter`, you'll find `20260610-080836-acp-llm-adapter-stderr.log` for stderr and `20260610-080836-codex-acp-stdout-jsonrpc.log` for the jsonrpc messages.
+For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending streams to `.local/state/acp-llm-adapter` using filenames like `20260610-080836-32451-acp-llm-adapter-deepseek-stderr.log` and `20260610-080836-32451-codex-acp-stdout-jsonrpc.log` (`<timestamp>-<pid>-<binary>[-<label>]...`). The label is `ACP_DEBUG_LABEL` when set; otherwise it is auto-derived from `--backend` (supports both `--backend value` and `--backend=value`).
 
 
 ## Architecture
@@ -92,7 +92,7 @@ The adapter bridges two independent channels:
 - Optional: `DEEPSEEK_MODEL` (defaults to `deepseek-v4-pro` for DeepSeek, `glm-4.6` for GLM)
 - Optional: `GLM_MODEL` (checked when `--backend glm`)
 
-Select a provider with `--backend deepseek|glm|mock`. The `mock` backend requires no API key and is useful for local testing.
+Select a provider with `--backend deepseek|glm|mock`. On both `serve` and `dev`, `--backend` is required. The `mock` backend requires no API key and is useful for local testing.
 
 
 ## Editor Setup
@@ -210,12 +210,11 @@ than a filesystem sandbox.
 | `terminal/*` | ✅ Used for `run_command` when the client advertises terminal support |
 | MCP tools (stdio) | ✅ Full |
 | MCP tools (streamable HTTP) | ✅ Full |
-| MCP tools (SSE) | ❌ Not supported |
+| MCP tools (SSE) | ✅ Full |
 
 ## Current Limitations
 
 - No TUI
-- No MCP SSE transport
 - No auto model router
 - No `apply_patch`-style edits in v0.1
 
@@ -256,4 +255,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-

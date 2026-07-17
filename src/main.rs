@@ -116,7 +116,7 @@ struct Cli {
 enum Command {
     /// Run the ACP server over standard input and output.
     Serve {
-        #[arg(long, value_enum, default_value_t = Backend::DeepSeek)]
+        #[arg(long, value_enum)]
         backend: Backend,
         /// Maximum tool-call/response cycles per prompt turn (must be ≥ 1).
         #[arg(long, default_value_t = DEFAULT_MAX_TURN_REQUESTS)]
@@ -124,7 +124,7 @@ enum Command {
     },
     #[command(hide = true)]
     Dev {
-        #[arg(long, value_enum, default_value_t = Backend::Mock)]
+        #[arg(long, value_enum)]
         backend: Backend,
         #[arg(long, default_value = "Hello from the dev smoke test.")]
         prompt: String,
@@ -447,10 +447,7 @@ pub(crate) fn test_store() -> SessionStore {
 // every `slice[i]` with `.get(i).unwrap()` adds noise without safety benefit in tests.
 #[allow(clippy::indexing_slicing)]
 mod tests {
-    use super::{
-        Backend, Cli, Command, DEFAULT_MAX_TURN_REQUESTS, EofGuard, attach_eof_guard,
-        text_from_prompt,
-    };
+    use super::{Backend, Cli, Command, EofGuard, attach_eof_guard, text_from_prompt};
     use crate::acp::validate_session_paths;
     use agent_client_protocol::schema::v1::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
@@ -461,28 +458,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[test_log::test]
-    fn parses_serve_subcommand() {
+    fn rejects_serve_subcommand_without_backend() {
         let parsed = Cli::try_parse_from(["acp-llm-adapter", "serve"]);
         assert!(
-            matches!(
-                parsed,
-                Ok(Cli {
-                    command: Command::Serve {
-                        backend: Backend::DeepSeek,
-                        ..
-                    }
-                })
-            ),
-            "expected Ok(Cli::Serve {{ backend: Real }}), got {parsed:?}"
+            parsed.is_err(),
+            "expected parse failure for missing required backend"
         );
-        if let Ok(Cli {
-            command: Command::Serve {
-                max_turn_requests, ..
-            },
-        }) = parsed
-        {
-            assert_eq!(max_turn_requests, DEFAULT_MAX_TURN_REQUESTS);
-        }
+        let message = parsed.err().map_or_else(String::new, |e| e.to_string());
+        assert!(message.contains("required") || message.contains("--backend"));
     }
 
     #[test_log::test]
@@ -505,6 +488,17 @@ mod tests {
                 }
             }) if prompt == "smoke"
         ));
+    }
+
+    #[test_log::test]
+    fn rejects_dev_subcommand_without_backend() {
+        let parsed = Cli::try_parse_from(["acp-llm-adapter", "dev"]);
+        assert!(
+            parsed.is_err(),
+            "expected parse failure for missing required backend"
+        );
+        let message = parsed.err().map_or_else(String::new, |e| e.to_string());
+        assert!(message.contains("required") || message.contains("--backend"));
     }
 
     #[test_log::test]
@@ -716,7 +710,14 @@ mod tests {
 
     #[test_log::test]
     fn parses_serve_with_custom_max_turn_requests() {
-        let parsed = Cli::try_parse_from(["acp-llm-adapter", "serve", "--max-turn-requests", "5"]);
+        let parsed = Cli::try_parse_from([
+            "acp-llm-adapter",
+            "serve",
+            "--backend",
+            "deepseek",
+            "--max-turn-requests",
+            "5",
+        ]);
 
         assert!(matches!(
             parsed,

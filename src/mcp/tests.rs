@@ -1,8 +1,8 @@
 #![allow(clippy::indexing_slicing)]
 use super::{
-    McpSession, connect_mcp_http_session, connect_mcp_sessions, connect_mcp_stdio_session,
-    mcp_call_arguments, mcp_http_headers, mcp_tool_execution, mcp_tool_mappings,
-    mcp_tool_result_text,
+    McpSession, connect_mcp_http_session, connect_mcp_sessions, connect_mcp_sse_session,
+    connect_mcp_stdio_session, mcp_call_arguments, mcp_http_headers, mcp_tool_execution,
+    mcp_tool_mappings, mcp_tool_result_text,
 };
 use crate::acp::{handle_new_session_request, handle_set_session_mode_request};
 use crate::session::{
@@ -12,7 +12,7 @@ use crate::tools::{AdapterToolRegistry, ToolContext, ToolRegistry};
 use crate::{PermissionRequester, test_store};
 use acp_llm_adapter::llm::ToolCall as ChatToolCall;
 use agent_client_protocol::schema::v1::{
-    EnvVariable, HttpHeader, McpServer, McpServerAcp, McpServerHttp, McpServerStdio,
+    EnvVariable, HttpHeader, McpServer, McpServerAcp, McpServerHttp, McpServerSse, McpServerStdio,
     NewSessionRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SetSessionModeRequest, ToolKind,
 };
@@ -412,19 +412,25 @@ fn mcp_tool_result_text_returns_empty_for_no_content() {
 }
 
 #[test_log::test(tokio::test)]
-async fn connect_mcp_sessions_rejects_sse() {
-    let result = connect_mcp_sessions(&[McpServer::Sse(
-        agent_client_protocol::schema::v1::McpServerSse::new("events", "http://localhost/sse"),
-    )])
-    .await;
-    let Err(error) = result else {
-        return;
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("SSE MCP servers are not supported")
+async fn connect_mcp_sessions_connects_sse_fake_server() -> Result<(), agent_client_protocol::Error>
+{
+    let (url, cancellation) = spawn_http_echo_mcp_server().await?;
+    let sessions =
+        connect_mcp_sessions(&[McpServer::Sse(McpServerSse::new("Remote SSE Echo", url))]).await?;
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions.first().map(|session| session.name.as_str()),
+        Some("Remote SSE Echo")
     );
+    assert!(sessions.first().is_some_and(|session| {
+        session
+            .tools
+            .iter()
+            .any(|mapping| mapping.exposed_name == "mcp__remote_sse_echo__echo")
+    }));
+    cancellation.cancel();
+    Ok(())
 }
 
 #[test_log::test(tokio::test)]
@@ -665,6 +671,69 @@ async fn mcp_http_session_rejects_invalid_headers() {
     };
 
     assert!(error.to_string().contains("invalid HTTP header name"));
+}
+
+#[test_log::test(tokio::test)]
+async fn mcp_sse_session_rejects_invalid_headers() {
+    let sse = McpServerSse::new("remote-sse", "http://localhost/mcp")
+        .headers(vec![HttpHeader::new("bad header", "value")]);
+
+    let Err(error) = connect_mcp_sse_session(&sse).await else {
+        return;
+    };
+
+    assert!(error.to_string().contains("invalid HTTP header name"));
+}
+
+#[test_log::test(tokio::test)]
+async fn mcp_sse_session_reports_initialization_failure() {
+    let sse = McpServerSse::new("remote-sse", "not a valid url");
+
+    let Err(error) = connect_mcp_sse_session(&sse).await else {
+        return;
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to initialize MCP server 'remote-sse'")
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn mcp_sse_session_discovers_and_executes_fake_server()
+-> Result<(), agent_client_protocol::Error> {
+    let (url, cancellation) = spawn_http_echo_mcp_server().await?;
+    let sse = McpServerSse::new("Remote SSE Echo", url)
+        .headers(vec![HttpHeader::new("X-Test-Trace", "trace")]);
+    let session = connect_mcp_sse_session(&sse).await?;
+
+    assert_eq!(session.name, "Remote SSE Echo");
+    assert!(
+        session
+            .tools
+            .iter()
+            .any(|mapping| mapping.original_name == "echo"
+                && mapping.exposed_name == "mcp__remote_sse_echo__echo")
+    );
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "message".to_string(),
+        Value::String("hello over sse".to_string()),
+    );
+    let result = session
+        .peer
+        .call_tool(CallToolRequestParams::new("echo").with_arguments(arguments))
+        .await
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+
+    assert_eq!(
+        mcp_tool_result_text(&result.content),
+        "echo: hello over sse"
+    );
+    cancellation.cancel();
+    Ok(())
 }
 
 #[test_log::test(tokio::test)]

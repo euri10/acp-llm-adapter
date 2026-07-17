@@ -743,7 +743,7 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
                     agent_client_protocol::schema::v1::PromptCapabilities::new()
                         .embedded_context(true),
                 )
-                .mcp_capabilities(McpCapabilities::new().http(true))
+                .mcp_capabilities(McpCapabilities::new().http(true).sse(true))
                 .session_capabilities(
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new())

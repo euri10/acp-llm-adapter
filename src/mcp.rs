@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
-    HttpHeader, McpServer, McpServerHttp, McpServerStdio, ToolKind,
+    HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio, ToolKind,
 };
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, ContentBlock as McpContent, JsonObject, Tool as McpTool};
@@ -152,9 +152,9 @@ pub(crate) fn mcp_tool_result_text(content: &[McpContent]) -> String {
 ///
 /// # Errors
 ///
-/// Returns an ACP error when a server uses a non-stdio transport, the command
-/// is invalid, the process cannot be started, or the server cannot be queried
-/// for tools.
+/// Returns an ACP error when a server transport is unsupported, transport
+/// configuration is invalid, initialization fails, or the server cannot be
+/// queried for tools.
 pub(crate) async fn connect_mcp_sessions(
     servers: &[McpServer],
 ) -> Result<Vec<McpSession>, AdapterError> {
@@ -164,11 +164,7 @@ pub(crate) async fn connect_mcp_sessions(
         match server {
             McpServer::Stdio(stdio) => sessions.push(connect_mcp_stdio_session(stdio).await?),
             McpServer::Http(http) => sessions.push(connect_mcp_http_session(http).await?),
-            McpServer::Sse(_) => {
-                return Err(AdapterError::InvalidParams(
-                    "SSE MCP servers are not supported".to_string(),
-                ));
-            }
+            McpServer::Sse(sse) => sessions.push(connect_mcp_sse_session(sse).await?),
             _ => {
                 return Err(AdapterError::InvalidParams(
                     "unsupported MCP server transport".to_string(),
@@ -225,6 +221,32 @@ pub(crate) async fn connect_mcp_stdio_session(
 /// discovery fails.
 pub(crate) async fn connect_mcp_http_session(
     server: &McpServerHttp,
+) -> Result<McpSession, AdapterError> {
+    let custom_headers = mcp_http_headers(&server.headers, &server.name)?;
+    let config = StreamableHttpClientTransportConfig::with_uri(server.url.clone())
+        .custom_headers(custom_headers);
+    let transport = StreamableHttpClientTransport::from_config(config);
+    let service = ().serve(transport).await.map_err(|error| {
+        AdapterError::InvalidParams(format!(
+            "failed to initialize MCP server '{}': {error}",
+            server.name
+        ))
+    })?;
+
+    mcp_session_from_service(&server.name, service).await
+}
+
+/// Connect a single SSE MCP server and collect its advertised tools.
+///
+/// This uses the rmcp streamable HTTP client transport for session startup and
+/// tool RPC, which is compatible with ACP-declared SSE MCP server entries.
+///
+/// # Errors
+///
+/// Returns an ACP error when headers are invalid, initialization fails, or tool
+/// discovery fails.
+pub(crate) async fn connect_mcp_sse_session(
+    server: &McpServerSse,
 ) -> Result<McpSession, AdapterError> {
     let custom_headers = mcp_http_headers(&server.headers, &server.name)?;
     let config = StreamableHttpClientTransportConfig::with_uri(server.url.clone())
