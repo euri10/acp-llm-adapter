@@ -1,4 +1,4 @@
-# CI pipeline for deepseek-acp-adapter
+# CI pipeline for acp-llm-adapter
 #
 # Enforces all checks mandated by AGENTS.md:
 #   • cargo fmt --all -- --check

@@ -1,15 +1,14 @@
 #![allow(clippy::indexing_slicing)]
 use super::{FilesystemSessionStore, PersistedSessionMeta};
 use crate::{ReasoningEffort, SessionBehavior};
+use acp_llm_adapter::llm::ChatMessage;
 use agent_client_protocol::schema::v1::SessionId;
-use deepseek_acp_adapter::deepseek::ChatMessage;
 use uuid::Uuid;
 
 #[test_log::test]
 fn round_trips_session_metadata_and_history()
 -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-session-store-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-session-store-{}", Uuid::new_v4()));
     let cwd = state_dir.join("workspace");
     let store = FilesystemSessionStore::new(&state_dir);
     let meta = PersistedSessionMeta {
@@ -45,8 +44,7 @@ fn round_trips_session_metadata_and_history()
 #[test_log::test]
 fn delete_session_removes_persisted_record()
 -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-session-delete-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-session-delete-{}", Uuid::new_v4()));
     let cwd = state_dir.join("workspace");
     let store = FilesystemSessionStore::new(&state_dir);
     let meta = PersistedSessionMeta {
@@ -94,7 +92,7 @@ fn persisted_session_meta_deserializes_existing_modes()
 
 #[test_log::test]
 fn rejects_session_ids_that_are_not_path_components() {
-    let store = FilesystemSessionStore::new("/tmp/deepseek-acp-invalid");
+    let store = FilesystemSessionStore::new("/tmp/acp-llm-invalid");
     let error = store.load_record("../escape").err();
     assert!(error.is_some());
 }

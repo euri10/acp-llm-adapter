@@ -5,12 +5,12 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, KillTerminalRequest, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, ReadTextFileRequest, ReleaseTerminalRequest, SessionId, TerminalOutputRequest,
     ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
-use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
 use globset::{Glob, GlobSetBuilder};
 use grep::regex::RegexMatcher;
 use grep::searcher::sinks::UTF8;
@@ -244,7 +244,7 @@ struct UpdatePlanEntryArguments {
     status: PlanEntryStatus,
 }
 
-pub(crate) fn update_plan_tool_execution(call: &DeepSeekToolCall) -> ToolExecution {
+pub(crate) fn update_plan_tool_execution(call: &ChatToolCall) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<UpdatePlanArguments>(call.arguments()) {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -275,7 +275,7 @@ pub(crate) fn update_plan_tool_execution(call: &DeepSeekToolCall) -> ToolExecuti
 
 pub(crate) async fn exit_plan_mode_tool_execution(
     store: &SessionStore,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     context: &ToolContext,
 ) -> ToolExecution {
     let _arguments = match serde_json::from_str::<serde_json::Value>(call.arguments()) {
@@ -311,7 +311,7 @@ pub(crate) async fn exit_plan_mode_tool_execution(
 }
 
 pub(crate) async fn read_file_tool_execution(
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     context: &ToolContext,
     connection: Option<&dyn ReadTextFileRequester>,
 ) -> ToolExecution {
@@ -387,7 +387,7 @@ pub(crate) async fn read_file_tool_execution(
 
 pub(crate) async fn write_file_tool_execution(
     store: &SessionStore,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     context: &ToolContext,
     read_connection: Option<&dyn ReadTextFileRequester>,
     write_connection: Option<&dyn WriteTextFileRequester>,
@@ -464,7 +464,7 @@ pub(crate) async fn write_file_tool_execution(
 
 pub(crate) async fn edit_file_tool_execution(
     store: &SessionStore,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     context: &ToolContext,
     read_connection: Option<&dyn ReadTextFileRequester>,
     write_connection: Option<&dyn WriteTextFileRequester>,
@@ -571,7 +571,7 @@ pub(crate) async fn edit_file_tool_execution(
 
 pub(crate) async fn run_command_tool_execution(
     store: &SessionStore,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     context: &ToolContext,
     permission_requester: Option<&dyn PermissionRequester>,
     terminal_connection: Option<&dyn TerminalRequester>,
@@ -749,10 +749,7 @@ pub(crate) async fn run_command_via_terminal(
     }
 }
 
-pub(crate) fn list_dir_tool_execution(
-    call: &DeepSeekToolCall,
-    context: &ToolContext,
-) -> ToolExecution {
+pub(crate) fn list_dir_tool_execution(call: &ChatToolCall, context: &ToolContext) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<ListDirArguments>(call.arguments()) {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -785,7 +782,7 @@ pub(crate) fn list_dir_tool_execution(
     }
 }
 
-pub(crate) fn glob_tool_execution(call: &DeepSeekToolCall, context: &ToolContext) -> ToolExecution {
+pub(crate) fn glob_tool_execution(call: &ChatToolCall, context: &ToolContext) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<GlobArguments>(call.arguments()) {
         Ok(arguments) => arguments,
         Err(error) => return ToolExecution::failed(format!("invalid glob arguments: {error}")),
@@ -866,7 +863,7 @@ pub(crate) fn glob_tool_execution(call: &DeepSeekToolCall, context: &ToolContext
     }
 }
 
-pub(crate) fn grep_tool_execution(call: &DeepSeekToolCall, context: &ToolContext) -> ToolExecution {
+pub(crate) fn grep_tool_execution(call: &ChatToolCall, context: &ToolContext) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<GrepArguments>(call.arguments()) {
         Ok(arguments) => arguments,
         Err(error) => return ToolExecution::failed(format!("invalid grep arguments: {error}")),
@@ -912,7 +909,7 @@ pub(crate) fn grep_tool_execution(call: &DeepSeekToolCall, context: &ToolContext
 pub(crate) async fn require_tool_permission(
     store: &SessionStore,
     context: &ToolContext,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     kind: ToolKind,
     requester: Option<&dyn PermissionRequester>,
 ) -> Result<(), String> {

@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::stream::run_stream_attempt;
 use super::types::{ChatRequest, WireMessage, WireToolDefinition};
-use super::{DeepSeekConfig, DeepSeekError, StreamEvent};
+use super::{ChatConfig, ChatError, StreamEvent};
 
 /// A `DeepSeek` chat-completions client.
 ///
@@ -19,9 +19,9 @@ use super::{DeepSeekConfig, DeepSeekError, StreamEvent};
 /// # Examples
 ///
 /// ```rust
-/// use deepseek_acp_adapter::deepseek::{DeepSeekClient, DeepSeekConfig};
+/// use acp_llm_adapter::llm::{ChatClient, ChatConfig};
 ///
-/// let client = DeepSeekClient::new(DeepSeekConfig::new(
+/// let client = ChatClient::new(ChatConfig::new(
 ///     "test-key",
 ///     "https://api.deepseek.com",
 ///     "deepseek-v4-pro",
@@ -30,15 +30,15 @@ use super::{DeepSeekConfig, DeepSeekError, StreamEvent};
 /// assert_eq!(client.config().model(), "deepseek-v4-pro");
 /// ```
 #[derive(Debug, Clone)]
-pub struct DeepSeekClient {
+pub struct ChatClient {
     http: HttpClient,
-    config: DeepSeekConfig,
+    config: ChatConfig,
 }
 
-impl DeepSeekClient {
+impl ChatClient {
     /// Build a client from explicit configuration.
     #[must_use]
-    pub fn new(config: DeepSeekConfig) -> Self {
+    pub fn new(config: ChatConfig) -> Self {
         Self {
             http: HttpClient::new(),
             config,
@@ -54,19 +54,19 @@ impl DeepSeekClient {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use deepseek_acp_adapter::deepseek::DeepSeekClient;
+    /// use acp_llm_adapter::llm::ChatClient;
     ///
-    /// let client = DeepSeekClient::from_env()?;
+    /// let client = ChatClient::from_env()?;
     /// assert!(!client.config().base_url().is_empty());
-    /// # Ok::<(), deepseek_acp_adapter::deepseek::DeepSeekError>(())
+    /// # Ok::<(), acp_llm_adapter::llm::ChatError>(())
     /// ```
-    pub fn from_env() -> Result<Self, DeepSeekError> {
-        Ok(Self::new(DeepSeekConfig::from_env()?))
+    pub fn from_env() -> Result<Self, ChatError> {
+        Ok(Self::new(ChatConfig::from_env()?))
     }
 
     /// Return the client configuration.
     #[must_use]
-    pub fn config(&self) -> &DeepSeekConfig {
+    pub fn config(&self) -> &ChatConfig {
         &self.config
     }
 
@@ -149,13 +149,13 @@ pub trait LlmClient: Send + Sync {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, DeepSeekClient, LlmClient};
+    /// use acp_llm_adapter::llm::{ChatMessage, ChatRequest, ChatClient, LlmClient};
     /// use futures_util::StreamExt;
     /// use tokio_util::sync::CancellationToken;
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let client = DeepSeekClient::from_env()?;
+    ///     let client = ChatClient::from_env()?;
     ///     let request = ChatRequest::new(vec![ChatMessage::user("Say hello")]);
     ///     let mut stream = client.stream_chat(request, CancellationToken::new())?;
     ///
@@ -170,17 +170,17 @@ pub trait LlmClient: Send + Sync {
         &self,
         request: ChatRequest,
         cancellation_token: CancellationToken,
-    ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError>;
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ChatError>>, ChatError>;
 }
 
-impl LlmClient for DeepSeekClient {
+impl LlmClient for ChatClient {
     fn stream_chat(
         &self,
         request: ChatRequest,
         cancellation_token: CancellationToken,
-    ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ChatError>>, ChatError> {
         if self.config.api_key().trim().is_empty() {
-            return Err(DeepSeekError::MissingApiKey);
+            return Err(ChatError::MissingApiKey);
         }
 
         let (messages, tools, model_opt, reasoning_effort, max_tokens) = request.into_parts();
@@ -216,7 +216,7 @@ impl LlmClient for DeepSeekClient {
         );
         let api_key = self.config.api_key().to_string();
 
-        let (tx, rx) = mpsc::unbounded_channel::<Result<StreamEvent, DeepSeekError>>();
+        let (tx, rx) = mpsc::unbounded_channel::<Result<StreamEvent, ChatError>>();
 
         tokio::spawn(async move {
             let event_source = http

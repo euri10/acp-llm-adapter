@@ -4,9 +4,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use acp_llm_adapter::error::SessionPersistenceError;
+use acp_llm_adapter::llm::ChatMessage;
 use agent_client_protocol::schema::v1::{McpServer, SessionId, SessionInfo};
-use deepseek_acp_adapter::deepseek::ChatMessage;
-use deepseek_acp_adapter::error::SessionPersistenceError;
 use serde::{Deserialize, Serialize};
 
 use crate::{ReasoningEffort, SessionBehavior};
@@ -14,7 +14,7 @@ use crate::{ReasoningEffort, SessionBehavior};
 const SESSIONS_DIR: &str = "sessions";
 const META_FILE: &str = "meta.json";
 const HISTORY_FILE: &str = "history.jsonl";
-const APPLICATION_STATE_DIR: &str = "deepseek-acp-adapter";
+const APPLICATION_STATE_DIR: &str = "acp-llm-adapter";
 
 /// Filesystem-backed persistence for ACP session metadata and chat history.
 #[derive(Debug, Clone)]

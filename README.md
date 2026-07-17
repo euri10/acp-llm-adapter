@@ -1,6 +1,6 @@
 # DeepSeek ACP Adapter
 
-`deepseek-acp-adapter` is a headless ACP server that exposes DeepSeek as an agent to ACP-capable editors.
+`acp-llm-adapter` is a headless ACP server that exposes DeepSeek as an agent to ACP-capable editors.
 
 > [!WARNING]
 > This is alpha software. Expect breaking changes, incomplete ACP coverage, and rough edges while the adapter is still being shaped.
@@ -8,12 +8,12 @@
 ## Installation
 
 ```bash
-cargo install deepseek-acp-adapter
+cargo install acp-llm-adapter
 ```
 
 ## Debugging
 
-For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending the adapter's streams to `.local/state/codecompanion-acp`, you'll find `20260610-080836-deepseek-acp-adapter-stderr.log` for stderr and `20260610-080836-codex-acp-stdout-jsonrpc.log` for the jsonrpc messages.
+For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending the adapter's streams to `.local/state/codecompanion-acp`, you'll find `20260610-080836-acp-llm-adapter-stderr.log` for stderr and `20260610-080836-codex-acp-stdout-jsonrpc.log` for the jsonrpc messages.
 
 
 ## Architecture
@@ -22,7 +22,7 @@ The adapter bridges two independent channels:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                         deepseek-acp-adapter                                           │
+│                         acp-llm-adapter                                           │
 │                                                                                        │
 │  Editor ──ACP/stdio──▶ ┌─────────────────┐  ┌─────────────────┐                        │
 │  (Zed,      JSON-RPC   │  acp.rs         │  │  deepseek/*     │                        │
@@ -72,7 +72,7 @@ The adapter bridges two independent channels:
 | Module | Responsibility |
 |--------|---------------|
 | [`deepseek/types.rs`](src/deepseek/types.rs) | Chat message, request, tool definition, and stream-event types (public facade) |
-| [`deepseek/client.rs`](src/deepseek/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `DeepSeekClient` impl |
+| [`deepseek/client.rs`](src/deepseek/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `ChatClient` impl |
 | [`deepseek/stream.rs`](src/deepseek/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping |
 | [`deepseek/config.rs`](src/deepseek/config.rs) | Environment-driven config (`DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`) |
 | [`deepseek/error.rs`](src/deepseek/error.rs) | Typed error enum (config, HTTP, SSE, JSON, transport) |
@@ -109,7 +109,7 @@ require("codecompanion").setup({
         return require("codecompanion.adapters").extend("deepseek_acp", {
           commands = {
             default = {
-              "deepseek-acp-adapter",
+              "acp-llm-adapter",
               "serve",
             },
           },
@@ -139,7 +139,7 @@ Zed can run any ACP-capable agent as an external agent. Put the adapter command 
   "agent_servers": {
     "DeepSeek ACP": {
       "type": "custom",
-      "command": "deepseek-acp-adapter",
+      "command": "acp-llm-adapter",
       "args": ["serve"],
       "env": {
         "DEEPSEEK_API_KEY": "your-api-key",
@@ -227,18 +227,18 @@ Typical library entry points:
 - `deepseek::ChatRequest` for model/tool request construction
 - `deepseek::ToolDefinition` for JSON-schema tool advertisement
 - `deepseek::StreamEvent` for normalized streamed output
-- `deepseek::DeepSeekClient` for HTTP-backed streaming requests
+- `deepseek::ChatClient` for HTTP-backed streaming requests
 
 Minimal streaming example:
 
 ```rust,no_run
-use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, DeepSeekClient, LlmClient};
+use acp_llm_adapter::deepseek::{ChatMessage, ChatRequest, ChatClient, LlmClient};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = DeepSeekClient::from_env()?;
+    let client = ChatClient::from_env()?;
     let request = ChatRequest::new(vec![ChatMessage::user("Summarize this repository")]);
     let mut stream = client.stream_chat(request, CancellationToken::new())?;
 

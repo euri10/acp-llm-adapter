@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
+use acp_llm_adapter::error::AdapterError;
+use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{SessionId, ToolCallStatus, ToolKind};
-use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
-use deepseek_acp_adapter::error::AdapterError;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -46,7 +46,7 @@ pub(crate) trait ToolRegistry: Send + Sync {
     /// their work against it and abort promptly.
     fn execute<'a>(
         &'a self,
-        call: &'a DeepSeekToolCall,
+        call: &'a ChatToolCall,
         context: &'a ToolContext,
         store: &'a crate::SessionStore,
         connection: Option<&'a dyn crate::ToolCallRequester>,
@@ -74,7 +74,7 @@ impl ToolRegistry for EmptyToolRegistry {
 
     fn execute<'a>(
         &'a self,
-        call: &'a DeepSeekToolCall,
+        call: &'a ChatToolCall,
         _context: &'a ToolContext,
         _store: &'a crate::SessionStore,
         _connection: Option<&'a dyn crate::ToolCallRequester>,
@@ -124,7 +124,7 @@ impl ToolRegistry for AdapterToolRegistry {
 
     fn execute<'a>(
         &'a self,
-        call: &'a DeepSeekToolCall,
+        call: &'a ChatToolCall,
         context: &'a ToolContext,
         store: &'a crate::SessionStore,
         connection: Option<&'a dyn crate::ToolCallRequester>,
@@ -246,6 +246,8 @@ mod tests {
     use crate::acp::handle_new_session_request;
     use crate::session::PERMISSION_ALLOW_ONCE_OPTION_ID;
     use crate::test_store;
+    use acp_llm_adapter::error::AdapterError;
+    use acp_llm_adapter::llm::ToolCall as ChatToolCall;
     use agent_client_protocol::schema::v1::{
         ClientCapabilities, CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities,
         KillTerminalRequest, KillTerminalResponse, NewSessionRequest, ReadTextFileRequest,
@@ -255,8 +257,6 @@ mod tests {
         TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
         WriteTextFileRequest, WriteTextFileResponse,
     };
-    use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
-    use deepseek_acp_adapter::error::AdapterError;
     use futures_util::future::BoxFuture;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
@@ -432,7 +432,7 @@ mod tests {
         let registry = EmptyToolRegistry;
         let context = registry_context(std::path::PathBuf::from("/tmp"));
         let store = test_store();
-        let call = DeepSeekToolCall::new("empty-call", "test_tool", "{}");
+        let call = ChatToolCall::new("empty-call", "test_tool", "{}");
         let result = registry
             .execute(&call, &context, &store, None, CancellationToken::new())
             .await;
@@ -443,7 +443,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn adapter_registry_execute_read_file_local() -> Result<(), AdapterError> {
         let temp_root =
-            std::env::temp_dir().join(format!("deepseek-acp-reg-read-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("acp-llm-reg-read-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
         std::fs::write(temp_root.join("sample.txt"), "alpha\nbeta\ngamma\n")
             .map_err(AdapterError::from)?;
@@ -451,7 +451,7 @@ mod tests {
         let registry = AdapterToolRegistry;
         let context = registry_context(temp_root.clone());
         let store = test_store();
-        let call = DeepSeekToolCall::new(
+        let call = ChatToolCall::new(
             "reg-read",
             "read_file",
             serde_json::json!({"path": "sample.txt"}).to_string(),
@@ -468,10 +468,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn adapter_registry_execute_client_file_tools_use_connection() -> Result<(), AdapterError>
     {
-        let temp_root = std::env::temp_dir().join(format!(
-            "deepseek-acp-reg-client-fs-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_root =
+            std::env::temp_dir().join(format!("acp-llm-reg-client-fs-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
 
         let store = test_store();
@@ -489,7 +487,7 @@ mod tests {
         };
         let registry = AdapterToolRegistry;
 
-        let read_call = DeepSeekToolCall::new(
+        let read_call = ChatToolCall::new(
             "reg-client-read",
             "read_file",
             serde_json::json!({"path": "sample.txt"}).to_string(),
@@ -507,7 +505,7 @@ mod tests {
         assert_eq!(read_result.content, "client original");
         assert_eq!(read_result.raw_output["source"], "client");
 
-        let write_call = DeepSeekToolCall::new(
+        let write_call = ChatToolCall::new(
             "reg-client-write",
             "write_file",
             serde_json::json!({"path": "sample.txt", "content": "replacement"}).to_string(),
@@ -524,7 +522,7 @@ mod tests {
         assert!(write_result.success);
         assert_eq!(write_result.raw_output["source"], "client");
 
-        let edit_call = DeepSeekToolCall::new(
+        let edit_call = ChatToolCall::new(
             "reg-client-edit",
             "edit_file",
             serde_json::json!({
@@ -555,7 +553,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn adapter_registry_execute_write_file_local_no_permission() -> Result<(), AdapterError> {
         let temp_root =
-            std::env::temp_dir().join(format!("deepseek-acp-reg-write-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("acp-llm-reg-write-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
 
         let store = test_store();
@@ -568,7 +566,7 @@ mod tests {
             additional_directories: Vec::new(),
             client_capabilities: None,
         };
-        let call = DeepSeekToolCall::new(
+        let call = ChatToolCall::new(
             "reg-write",
             "write_file",
             serde_json::json!({"path": "out.txt", "content": "hello world"}).to_string(),
@@ -585,7 +583,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn adapter_registry_execute_edit_file_local_no_permission() -> Result<(), AdapterError> {
         let temp_root =
-            std::env::temp_dir().join(format!("deepseek-acp-reg-edit-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("acp-llm-reg-edit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
         std::fs::write(temp_root.join("source.txt"), "original content\n")
             .map_err(AdapterError::from)?;
@@ -600,7 +598,7 @@ mod tests {
             additional_directories: Vec::new(),
             client_capabilities: None,
         };
-        let call = DeepSeekToolCall::new(
+        let call = ChatToolCall::new(
             "reg-edit",
             "edit_file",
             serde_json::json!({
@@ -623,7 +621,7 @@ mod tests {
     async fn adapter_registry_execute_run_command_local_no_permission() -> Result<(), AdapterError>
     {
         let temp_root =
-            std::env::temp_dir().join(format!("deepseek-acp-reg-cmd-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("acp-llm-reg-cmd-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
 
         let store = test_store();
@@ -636,7 +634,7 @@ mod tests {
             additional_directories: Vec::new(),
             client_capabilities: None,
         };
-        let call = DeepSeekToolCall::new(
+        let call = ChatToolCall::new(
             "reg-cmd",
             "run_command",
             serde_json::json!({"command": "echo hello"}).to_string(),
@@ -653,10 +651,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn adapter_registry_execute_run_command_uses_terminal_connection()
     -> Result<(), AdapterError> {
-        let temp_root = std::env::temp_dir().join(format!(
-            "deepseek-acp-reg-terminal-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_root =
+            std::env::temp_dir().join(format!("acp-llm-reg-terminal-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root).map_err(AdapterError::from)?;
 
         let store = test_store();
@@ -672,7 +668,7 @@ mod tests {
                     .fs(FileSystemCapabilities::new()),
             ),
         };
-        let call = DeepSeekToolCall::new(
+        let call = ChatToolCall::new(
             "reg-terminal",
             "run_command",
             serde_json::json!({"command": "echo via-terminal"}).to_string(),
@@ -703,7 +699,7 @@ mod tests {
         let registry = AdapterToolRegistry;
         let context = registry_context(std::path::PathBuf::from("/tmp"));
         let store = test_store();
-        let call = DeepSeekToolCall::new("bogus-call", "no_such_tool", "{}");
+        let call = ChatToolCall::new("bogus-call", "no_such_tool", "{}");
         let result = registry
             .execute(&call, &context, &store, None, CancellationToken::new())
             .await;

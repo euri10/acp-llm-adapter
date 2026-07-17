@@ -11,6 +11,9 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use acp_llm_adapter::llm::{
+    ChatClient, ChatConfig, ChatError, ChatRequest, FinishReason, LlmClient, StreamEvent,
+};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
@@ -21,10 +24,6 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Client, ConnectTo, SessionMessage};
 use clap::ValueEnum;
-use deepseek_acp_adapter::deepseek::{
-    ChatRequest, DeepSeekClient, DeepSeekConfig, DeepSeekError, FinishReason, LlmClient,
-    StreamEvent,
-};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use tokio_util::sync::CancellationToken;
@@ -63,7 +62,7 @@ impl Backend {
     /// Default base URL for the provider's chat-completions endpoint.
     pub(crate) const fn default_base_url(self) -> &'static str {
         match self {
-            Self::DeepSeek => DeepSeekConfig::DEFAULT_BASE_URL,
+            Self::DeepSeek => ChatConfig::DEFAULT_BASE_URL,
             Self::Glm => "https://api.z.ai/api/paas/v4",
             Self::Mock => "http://localhost:0",
         }
@@ -72,7 +71,7 @@ impl Backend {
     /// Default model name for the provider.
     pub(crate) const fn default_model(self) -> &'static str {
         match self {
-            Self::DeepSeek => DeepSeekConfig::DEFAULT_MODEL,
+            Self::DeepSeek => ChatConfig::DEFAULT_MODEL,
             Self::Glm => "glm-4.6",
             Self::Mock => "mock-model",
         }
@@ -90,18 +89,17 @@ pub(crate) fn llm_client_for_backend(
 ) -> Result<Arc<dyn LlmClient>, agent_client_protocol::Error> {
     match backend {
         Backend::DeepSeek => Ok(Arc::new(
-            DeepSeekClient::from_env()
-                .map_err(agent_client_protocol::Error::into_internal_error)?,
+            ChatClient::from_env().map_err(agent_client_protocol::Error::into_internal_error)?,
         )),
         Backend::Glm => {
-            let config = DeepSeekConfig::from_env()
+            let config = ChatConfig::from_env()
                 .map_err(agent_client_protocol::Error::into_internal_error)?;
-            let config = DeepSeekConfig::new(
+            let config = ChatConfig::new(
                 config.api_key().to_string(),
                 backend.default_base_url(),
                 backend.default_model(),
             );
-            Ok(Arc::new(DeepSeekClient::new(config)))
+            Ok(Arc::new(ChatClient::new(config)))
         }
         Backend::Mock => Ok(Arc::new(MockLlmClient)),
     }
@@ -119,7 +117,7 @@ pub(crate) fn build_dev_agent(
     let command = executable.to_string_lossy();
     let agent_config = serde_json::json!({
         "type": "stdio",
-        "name": "deepseek-acp-adapter-dev",
+        "name": "acp-llm-adapter-dev",
         "command": command,
         "args": [
             "serve",
@@ -143,7 +141,7 @@ pub(crate) async fn run_smoke_flow(
 ) -> Result<DevSmokeResult, agent_client_protocol::Error> {
     Client
         .builder()
-        .name("deepseek-acp-adapter-dev-client")
+        .name("acp-llm-adapter-dev-client")
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _cx| {
                 let outcome =
@@ -248,7 +246,7 @@ impl LlmClient for MockLlmClient {
         &self,
         request: ChatRequest,
         _cancellation_token: CancellationToken,
-    ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ChatError>>, ChatError> {
         let prompt = request.messages().last().map_or_else(
             || "mock prompt".to_owned(),
             |message| message.content().to_owned(),
@@ -310,7 +308,7 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let call = acp_llm_adapter::llm::ToolCall::new(
         "dev-permission-call",
         "write_file",
         serde_json::json!({ "path": "smoke.txt" }).to_string(),
@@ -352,15 +350,13 @@ mod tests {
     };
     use crate::session::DEFAULT_MAX_TURN_REQUESTS;
     use crate::tools::EmptyToolRegistry;
+    use acp_llm_adapter::llm::{ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent};
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
         McpServer, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
         RequestPermissionRequest, SessionId, StopReason, ToolCallStatus, ToolCallUpdate,
         ToolCallUpdateFields, ToolKind,
-    };
-    use deepseek_acp_adapter::deepseek::{
-        ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent,
     };
     use futures_util::StreamExt;
     use std::sync::{Arc, Mutex};
@@ -375,10 +371,7 @@ mod tests {
     #[test_log::test]
     fn build_dev_agent_uses_backend_and_executable_path() -> Result<(), agent_client_protocol::Error>
     {
-        let agent = build_dev_agent(
-            std::path::Path::new("/tmp/deepseek-acp-adapter"),
-            Backend::Mock,
-        )?;
+        let agent = build_dev_agent(std::path::Path::new("/tmp/acp-llm-adapter"), Backend::Mock)?;
 
         let McpServer::Stdio(stdio) = agent.server() else {
             return Err(
@@ -388,7 +381,7 @@ mod tests {
 
         assert_eq!(
             stdio.command,
-            std::path::PathBuf::from("/tmp/deepseek-acp-adapter")
+            std::path::PathBuf::from("/tmp/acp-llm-adapter")
         );
         assert_eq!(stdio.args, vec!["serve", "--backend", "mock"]);
         assert!(stdio.env.is_empty());
@@ -407,7 +400,7 @@ mod tests {
         let server_client = Arc::clone(&llm_client);
         let server_tools = Arc::clone(&tool_registry);
         let state_dir =
-            std::env::temp_dir().join(format!("deepseek-acp-smoke-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("acp-llm-smoke-test-{}", uuid::Uuid::new_v4()));
 
         let server = tokio::spawn(async move {
             serve_with_transport_and_state_dir(
@@ -481,7 +474,7 @@ mod tests {
         let client = llm_client_for_backend(Backend::Mock)?;
         let mut stream = client
             .stream_chat(
-                deepseek_acp_adapter::deepseek::ChatRequest::new(vec![ChatMessage::user("hello")]),
+                acp_llm_adapter::llm::ChatRequest::new(vec![ChatMessage::user("hello")]),
                 CancellationToken::new(),
             )
             .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -509,7 +502,7 @@ mod tests {
         assert!(crate::init_tracing().is_err());
         assert!(std::env::var("DEEPSEEK_API_KEY").is_ok());
 
-        let client = deepseek_acp_adapter::deepseek::DeepSeekClient::from_env()
+        let client = acp_llm_adapter::llm::ChatClient::from_env()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let config = client.config();
         assert!(!config.base_url().is_empty());
@@ -543,7 +536,7 @@ mod tests {
     #[test_log::test]
     fn build_dev_agent_uses_deepseek_backend_args() -> Result<(), agent_client_protocol::Error> {
         let agent = build_dev_agent(
-            std::path::Path::new("/tmp/deepseek-acp-adapter"),
+            std::path::Path::new("/tmp/acp-llm-adapter"),
             Backend::DeepSeek,
         )?;
 
@@ -554,7 +547,7 @@ mod tests {
         };
         assert_eq!(
             stdio.command,
-            std::path::PathBuf::from("/tmp/deepseek-acp-adapter")
+            std::path::PathBuf::from("/tmp/acp-llm-adapter")
         );
         assert_eq!(stdio.args, vec!["serve", "--backend", "deepseek"]);
         Ok(())

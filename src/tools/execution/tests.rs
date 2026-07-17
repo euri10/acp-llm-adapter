@@ -8,23 +8,21 @@ use crate::test_utils::{
     FakeTerminalRequester, RecordingWriteTextFileRequester, Utf8FailingReadTextFileRequester,
 };
 use crate::tools::registry::{AdapterToolRegistry, EmptyToolRegistry, ToolExecution, ToolRegistry};
+use acp_llm_adapter::llm::ToolCall as ChatToolCall;
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, FileSystemCapabilities, NewSessionRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionResponse,
     SelectedPermissionOutcome, ToolKind,
 };
 use agent_client_protocol::{Agent, Channel, Client};
-use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 #[test_log::test(tokio::test)]
 async fn read_file_tool_defaults_line_and_limit() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-defaults-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-defaults-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let file_path = temp_root.join("sample.txt");
@@ -36,7 +34,7 @@ async fn read_file_tool_defaults_line_and_limit() -> Result<(), agent_client_pro
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "call-defaults",
         "read_file",
         serde_json::json!({"path": "sample.txt"}).to_string(),
@@ -52,10 +50,8 @@ async fn read_file_tool_defaults_line_and_limit() -> Result<(), agent_client_pro
 
 #[test_log::test(tokio::test)]
 async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-tools-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-tools-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     std::fs::write(temp_root.join("visible.txt"), "one\ntwo\nthree")
@@ -67,7 +63,7 @@ async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client
         client_capabilities: None,
     };
     let r = read_file_tool_execution(
-        &DeepSeekToolCall::new("invalid-read", "read_file", "not json"),
+        &ChatToolCall::new("invalid-read", "read_file", "not json"),
         &context,
         None,
     )
@@ -75,7 +71,7 @@ async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client
     assert!(!r.success);
     assert!(r.content.contains("invalid read_file arguments"));
     let r = read_file_tool_execution(
-        &DeepSeekToolCall::new(
+        &ChatToolCall::new(
             "zl",
             "read_file",
             serde_json::json!({"path":"visible.txt","line":0}).to_string(),
@@ -87,7 +83,7 @@ async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client
     assert!(!r.success);
     assert!(r.content.contains("line must be at least 1"));
     let r = read_file_tool_execution(
-        &DeepSeekToolCall::new(
+        &ChatToolCall::new(
             "zl2",
             "read_file",
             serde_json::json!({"path":"visible.txt","limit":0}).to_string(),
@@ -99,7 +95,7 @@ async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client
     assert!(!r.success);
     assert!(r.content.contains("limit must be at least 1"));
     let r = read_file_tool_execution(
-        &DeepSeekToolCall::new(
+        &ChatToolCall::new(
             "mf",
             "read_file",
             serde_json::json!({"path":"missing.txt"}).to_string(),
@@ -115,10 +111,8 @@ async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client
 
 #[test_log::test(tokio::test)]
 async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-tools-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-tools-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let context = ToolContext {
@@ -128,15 +122,12 @@ async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_pro
         client_capabilities: None,
     };
     assert!(
-        !list_dir_tool_execution(
-            &DeepSeekToolCall::new("il", "list_dir", "not json"),
-            &context
-        )
-        .success
+        !list_dir_tool_execution(&ChatToolCall::new("il", "list_dir", "not json"), &context)
+            .success
     );
     assert!(
         !list_dir_tool_execution(
-            &DeepSeekToolCall::new(
+            &ChatToolCall::new(
                 "md",
                 "list_dir",
                 serde_json::json!({"path":"missing-dir"}).to_string()
@@ -145,12 +136,10 @@ async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_pro
         )
         .success
     );
-    assert!(
-        !glob_tool_execution(&DeepSeekToolCall::new("ig", "glob", "not json"), &context).success
-    );
+    assert!(!glob_tool_execution(&ChatToolCall::new("ig", "glob", "not json"), &context).success);
     assert!(
         !glob_tool_execution(
-            &DeepSeekToolCall::new(
+            &ChatToolCall::new(
                 "igp",
                 "glob",
                 serde_json::json!({"pattern":"["}).to_string()
@@ -159,12 +148,10 @@ async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_pro
         )
         .success
     );
-    assert!(
-        !grep_tool_execution(&DeepSeekToolCall::new("ig2", "grep", "not json"), &context).success
-    );
+    assert!(!grep_tool_execution(&ChatToolCall::new("ig2", "grep", "not json"), &context).success);
     assert!(
         !grep_tool_execution(
-            &DeepSeekToolCall::new(
+            &ChatToolCall::new(
                 "igr",
                 "grep",
                 serde_json::json!({"pattern":"("}).to_string()
@@ -178,10 +165,8 @@ async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_pro
 
 #[test_log::test(tokio::test)]
 async fn read_file_tool_uses_local_fallback() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-local-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-local-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let file_path = temp_root.join("sample.txt");
@@ -194,7 +179,7 @@ async fn read_file_tool_uses_local_fallback() -> Result<(), agent_client_protoco
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "call-local",
         "read_file",
         serde_json::json!({
@@ -219,10 +204,8 @@ async fn read_file_tool_uses_local_fallback() -> Result<(), agent_client_protoco
 
 #[test_log::test(tokio::test)]
 async fn read_file_tool_routes_to_client_fs() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-client-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-client-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
@@ -259,7 +242,7 @@ async fn read_file_tool_routes_to_client_fs() -> Result<(), agent_client_protoco
                 .write_text_file(false)),
         ),
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "call-client",
         "read_file",
         serde_json::json!({
@@ -313,10 +296,8 @@ async fn read_file_tool_routes_to_client_fs() -> Result<(), agent_client_protoco
 #[test_log::test(tokio::test)]
 async fn read_file_tool_rejects_local_non_utf8_before_client_fs()
 -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-non-utf8-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-non-utf8-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let file_path = temp_root.join("artifact.bin");
@@ -331,7 +312,7 @@ async fn read_file_tool_rejects_local_non_utf8_before_client_fs()
             ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
         ),
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "call-non-utf8",
         "read_file",
         serde_json::json!({ "path": "artifact.bin" }).to_string(),
@@ -363,7 +344,7 @@ async fn read_file_tool_rejects_local_non_utf8_before_client_fs()
 async fn read_file_tool_sanitizes_client_non_utf8_error() -> Result<(), agent_client_protocol::Error>
 {
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-client-utf8-{}",
+        "acp-llm-adapter-client-utf8-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -377,7 +358,7 @@ async fn read_file_tool_sanitizes_client_non_utf8_error() -> Result<(), agent_cl
             ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
         ),
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "call-client-utf8",
         "read_file",
         serde_json::json!({ "path": "client-only.bin" }).to_string(),
@@ -405,7 +386,7 @@ async fn read_file_tool_sanitizes_client_non_utf8_error() -> Result<(), agent_cl
 #[test_log::test(tokio::test)]
 async fn write_file_tool_routes_to_client_fs_write() -> Result<(), agent_client_protocol::Error> {
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-write-client-{}",
+        "acp-llm-adapter-write-client-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -428,7 +409,7 @@ async fn write_file_tool_routes_to_client_fs_write() -> Result<(), agent_client_
     )]);
     let write_requester = RecordingWriteTextFileRequester::new();
     let requests = write_requester.requests();
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "write-client-call",
         "write_file",
         serde_json::json!({
@@ -469,7 +450,7 @@ async fn write_file_tool_routes_to_client_fs_write() -> Result<(), agent_client_
 async fn edit_file_tool_routes_to_client_fs_read_and_write()
 -> Result<(), agent_client_protocol::Error> {
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-edit-client-{}",
+        "acp-llm-adapter-edit-client-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -496,7 +477,7 @@ async fn edit_file_tool_routes_to_client_fs_read_and_write()
     let read_calls = read_requester.calls();
     let write_requester = RecordingWriteTextFileRequester::new();
     let write_requests = write_requester.requests();
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "edit-client-call",
         "edit_file",
         serde_json::json!({
@@ -544,10 +525,8 @@ async fn edit_file_tool_routes_to_client_fs_read_and_write()
 #[test_log::test(tokio::test)]
 async fn write_and_edit_file_tools_modify_local_files_after_permission()
 -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-write-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-write-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let store = test_store();
@@ -564,7 +543,7 @@ async fn write_and_edit_file_tools_modify_local_files_after_permission()
             PERMISSION_ALLOW_ONCE_OPTION_ID,
         )),
     )]);
-    let write_call = DeepSeekToolCall::new(
+    let write_call = ChatToolCall::new(
         "write-call",
         "write_file",
         serde_json::json!({
@@ -606,7 +585,7 @@ async fn write_and_edit_file_tools_modify_local_files_after_permission()
             PERMISSION_ALLOW_ONCE_OPTION_ID,
         )),
     )]);
-    let edit_call = DeepSeekToolCall::new(
+    let edit_call = ChatToolCall::new(
         "edit-call",
         "edit_file",
         serde_json::json!({
@@ -651,10 +630,8 @@ async fn write_and_edit_file_tools_modify_local_files_after_permission()
 #[test_log::test(tokio::test)]
 async fn run_command_tool_executes_in_session_cwd_after_permission()
 -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-command-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-command-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let store = test_store();
@@ -670,7 +647,7 @@ async fn run_command_tool_executes_in_session_cwd_after_permission()
             PERMISSION_ALLOW_ONCE_OPTION_ID,
         )),
     )]);
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "command-call",
         "run_command",
         serde_json::json!({ "command": "printf shell-ok" }).to_string(),
@@ -697,7 +674,7 @@ async fn run_command_tool_executes_in_session_cwd_after_permission()
 #[test_log::test(tokio::test)]
 async fn local_tools_list_dir_and_glob() -> Result<(), agent_client_protocol::Error> {
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-local-tools-{}",
+        "acp-llm-adapter-local-tools-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(temp_root.join("src"))
@@ -726,7 +703,7 @@ async fn local_tools_list_dir_and_glob() -> Result<(), agent_client_protocol::Er
 
     let list_result = registry
         .execute(
-            &DeepSeekToolCall::new(
+            &ChatToolCall::new(
                 "call-list",
                 "list_dir",
                 serde_json::json!({ "path": "." }).to_string(),
@@ -746,7 +723,7 @@ async fn local_tools_list_dir_and_glob() -> Result<(), agent_client_protocol::Er
 
     let glob_result = registry
         .execute(
-            &DeepSeekToolCall::new(
+            &ChatToolCall::new(
                 "call-glob",
                 "glob",
                 serde_json::json!({ "pattern": "**/*.rs" }).to_string(),
@@ -771,10 +748,8 @@ async fn local_tools_list_dir_and_glob() -> Result<(), agent_client_protocol::Er
 #[test_log::test(tokio::test)]
 async fn local_tools_grep_respects_gitignore_and_truncates()
 -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-grep-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-grep-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(temp_root.join("ignored"))
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
@@ -797,7 +772,7 @@ async fn local_tools_grep_respects_gitignore_and_truncates()
 
     let result = registry
         .execute(
-            &DeepSeekToolCall::new(
+            &ChatToolCall::new(
                 "call-grep",
                 "grep",
                 serde_json::json!({ "pattern": "needle" }).to_string(),
@@ -831,7 +806,7 @@ async fn registry_and_tool_execution_helpers_cover_error_branches()
 
     let empty_result = EmptyToolRegistry
         .execute(
-            &DeepSeekToolCall::new("empty", "anything", "{}"),
+            &ChatToolCall::new("empty", "anything", "{}"),
             &context,
             &store,
             None,
@@ -843,7 +818,7 @@ async fn registry_and_tool_execution_helpers_cover_error_branches()
 
     let read_only_result = AdapterToolRegistry
         .execute(
-            &DeepSeekToolCall::new("read-only", "bogus", "{}"),
+            &ChatToolCall::new("read-only", "bogus", "{}"),
             &context,
             &store,
             None,
@@ -931,7 +906,7 @@ async fn run_command_rejects_empty_command() {
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "empty-cmd-call",
         "run_command",
         serde_json::json!({ "command": "   " }).to_string(),
@@ -965,7 +940,7 @@ fn collect_directory_entries_reports_missing() -> Result<(), agent_client_protoc
 #[test]
 fn build_root_gitignore_loads_when_present() -> Result<(), agent_client_protocol::Error> {
     let temp_root =
-        std::env::temp_dir().join(format!("deepseek-acp-adapter-gi-{}", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("acp-llm-adapter-gi-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     std::fs::write(temp_root.join(".gitignore"), "*.log\n")
@@ -979,7 +954,7 @@ fn build_root_gitignore_loads_when_present() -> Result<(), agent_client_protocol
 #[test]
 fn build_root_gitignore_loads_file() -> Result<(), agent_client_protocol::Error> {
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-gitignore-{}",
+        "acp-llm-adapter-gitignore-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -994,10 +969,8 @@ fn build_root_gitignore_loads_file() -> Result<(), agent_client_protocol::Error>
 
 #[test]
 fn read_file_from_local_zero_line_defaults_to_start() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-read-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-read-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     std::fs::write(temp_root.join("lines.txt"), "a\nb\nc\nd\ne\n")
@@ -1014,7 +987,7 @@ fn read_file_from_local_zero_line_defaults_to_start() -> Result<(), agent_client
 #[test]
 fn read_file_from_local_line_past_end_returns_empty() -> Result<(), agent_client_protocol::Error> {
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-read-past-{}",
+        "acp-llm-adapter-read-past-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -1033,7 +1006,7 @@ fn read_file_from_local_line_past_end_returns_empty() -> Result<(), agent_client
 #[test]
 fn read_file_local_error_handles_invalid_data() -> Result<(), agent_client_protocol::Error> {
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-local-err-{}",
+        "acp-llm-adapter-local-err-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -1054,10 +1027,8 @@ fn read_file_local_error_handles_invalid_data() -> Result<(), agent_client_proto
 
 #[test_log::test(tokio::test)]
 async fn glob_tool_execution_invalid_build_pattern() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-glob-err-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-glob-err-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
@@ -1067,7 +1038,7 @@ async fn glob_tool_execution_invalid_build_pattern() -> Result<(), agent_client_
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "glob-invalid",
         "glob",
         serde_json::json!({ "pattern": "[" }).to_string(),
@@ -1082,7 +1053,7 @@ async fn glob_tool_execution_invalid_build_pattern() -> Result<(), agent_client_
 #[test_log::test(tokio::test)]
 async fn grep_tool_execution_invalid_regex() -> Result<(), agent_client_protocol::Error> {
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-grep-regex-{}",
+        "acp-llm-adapter-grep-regex-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -1096,7 +1067,7 @@ async fn grep_tool_execution_invalid_regex() -> Result<(), agent_client_protocol
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "grep-regex",
         "grep",
         serde_json::json!({ "pattern": "(" }).to_string(),
@@ -1117,10 +1088,8 @@ fn render_command_output_adds_newline_to_stderr() {
 #[test_log::test(tokio::test)]
 async fn adapter_registry_execute_write_without_permission()
 -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-conn-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-conn-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
@@ -1136,7 +1105,7 @@ async fn adapter_registry_execute_write_without_permission()
     let registry = AdapterToolRegistry;
     let result = registry
         .execute(
-            &DeepSeekToolCall::new(
+            &ChatToolCall::new(
                 "conn-write",
                 "write_file",
                 serde_json::json!({ "path": "out.txt", "content": "data" }).to_string(),
@@ -1165,7 +1134,7 @@ async fn write_file_with_client_capability_but_no_connection_errors()
             ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
         ),
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "w",
         "write_file",
         serde_json::json!({"path": "out.txt", "content": "hi"}).to_string(),
@@ -1200,7 +1169,7 @@ async fn edit_file_with_client_read_capability_but_no_connection_errors()
             ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
         ),
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "e",
         "edit_file",
         serde_json::json!({"path": "out.txt", "old_text": "a", "new_text": "b"}).to_string(),
@@ -1225,10 +1194,8 @@ async fn edit_file_with_client_read_capability_but_no_connection_errors()
 #[test_log::test(tokio::test)]
 async fn edit_file_with_client_write_capability_but_no_connection_errors()
 -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-client-write-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-client-write-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     std::fs::write(temp_root.join("out.txt"), "hello world")
@@ -1244,7 +1211,7 @@ async fn edit_file_with_client_write_capability_but_no_connection_errors()
             ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
         ),
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "e",
         "edit_file",
         serde_json::json!({"path": "out.txt", "old_text": "hello", "new_text": "bye"}).to_string(),
@@ -1279,7 +1246,7 @@ async fn read_file_with_client_capability_but_no_connection_errors()
             ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
         ),
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "r",
         "read_file",
         serde_json::json!({"path": "missing.txt"}).to_string(),
@@ -1297,10 +1264,8 @@ async fn read_file_with_client_capability_but_no_connection_errors()
 
 #[test]
 fn helper_path_functions_cover_error_branches() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-path-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-path-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     assert!(build_root_gitignore(&temp_root).is_none());
@@ -1554,7 +1519,7 @@ async fn run_command_via_terminal_kills_on_cancellation() {
 async fn edit_file_rejects_empty_old_text() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-edit-empty-{}",
+        "acp-llm-adapter-edit-empty-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -1569,7 +1534,7 @@ async fn edit_file_rejects_empty_old_text() -> Result<(), agent_client_protocol:
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "edit-empty",
         "edit_file",
         serde_json::json!({
@@ -1589,10 +1554,8 @@ async fn edit_file_rejects_empty_old_text() -> Result<(), agent_client_protocol:
 #[test_log::test(tokio::test)]
 async fn edit_file_rejects_old_text_not_found() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-edit-nf-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-edit-nf-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     std::fs::write(temp_root.join("f.txt"), "content")
@@ -1605,7 +1568,7 @@ async fn edit_file_rejects_old_text_not_found() -> Result<(), agent_client_proto
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "edit-nf",
         "edit_file",
         serde_json::json!({
@@ -1626,7 +1589,7 @@ async fn edit_file_rejects_old_text_not_found() -> Result<(), agent_client_proto
 async fn edit_file_rejects_multiple_matches() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-edit-multi-{}",
+        "acp-llm-adapter-edit-multi-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&temp_root)
@@ -1641,7 +1604,7 @@ async fn edit_file_rejects_multiple_matches() -> Result<(), agent_client_protoco
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "edit-multi",
         "edit_file",
         serde_json::json!({
@@ -1669,7 +1632,7 @@ async fn write_file_rejects_invalid_arguments() -> Result<(), agent_client_proto
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("write-invalid", "write_file", "not json");
+    let call = ChatToolCall::new("write-invalid", "write_file", "not json");
 
     let result = write_file_tool_execution(&store, &call, &context, None, None, None).await;
     assert!(!result.success);
@@ -1687,7 +1650,7 @@ async fn run_command_rejects_invalid_arguments() -> Result<(), agent_client_prot
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("run-invalid", "run_command", "not json");
+    let call = ChatToolCall::new("run-invalid", "run_command", "not json");
 
     let result = run_command_tool_execution(
         &store,
@@ -1713,7 +1676,7 @@ async fn edit_file_rejects_invalid_arguments() -> Result<(), agent_client_protoc
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("edit-invalid", "edit_file", "not json");
+    let call = ChatToolCall::new("edit-invalid", "edit_file", "not json");
 
     let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
     assert!(!result.success);
@@ -1737,7 +1700,7 @@ async fn require_tool_permission_propagates_request_error()
     // Use a permission requester that returns an error.
     // The FakePermissionRequester with empty responses signals exhaustion as an error.
     let requester = FakePermissionRequester::new(Vec::new());
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "err-call",
         "write_file",
         "{\"path\": \"x\", \"content\": \"c\"}",
@@ -1753,10 +1716,8 @@ async fn require_tool_permission_propagates_request_error()
 #[test_log::test(tokio::test)]
 async fn write_file_tool_execution_read_existing_text_local_success()
 -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-write-existing-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-write-existing-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     std::fs::write(temp_root.join("existing.txt"), "previous content")
@@ -1775,7 +1736,7 @@ async fn write_file_tool_execution_read_existing_text_local_success()
             PERMISSION_ALLOW_ONCE_OPTION_ID,
         )),
     )]);
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "write-existing",
         "write_file",
         serde_json::json!({"path": "existing.txt", "content": "new content"}).to_string(),
@@ -1817,10 +1778,8 @@ fn line_number_for_offset_returns_1_for_out_of_bounds() {
 #[test_log::test(tokio::test)]
 async fn run_command_tool_uses_terminal_when_capability_present()
 -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-cmd-terminal-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-cmd-terminal-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
@@ -1851,7 +1810,7 @@ async fn run_command_tool_uses_terminal_when_capability_present()
                 .fs(FileSystemCapabilities::new()),
         ),
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "cmd-terminal",
         "run_command",
         serde_json::json!({"command": "echo via-terminal"}).to_string(),
@@ -1884,7 +1843,7 @@ async fn run_command_tool_execution_spawn_error_path() {
             PERMISSION_ALLOW_ONCE_OPTION_ID,
         )),
     )]);
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "spawn-err",
         "run_command",
         serde_json::json!({"command": "echo ok"}).to_string(),
@@ -1917,7 +1876,7 @@ fn update_plan_tool_definition_exposes_structured_entries() {
 
 #[test]
 fn update_plan_tool_execution_parses_entries() {
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "plan-call",
         "update_plan",
         serde_json::json!({
@@ -1957,7 +1916,7 @@ fn update_plan_tool_execution_parses_entries() {
 
 #[test]
 fn update_plan_tool_execution_rejects_invalid_json() {
-    let call = DeepSeekToolCall::new("plan-bad", "update_plan", "not json");
+    let call = ChatToolCall::new("plan-bad", "update_plan", "not json");
     let result = update_plan_tool_execution(&call);
 
     assert!(!result.success);
@@ -1977,7 +1936,7 @@ async fn exit_plan_mode_tool_execution_switches_to_accept_edits()
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("exit-plan", "exit_plan_mode", "{}");
+    let call = ChatToolCall::new("exit-plan", "exit_plan_mode", "{}");
 
     let result = exit_plan_mode_tool_execution(&store, &call, &context).await;
 
@@ -2016,10 +1975,8 @@ async fn read_file_tool_byte_caps_pathological_wide_line()
     // Regression test for daa-8q1: a minified-style file is few lines but each
     // line is huge. The line-count cap alone lets a single line add a multi-MB
     // tool result to history; FILE_OUTPUT_LIMIT must bound it.
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-widecap-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-widecap-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let huge_line = "x".repeat(FILE_OUTPUT_LIMIT * 4);
@@ -2032,7 +1989,7 @@ async fn read_file_tool_byte_caps_pathological_wide_line()
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "call-widecap",
         "read_file",
         serde_json::json!({ "path": "min.js" }).to_string(),
@@ -2052,10 +2009,8 @@ async fn grep_tool_byte_caps_wide_matches() -> Result<(), agent_client_protocol:
     // Regression test for daa-8q1: grep emits full match lines. Matching in a
     // minified file yields enormous per-line matches; FILE_OUTPUT_LIMIT bounds
     // the content that reaches the model and history.
-    let temp_root = std::env::temp_dir().join(format!(
-        "deepseek-acp-adapter-grepcap-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_root =
+        std::env::temp_dir().join(format!("acp-llm-adapter-grepcap-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let huge_line = format!("needle{}", "x".repeat(FILE_OUTPUT_LIMIT * 4));
@@ -2070,7 +2025,7 @@ async fn grep_tool_byte_caps_wide_matches() -> Result<(), agent_client_protocol:
     };
 
     let result = grep_tool_execution(
-        &DeepSeekToolCall::new(
+        &ChatToolCall::new(
             "call-grepcap",
             "grep",
             serde_json::json!({ "pattern": "needle" }).to_string(),

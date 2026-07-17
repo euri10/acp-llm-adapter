@@ -7,8 +7,8 @@ pub(crate) type PermissionModeFixture = (
     crate::session::SessionStore,
     agent_client_protocol::schema::v1::SessionId,
     crate::tools::ToolContext,
-    deepseek_acp_adapter::deepseek::ToolCall,
-    deepseek_acp_adapter::deepseek::ToolCall,
+    acp_llm_adapter::llm::ToolCall,
+    acp_llm_adapter::llm::ToolCall,
 );
 
 /// Create a fully wired permission-mode test environment.
@@ -32,12 +32,12 @@ pub(crate) fn permission_mode_fixture()
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let edit_call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let edit_call = acp_llm_adapter::llm::ToolCall::new(
         "call-edit",
         "write_file",
         serde_json::json!({ "path": "file.txt" }).to_string(),
     );
-    let shell_call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let shell_call = acp_llm_adapter::llm::ToolCall::new(
         "call-shell",
         "run_command",
         serde_json::json!({ "command": "echo hi" }).to_string(),
@@ -140,7 +140,7 @@ fn max_tokens_select_options_include_default_and_presets() {
 
 #[test]
 fn pending_tool_calls_require_complete_metadata() -> Result<(), agent_client_protocol::Error> {
-    use deepseek_acp_adapter::deepseek::ToolCallDelta;
+    use acp_llm_adapter::llm::ToolCallDelta;
 
     let mut missing_id = PendingToolCalls::default();
     missing_id.push(&ToolCallDelta::new(

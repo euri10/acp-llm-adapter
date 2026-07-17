@@ -14,16 +14,16 @@ use crate::test_utils::{FakePermissionRequester, select_current_value};
 use crate::tools::{
     AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry,
 };
+use acp_llm_adapter::error::AdapterError;
+use acp_llm_adapter::llm::{
+    ChatError, ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
+    ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition,
+};
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, DeleteSessionRequest, PromptRequest,
     RequestPermissionRequest, RequestPermissionResponse, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
 };
-use deepseek_acp_adapter::deepseek::{
-    ChatMessage, ChatRequest, DeepSeekError, FinishReason, LlmClient, MessageRole, StreamEvent,
-    ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
-};
-use deepseek_acp_adapter::error::AdapterError;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use std::collections::VecDeque;
@@ -38,7 +38,7 @@ struct FakeLlmClient {
 }
 
 impl FakeLlmClient {
-    fn new(events: Vec<Result<StreamEvent, DeepSeekError>>) -> Self {
+    fn new(events: Vec<Result<StreamEvent, ChatError>>) -> Self {
         Self::with_steps(events.into_iter().map(FakeStreamStep::Event).collect())
     }
 
@@ -63,18 +63,18 @@ impl LlmClient for FakeLlmClient {
         &self,
         request: ChatRequest,
         cancellation_token: CancellationToken,
-    ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ChatError>>, ChatError> {
         self.requests
             .lock()
-            .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
+            .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
             .push(request);
         let steps = self
             .streams
             .lock()
-            .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
+            .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
             .pop_front()
             .ok_or_else(|| {
-                DeepSeekError::InvalidResponse(
+                ChatError::InvalidResponse(
                     "fake client stream was requested too many times".to_string(),
                 )
             })?;
@@ -96,7 +96,7 @@ impl LlmClient for FakeLlmClient {
 }
 
 enum FakeStreamStep {
-    Event(Result<StreamEvent, DeepSeekError>),
+    Event(Result<StreamEvent, ChatError>),
     WaitForCancel,
 }
 
@@ -115,11 +115,9 @@ impl LlmClient for PendingLlmClient {
         &self,
         _request: ChatRequest,
         _cancellation_token: CancellationToken,
-    ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError> {
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ChatError>>, ChatError> {
         self.started.notify_one();
-        Ok(Box::pin(stream::pending::<
-            Result<StreamEvent, DeepSeekError>,
-        >()))
+        Ok(Box::pin(stream::pending::<Result<StreamEvent, ChatError>>()))
     }
 }
 
@@ -320,12 +318,12 @@ fn assert_no_permission_requests(
 struct FakeToolRegistry {
     definitions: Vec<ToolDefinition>,
     result: ToolExecution,
-    calls: Arc<Mutex<Vec<DeepSeekToolCall>>>,
+    calls: Arc<Mutex<Vec<ChatToolCall>>>,
 }
 
 struct PlanModeToolRegistry {
     definitions: Vec<ToolDefinition>,
-    calls: Arc<Mutex<Vec<DeepSeekToolCall>>>,
+    calls: Arc<Mutex<Vec<ChatToolCall>>>,
 }
 
 impl PlanModeToolRegistry {
@@ -403,7 +401,7 @@ impl PlanModeToolRegistry {
         }
     }
 
-    fn calls(&self) -> Arc<Mutex<Vec<DeepSeekToolCall>>> {
+    fn calls(&self) -> Arc<Mutex<Vec<ChatToolCall>>> {
         Arc::clone(&self.calls)
     }
 }
@@ -430,7 +428,7 @@ impl ToolRegistry for PlanModeToolRegistry {
 
     fn execute<'a>(
         &'a self,
-        call: &'a DeepSeekToolCall,
+        call: &'a ChatToolCall,
         _context: &'a ToolContext,
         _store: &'a SessionStore,
         _connection: Option<&'a dyn ToolCallRequester>,
@@ -465,7 +463,7 @@ impl FakeToolRegistry {
         }
     }
 
-    fn calls(&self) -> Arc<Mutex<Vec<DeepSeekToolCall>>> {
+    fn calls(&self) -> Arc<Mutex<Vec<ChatToolCall>>> {
         Arc::clone(&self.calls)
     }
 }
@@ -485,7 +483,7 @@ impl ToolRegistry for FakeToolRegistry {
 
     fn execute<'a>(
         &'a self,
-        call: &'a DeepSeekToolCall,
+        call: &'a ChatToolCall,
         _context: &'a ToolContext,
         _store: &'a SessionStore,
         _connection: Option<&'a dyn ToolCallRequester>,
@@ -1515,10 +1513,7 @@ async fn prompt_executes_tool_calls_and_replays_results() -> Result<(), agent_cl
     assert_eq!(replayed.len(), 3);
     assert_eq!(replayed[0].content(), "use tool");
     assert_eq!(replayed[1].tool_calls()[0].id(), "call-1");
-    assert_eq!(
-        replayed[2].role(),
-        deepseek_acp_adapter::deepseek::MessageRole::Tool
-    );
+    assert_eq!(replayed[2].role(), acp_llm_adapter::llm::MessageRole::Tool);
     assert_eq!(replayed[2].tool_call_id(), Some("call-1"));
     assert_eq!(replayed[2].content(), "tool says hi");
 
@@ -1641,7 +1636,7 @@ async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protoc
 async fn report_tool_call_generates_correct_notification()
 -> Result<(), agent_client_protocol::Error> {
     let session_id = agent_client_protocol::schema::v1::SessionId::new("report-test");
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "call-rtc",
         "write_file",
         serde_json::json!({"path": "f"}).to_string(),
@@ -1669,7 +1664,7 @@ async fn report_tool_call_generates_correct_notification()
 async fn report_tool_result_with_edit_generates_diff_and_location()
 -> Result<(), agent_client_protocol::Error> {
     let session_id = agent_client_protocol::schema::v1::SessionId::new("report-result");
-    let call = DeepSeekToolCall::new("call-rt", "write_file", "{}");
+    let call = ChatToolCall::new("call-rt", "write_file", "{}");
     let exec = ToolExecution {
         content: "ok".to_string(),
         raw_output: serde_json::json!({"x": 1}),
@@ -1717,10 +1712,10 @@ async fn report_tool_result_with_edit_generates_diff_and_location()
 
 #[test]
 fn helper_raw_input_and_finish_reason_cover_branches() {
+    use acp_llm_adapter::llm::FinishReason;
     use agent_client_protocol::schema::v1::StopReason;
-    use deepseek_acp_adapter::deepseek::FinishReason;
 
-    let valid_raw_input = DeepSeekToolCall::new(
+    let valid_raw_input = ChatToolCall::new(
         "valid-raw-input",
         "echo",
         serde_json::json!({ "a": 1 }).to_string(),
@@ -1729,7 +1724,7 @@ fn helper_raw_input_and_finish_reason_cover_branches() {
         super::tool_raw_input(&valid_raw_input),
         serde_json::json!({ "a": 1 })
     );
-    let invalid_raw_input = DeepSeekToolCall::new("invalid-raw-input", "echo", "not json");
+    let invalid_raw_input = ChatToolCall::new("invalid-raw-input", "echo", "not json");
     assert_eq!(
         super::tool_raw_input(&invalid_raw_input),
         serde_json::json!("not json")
@@ -1759,49 +1754,49 @@ fn helper_raw_input_and_finish_reason_cover_branches() {
 
 #[test]
 fn tool_call_title_read_file() {
-    let call = DeepSeekToolCall::new("c1", "read_file", r#"{"path":"src/lib.rs"}"#);
+    let call = ChatToolCall::new("c1", "read_file", r#"{"path":"src/lib.rs"}"#);
     assert_eq!(super::tool_call_title(&call), "Read: src/lib.rs");
 }
 
 #[test]
 fn tool_call_title_write_file() {
-    let call = DeepSeekToolCall::new("c2", "write_file", r#"{"path":"Cargo.toml"}"#);
+    let call = ChatToolCall::new("c2", "write_file", r#"{"path":"Cargo.toml"}"#);
     assert_eq!(super::tool_call_title(&call), "Write: Cargo.toml");
 }
 
 #[test]
 fn tool_call_title_edit_file() {
-    let call = DeepSeekToolCall::new("c3", "edit_file", r#"{"path":"src/main.rs"}"#);
+    let call = ChatToolCall::new("c3", "edit_file", r#"{"path":"src/main.rs"}"#);
     assert_eq!(super::tool_call_title(&call), "Edit: src/main.rs");
 }
 
 #[test]
 fn tool_call_title_list_dir() {
-    let call = DeepSeekToolCall::new("c4", "list_dir", r#"{"path":"src/"}"#);
+    let call = ChatToolCall::new("c4", "list_dir", r#"{"path":"src/"}"#);
     assert_eq!(super::tool_call_title(&call), "List: src/");
 }
 
 #[test]
 fn tool_call_title_grep() {
-    let call = DeepSeekToolCall::new("c5", "grep", r#"{"pattern":"fn main"}"#);
+    let call = ChatToolCall::new("c5", "grep", r#"{"pattern":"fn main"}"#);
     assert_eq!(super::tool_call_title(&call), "Search: fn main");
 }
 
 #[test]
 fn tool_call_title_glob() {
-    let call = DeepSeekToolCall::new("c6", "glob", r#"{"pattern":"*.rs"}"#);
+    let call = ChatToolCall::new("c6", "glob", r#"{"pattern":"*.rs"}"#);
     assert_eq!(super::tool_call_title(&call), "Glob: *.rs");
 }
 
 #[test]
 fn tool_call_title_run_command() {
-    let call = DeepSeekToolCall::new("c7", "run_command", r#"{"command":"ls -la"}"#);
+    let call = ChatToolCall::new("c7", "run_command", r#"{"command":"ls -la"}"#);
     assert_eq!(super::tool_call_title(&call), "ls -la");
 }
 
 #[test]
 fn tool_call_title_run_command_complex() {
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "c8",
         "run_command",
         r#"{"command":"pwd && sed -n '1,220p' /home/user/file.txt"}"#,
@@ -1814,20 +1809,20 @@ fn tool_call_title_run_command_complex() {
 
 #[test]
 fn tool_call_title_fallback_to_name_when_no_known_args() {
-    let call = DeepSeekToolCall::new("c9", "custom_tool", r#"{"foo":"bar"}"#);
+    let call = ChatToolCall::new("c9", "custom_tool", r#"{"foo":"bar"}"#);
     assert_eq!(super::tool_call_title(&call), "custom_tool");
 }
 
 #[test]
 fn tool_call_title_fallback_to_name_when_invalid_json() {
-    let call = DeepSeekToolCall::new("c10", "some_tool", "not json at all");
+    let call = ChatToolCall::new("c10", "some_tool", "not json at all");
     assert_eq!(super::tool_call_title(&call), "some_tool");
 }
 
 #[test]
 fn tool_call_title_prefers_command_over_path() {
     // Args with both command and path should use command (higher priority).
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "c11",
         "run_command",
         r#"{"command":"cargo build","path":"src/"}"#,
@@ -1837,7 +1832,7 @@ fn tool_call_title_prefers_command_over_path() {
 
 #[test]
 fn tool_call_title_empty_string_filtered_out() {
-    let call = DeepSeekToolCall::new("c12", "run_command", r#"{"command":""}"#);
+    let call = ChatToolCall::new("c12", "run_command", r#"{"command":""}"#);
     assert_eq!(super::tool_call_title(&call), "run_command");
 }
 
@@ -1874,11 +1869,7 @@ fn filter_messages_by_size_drops_oversized_tool_call_unit_as_a_whole() {
     let older_small = ChatMessage::user("keep me");
     let assistant_call = ChatMessage::assistant_with_tool_calls(
         "checking",
-        vec![DeepSeekToolCall::new(
-            "call-1",
-            "read_file",
-            r#"{"path":"a"}"#,
-        )],
+        vec![ChatToolCall::new("call-1", "read_file", r#"{"path":"a"}"#)],
     );
     let tool_result = ChatMessage::tool_result("call-1", "x".repeat(2_000));
     let messages = vec![
@@ -1900,11 +1891,7 @@ fn filter_messages_by_size_keeps_tool_call_unit_together_when_it_fits() {
     let first = ChatMessage::user("first");
     let assistant_call = ChatMessage::assistant_with_tool_calls(
         "checking",
-        vec![DeepSeekToolCall::new(
-            "call-1",
-            "read_file",
-            r#"{"path":"a"}"#,
-        )],
+        vec![ChatToolCall::new("call-1", "read_file", r#"{"path":"a"}"#)],
     );
     let tool_result = ChatMessage::tool_result("call-1", "small result");
     let padding = ChatMessage::user("x".repeat(500));
@@ -1974,8 +1961,8 @@ fn sanitize_conversation_preserves_tool_calls_and_results() {
     let assistant_call = ChatMessage::assistant_with_tool_calls(
         "checking",
         vec![
-            DeepSeekToolCall::new("call-1", "read_file", r#"{"path":"a"}"#),
-            DeepSeekToolCall::new("call-2", "read_file", r#"{"path":"b"}"#),
+            ChatToolCall::new("call-1", "read_file", r#"{"path":"a"}"#),
+            ChatToolCall::new("call-2", "read_file", r#"{"path":"b"}"#),
         ],
     );
     let messages = vec![

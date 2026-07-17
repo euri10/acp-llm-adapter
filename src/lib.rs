@@ -11,32 +11,33 @@
     clippy::unimplemented
 )]
 
-//! `DeepSeek` client support for the `ACP` adapter.
+//! LLM client support for the ACP adapter.
 //!
-//! The adapter proper still needs the ACP session layer, but the DeepSeek-side
+//! The adapter proper still needs the ACP session layer, but the LLM-side
 //! seam lives here so it can be tested in isolation and reused by the later
 //! protocol wiring.
 //!
 //! # Overview
 //!
-//! The [`deepseek`] module exposes:
-//! - request primitives such as [`deepseek::ChatMessage`] and [`deepseek::ChatRequest`]
-//! - tool advertisement types such as [`deepseek::ToolDefinition`]
-//! - streamed response events via [`deepseek::StreamEvent`]
-//! - an HTTP-backed client via [`deepseek::DeepSeekClient`]
+//! The [`llm`] module exposes:
+//! - [`ChatClient`](llm::ChatClient) — OpenAI-compatible chat-completions client
+//! - [`ChatConfig`](llm::ChatConfig) — client configuration
+//! - [`ChatRequest`](llm::ChatRequest) — streaming request builder
+//! - [`StreamEvent`](llm::StreamEvent) — normalized streaming event
+//! - [`LlmClient`](llm::LlmClient) — trait abstracting the LLM backend
 //!
 //! # Examples
 //!
 //! Create a simple streaming request:
 //!
 //! ```rust,no_run
-//! use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, DeepSeekClient, LlmClient};
+//! use acp_llm_adapter::llm::{ChatMessage, ChatRequest, ChatClient, LlmClient};
 //! use futures_util::StreamExt;
 //! use tokio_util::sync::CancellationToken;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let client = DeepSeekClient::from_env()?;
+//!     let client = ChatClient::from_env()?;
 //!     let request = ChatRequest::new(vec![
 //!         ChatMessage::system("You are a concise coding assistant."),
 //!         ChatMessage::user("Explain what this adapter crate does."),
@@ -54,7 +55,7 @@
 //! Build a tool-enabled request:
 //!
 //! ```rust
-//! use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest, ToolDefinition};
+//! use acp_llm_adapter::llm::{ChatMessage, ChatRequest, ToolDefinition};
 //!
 //! let request = ChatRequest::new(vec![ChatMessage::user("Read src/lib.rs")]).with_tools(vec![
 //!     ToolDefinition::new(
@@ -74,8 +75,8 @@
 //! assert_eq!(request.tools()[0].name(), "read_file");
 //! ```
 
-/// `DeepSeek` client primitives and streaming SSE adapter.
-pub mod deepseek;
+/// LLM client primitives and streaming SSE adapter.
+pub mod llm;
 
 /// Unified domain error type for the adapter crate.
 pub mod error;
@@ -85,14 +86,14 @@ pub mod error;
 // every `slice[i]` with `.get(i).unwrap()` adds noise without safety benefit in tests.
 #[allow(clippy::indexing_slicing)]
 mod tests {
-    use crate::deepseek::ToolCall as DeepSeekToolCall;
-    use crate::deepseek::{
-        ChatMessage, ChatRequest, DeepSeekConfig, FinishReason, ToolCallDelta, ToolDefinition,
+    use crate::llm::ToolCall as ChatToolCall;
+    use crate::llm::{
+        ChatConfig, ChatMessage, ChatRequest, FinishReason, ToolCallDelta, ToolDefinition,
     };
 
     #[test]
     fn message_role_as_str_returns_correct_wire_names() {
-        use crate::deepseek::MessageRole;
+        use crate::llm::MessageRole;
         let system = ChatMessage::system("s");
         assert_eq!(system.role(), MessageRole::System);
         let user = ChatMessage::user("u");
@@ -105,7 +106,7 @@ mod tests {
 
     #[test]
     fn chat_message_tool_call_accessors() {
-        let tool_calls = vec![DeepSeekToolCall::new("call-1", "echo", "{}")];
+        let tool_calls = vec![ChatToolCall::new("call-1", "echo", "{}")];
         let msg = ChatMessage::assistant_with_tool_calls("assistant", tool_calls.clone());
         assert_eq!(msg.tool_calls().len(), 1);
         assert_eq!(msg.tool_calls()[0].id(), "call-1");
@@ -163,15 +164,12 @@ mod tests {
 
     #[test]
     fn finish_reason_from_api_covers_all_branches() {
-        assert_eq!(
-            FinishReason::EndTurn,
-            crate::deepseek::FinishReason::EndTurn
-        );
+        assert_eq!(FinishReason::EndTurn, crate::llm::FinishReason::EndTurn);
     }
 
     #[test]
-    fn deepseek_config_new_accepts_explicit_values() {
-        let config = DeepSeekConfig::new("key", "https://example.com", "model-v1");
+    fn chat_config_new_accepts_explicit_values() {
+        let config = ChatConfig::new("key", "https://example.com", "model-v1");
         assert_eq!(config.base_url(), "https://example.com");
         assert_eq!(config.model(), "model-v1");
     }

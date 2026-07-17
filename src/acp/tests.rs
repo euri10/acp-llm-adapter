@@ -25,6 +25,7 @@ use crate::test_utils::*;
 use crate::tools::{
     AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolRegistry, require_tool_permission,
 };
+use acp_llm_adapter::llm::{ChatMessage, LlmClient};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest,
@@ -37,7 +38,6 @@ use agent_client_protocol::schema::v1::{
     ToolKind,
 };
 use agent_client_protocol::{Channel, Client};
-use deepseek_acp_adapter::deepseek::{ChatMessage, LlmClient};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -596,7 +596,7 @@ async fn permission_request_prompts_and_caches_allow_always()
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let call = acp_llm_adapter::llm::ToolCall::new(
         "call-1",
         "write_file",
         serde_json::json!({ "path": "file.txt" }).to_string(),
@@ -672,7 +672,7 @@ async fn permission_request_rejects_without_caching() -> Result<(), agent_client
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let call = acp_llm_adapter::llm::ToolCall::new(
         "call-2",
         "run_command",
         serde_json::json!({ "command": "echo hi" }).to_string(),
@@ -821,7 +821,7 @@ async fn serve_with_transport_handles_authenticate_and_mode_updates()
     let server_client = Arc::clone(&llm_client);
     let server_tools = Arc::clone(&tool_registry);
 
-    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-auth-test-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-auth-test-{}", Uuid::new_v4()));
 
     let server = tokio::spawn(async move {
         serve_with_transport_and_state_dir(
@@ -943,7 +943,7 @@ async fn request_permission_rejects_unknown_option() -> Result<(), agent_client_
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let call = acp_llm_adapter::llm::ToolCall::new(
         "unknown-option-call",
         "write_file",
         serde_json::json!({ "path": "file.txt" }).to_string(),
@@ -1068,7 +1068,7 @@ async fn require_tool_permission_rejects() -> Result<(), agent_client_protocol::
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let call = acp_llm_adapter::llm::ToolCall::new(
         "reject-call",
         "run_command",
         serde_json::json!({ "command": "echo hi" }).to_string(),
@@ -1098,7 +1098,7 @@ async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let call = acp_llm_adapter::llm::ToolCall::new(
         "cancel-call",
         "run_command",
         serde_json::json!({ "command": "echo hi" }).to_string(),
@@ -1125,7 +1125,7 @@ async fn require_tool_permission_missing_requester() {
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = deepseek_acp_adapter::deepseek::ToolCall::new("id", "tool", "{}");
+    let call = acp_llm_adapter::llm::ToolCall::new("id", "tool", "{}");
     let Err(error) = require_tool_permission(&store, &context, &call, ToolKind::Edit, None).await
     else {
         return;
@@ -1143,7 +1143,7 @@ async fn request_permission_handles_unknown_session_and_cancelled()
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let missing_call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let missing_call = acp_llm_adapter::llm::ToolCall::new(
         "missing-call",
         "write_file",
         serde_json::json!({ "path": "file.txt" }).to_string(),
@@ -1172,7 +1172,7 @@ async fn request_permission_handles_unknown_session_and_cancelled()
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = deepseek_acp_adapter::deepseek::ToolCall::new(
+    let call = acp_llm_adapter::llm::ToolCall::new(
         "cancelled-call",
         "run_command",
         serde_json::json!({ "command": "echo hi" }).to_string(),
@@ -1367,7 +1367,7 @@ async fn new_session_connected_async_path_creates_session()
 async fn serve_with_transport_exercises_list_close_and_logout()
 -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
-    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-list-test-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-list-test-{}", Uuid::new_v4()));
     let llm_client: Arc<dyn LlmClient> = Arc::new(MockLlmClient);
     let tool_registry: Arc<dyn ToolRegistry> = Arc::new(EmptyToolRegistry);
     let (client_transport, server_transport) = Channel::duplex();
@@ -1433,8 +1433,7 @@ async fn serve_with_transport_drives_new_session_config_prompt_and_cancel()
     let server_state = Arc::clone(&store.state);
     let server_client = Arc::clone(&llm_client);
     let server_tools = Arc::clone(&tool_registry);
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-config-test-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-config-test-{}", Uuid::new_v4()));
 
     let server = tokio::spawn(async move {
         serve_with_transport_and_state_dir(
@@ -1540,8 +1539,7 @@ fn list_sessions_returns_active_sessions() -> Result<(), agent_client_protocol::
 #[test]
 fn save_history_appends_only_new_messages_to_persistence()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-save-history-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-save-history-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
@@ -1575,8 +1573,7 @@ fn save_history_appends_only_new_messages_to_persistence()
 #[test]
 fn list_sessions_includes_persisted_sessions_for_requested_cwd()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-list-history-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-list-history-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(FilesystemSessionStore::new(&state_dir));
@@ -1600,8 +1597,7 @@ fn list_sessions_includes_persisted_sessions_for_requested_cwd()
 #[test]
 fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-list-merge-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-list-merge-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
@@ -1664,18 +1660,14 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
 #[test_log::test(tokio::test)]
 async fn load_session_restores_state_and_replays_history()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-load-history-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-load-history-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone());
     let session_id = agent_client_protocol::schema::v1::SessionId::new("session-load");
-    let tool_call = deepseek_acp_adapter::deepseek::ToolCall::new(
-        "call-1",
-        "read_file",
-        r#"{"path":"Cargo.toml"}"#,
-    );
+    let tool_call =
+        acp_llm_adapter::llm::ToolCall::new("call-1", "read_file", r#"{"path":"Cargo.toml"}"#);
     let history = vec![
         ChatMessage::user("inspect the manifest"),
         ChatMessage::assistant_with_tool_calls("reading", vec![tool_call]),
@@ -1772,8 +1764,7 @@ async fn load_session_restores_state_and_replays_history()
 #[test_log::test(tokio::test)]
 async fn resume_session_restores_state_without_replay() -> Result<(), agent_client_protocol::Error>
 {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-resume-history-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-resume-history-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
@@ -1848,7 +1839,7 @@ async fn resume_session_rejects_relative_additional_directory()
 
 #[test_log::test(tokio::test)]
 async fn load_session_rejects_mismatched_cwd() -> Result<(), agent_client_protocol::Error> {
-    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-load-cwd-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-load-cwd-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
@@ -1925,8 +1916,7 @@ fn close_session_rejects_unknown_session() -> Result<(), agent_client_protocol::
 
 #[test]
 fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_protocol::Error> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-delete-session-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-delete-session-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
@@ -2419,9 +2409,7 @@ fn tool_result_content_finds_matching_tool_result() {
         ChatMessage::user("run tool"),
         ChatMessage::assistant_with_tool_calls(
             "calling",
-            vec![deepseek_acp_adapter::deepseek::ToolCall::new(
-                "call-1", "echo", "{}",
-            )],
+            vec![acp_llm_adapter::llm::ToolCall::new("call-1", "echo", "{}")],
         ),
         ChatMessage::tool_result("call-1", "tool output"),
         ChatMessage::assistant("done"),
@@ -2455,7 +2443,7 @@ fn replayed_tool_call_formats_acp_tool_call_with_output() -> Result<(), agent_cl
         ChatMessage::user("run echo"),
         ChatMessage::assistant_with_tool_calls(
             "using echo",
-            vec![deepseek_acp_adapter::deepseek::ToolCall::new(
+            vec![acp_llm_adapter::llm::ToolCall::new(
                 "call-1",
                 "echo",
                 r#"{"message":"hi"}"#,
@@ -2464,8 +2452,7 @@ fn replayed_tool_call_formats_acp_tool_call_with_output() -> Result<(), agent_cl
         ChatMessage::tool_result("call-1", "echo: hi"),
     ];
 
-    let tool_call =
-        deepseek_acp_adapter::deepseek::ToolCall::new("call-1", "echo", r#"{"message":"hi"}"#);
+    let tool_call = acp_llm_adapter::llm::ToolCall::new("call-1", "echo", r#"{"message":"hi"}"#);
     let replayed = replayed_tool_call(&tool_call, &history);
 
     assert_eq!(replayed.tool_call_id.0.as_ref(), "call-1");
@@ -2496,8 +2483,7 @@ fn replayed_tool_call_formats_acp_tool_call_with_output() -> Result<(), agent_cl
 #[test]
 fn replayed_tool_call_defaults_output_when_tool_result_missing()
 -> Result<(), agent_client_protocol::Error> {
-    let tool_call =
-        deepseek_acp_adapter::deepseek::ToolCall::new("call-2", "echo", r#"{"message":"hi"}"#);
+    let tool_call = acp_llm_adapter::llm::ToolCall::new("call-2", "echo", r#"{"message":"hi"}"#);
     let history: Vec<ChatMessage> = Vec::new();
     let replayed = replayed_tool_call(&tool_call, &history);
 
@@ -2582,8 +2568,7 @@ fn replay_session_history_skips_system_and_tool_messages()
 fn replay_session_history_replays_tool_calls_for_assistant()
 -> Result<(), agent_client_protocol::Error> {
     let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-tools");
-    let tool_call =
-        deepseek_acp_adapter::deepseek::ToolCall::new("call-1", "echo", r#"{"message":"hi"}"#);
+    let tool_call = acp_llm_adapter::llm::ToolCall::new("call-1", "echo", r#"{"message":"hi"}"#);
     let history = vec![
         ChatMessage::user("use echo"),
         ChatMessage::assistant_with_tool_calls("using tool", vec![tool_call]),
@@ -2680,9 +2665,7 @@ fn replay_assistant_message_emits_content_and_tool_calls()
 -> Result<(), agent_client_protocol::Error> {
     let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-asst");
     let history: Vec<ChatMessage> = Vec::new();
-    let tool_calls = vec![deepseek_acp_adapter::deepseek::ToolCall::new(
-        "call-1", "echo", "{}",
-    )];
+    let tool_calls = vec![acp_llm_adapter::llm::ToolCall::new("call-1", "echo", "{}")];
     let message = ChatMessage::assistant_with_tool_calls("assistant text", tool_calls);
     let mut notifications = Vec::new();
 
@@ -2749,8 +2732,7 @@ fn replay_assistant_message_content_only_no_tool_calls() -> Result<(), agent_cli
 #[test_log::test(tokio::test)]
 async fn restore_persisted_session_rejects_mismatched_id()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-restore-id-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-restore-id-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
@@ -2823,7 +2805,7 @@ fn new_session_without_persistence_omits_meta() -> Result<(), agent_client_proto
 #[test]
 fn new_session_with_persistence_includes_history_jsonl_path_in_meta()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-new-meta-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-new-meta-{}", Uuid::new_v4()));
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(FilesystemSessionStore::new(&state_dir));
     let response = handle_new_session_request(&store, &NewSessionRequest::new(&state_dir))?;
@@ -2852,7 +2834,7 @@ fn new_session_with_persistence_includes_history_jsonl_path_in_meta()
 #[test_log::test(tokio::test)]
 async fn load_session_response_includes_history_jsonl_path_in_meta()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-load-meta-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-load-meta-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
@@ -2907,8 +2889,7 @@ async fn load_session_response_includes_history_jsonl_path_in_meta()
 #[test_log::test(tokio::test)]
 async fn resume_session_response_includes_history_jsonl_path_in_meta()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir =
-        std::env::temp_dir().join(format!("deepseek-acp-resume-meta-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-resume-meta-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
@@ -2962,7 +2943,7 @@ async fn resume_session_response_includes_history_jsonl_path_in_meta()
 #[test]
 fn list_sessions_with_persistence_includes_history_jsonl_path_in_meta()
 -> Result<(), agent_client_protocol::Error> {
-    let state_dir = std::env::temp_dir().join(format!("deepseek-acp-list-meta-{}", Uuid::new_v4()));
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-list-meta-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(FilesystemSessionStore::new(&state_dir));

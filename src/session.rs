@@ -10,16 +10,16 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use acp_llm_adapter::llm::MessageRole;
+use acp_llm_adapter::llm::{
+    ChatConfig, ChatMessage, ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition,
+};
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, McpServer, PermissionOption, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
     SessionInfo, SessionMode, SessionModeId, SessionModeState, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind,
-};
-use deepseek_acp_adapter::deepseek::MessageRole;
-use deepseek_acp_adapter::deepseek::{
-    ChatMessage, DeepSeekConfig, ToolCall as DeepSeekToolCall, ToolCallDelta, ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -29,7 +29,7 @@ use crate::mcp::{McpSession, McpToolTarget};
 use crate::session_store::{FilesystemSessionStore, PersistedSessionMeta, PersistedSessionRecord};
 use crate::tools::ToolContext;
 use crate::turn::tool_raw_input;
-use deepseek_acp_adapter::error::AdapterError;
+use acp_llm_adapter::error::AdapterError;
 /// Default maximum number of tool-call/response cycles per prompt turn.
 pub(crate) const DEFAULT_MAX_TURN_REQUESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(99);
 pub(crate) const PERMISSION_ALLOW_ONCE_OPTION_ID: &str = "allow_once";
@@ -178,7 +178,7 @@ impl ReasoningEffort {
 pub(crate) async fn request_tool_permission(
     store: &SessionStore,
     context: &ToolContext,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     kind: ToolKind,
     requester: &dyn PermissionRequester,
 ) -> Result<PermissionDecision, AdapterError> {
@@ -286,7 +286,7 @@ impl PendingToolCalls {
         }
     }
 
-    pub(crate) fn finish(self) -> Result<Vec<DeepSeekToolCall>, AdapterError> {
+    pub(crate) fn finish(self) -> Result<Vec<ChatToolCall>, AdapterError> {
         self.calls
             .into_iter()
             .enumerate()
@@ -303,7 +303,7 @@ struct PendingToolCall {
 }
 
 impl PendingToolCall {
-    fn finish(self, index: usize) -> Result<DeepSeekToolCall, AdapterError> {
+    fn finish(self, index: usize) -> Result<ChatToolCall, AdapterError> {
         let id = self.id.ok_or_else(|| {
             AdapterError::InvalidParams(format!("tool call delta {index} is missing an id"))
         })?;
@@ -313,7 +313,7 @@ impl PendingToolCall {
             ))
         })?;
 
-        Ok(DeepSeekToolCall::new(id, name, self.arguments))
+        Ok(ChatToolCall::new(id, name, self.arguments))
     }
 }
 
@@ -511,7 +511,7 @@ pub(crate) fn initial_model(fallback_model: impl Into<String>) -> String {
 pub(crate) struct AdapterState {
     pub(crate) default_model: String,
     /// Model IDs available for selection. Set at startup via
-    /// `DeepSeekClient::fetch_available_models` or initialised to
+    /// `ChatClient::fetch_available_models` or initialised to
     /// `[default_model]` as a fallback.
     pub(crate) available_models: Vec<String>,
     pub(crate) client_capabilities: Option<ClientCapabilities>,
@@ -542,7 +542,7 @@ impl AdapterState {
 
 impl Default for AdapterState {
     fn default() -> Self {
-        Self::new(DeepSeekConfig::DEFAULT_MODEL)
+        Self::new(ChatConfig::DEFAULT_MODEL)
     }
 }
 

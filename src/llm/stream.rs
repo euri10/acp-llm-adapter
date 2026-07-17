@@ -4,7 +4,7 @@ use sse_reqwest_client::{EventSource, SseEvent};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{DeepSeekError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
+use super::{ChatError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
 
 /// Run a single SSE stream attempt, forwarding events into `tx`.
 ///
@@ -13,7 +13,7 @@ use super::{DeepSeekError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
 /// need to inspect the return value.
 pub(super) async fn run_stream_attempt(
     mut event_source: EventSource,
-    tx: &mpsc::UnboundedSender<Result<StreamEvent, DeepSeekError>>,
+    tx: &mpsc::UnboundedSender<Result<StreamEvent, ChatError>>,
     cancellation_token: &CancellationToken,
 ) {
     let mut saw_finish = false;
@@ -66,7 +66,7 @@ pub(super) async fn run_stream_attempt(
     }
 
     if !saw_finish && !cancellation_token.is_cancelled() {
-        let _ = tx.send(Err(DeepSeekError::InvalidResponse(
+        let _ = tx.send(Err(ChatError::InvalidResponse(
             "stream ended before a finish reason was received".to_string(),
         )));
     }
@@ -122,12 +122,10 @@ struct ChatToolCallFunctionDelta {
     arguments: Option<String>,
 }
 
-pub(crate) fn parse_chat_completion_chunk(
-    payload: &str,
-) -> Result<Vec<StreamEvent>, DeepSeekError> {
+pub(crate) fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEvent>, ChatError> {
     let chunk: ChatCompletionChunk = serde_json::from_str(payload)?;
     let Some(choice) = chunk.choices.into_iter().next() else {
-        return Err(DeepSeekError::InvalidResponse(
+        return Err(ChatError::InvalidResponse(
             "chat completion chunk did not include any choices".to_string(),
         ));
     };

@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 
+use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
     HttpHeader, McpServer, McpServerHttp, McpServerStdio, ToolKind,
 };
-use deepseek_acp_adapter::deepseek::{ToolCall as DeepSeekToolCall, ToolDefinition};
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, ContentBlock as McpContent, JsonObject, Tool as McpTool};
 use rmcp::service::RunningService;
@@ -17,7 +17,7 @@ use tokio::process::Command as TokioCommand;
 
 use crate::SessionStore;
 use crate::tools::{ToolContext, ToolExecution};
-use deepseek_acp_adapter::error::AdapterError;
+use acp_llm_adapter::error::AdapterError;
 
 /// Prefix used for model-visible MCP tool names.
 pub(crate) const MCP_TOOL_PREFIX: &str = "mcp";
@@ -67,7 +67,7 @@ pub(crate) const fn mcp_tool_kind() -> ToolKind {
 #[must_use]
 pub(crate) async fn mcp_tool_execution(
     store: &SessionStore,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     context: &ToolContext,
 ) -> ToolExecution {
     let target = match store.find_mcp_target(&context.session_id, call.name()) {
@@ -111,7 +111,7 @@ pub(crate) async fn mcp_tool_execution(
 }
 
 /// Parse MCP tool arguments from the model-emitted JSON payload.
-pub(crate) fn mcp_call_arguments(call: &DeepSeekToolCall) -> Result<JsonObject, String> {
+pub(crate) fn mcp_call_arguments(call: &ChatToolCall) -> Result<JsonObject, String> {
     match serde_json::from_str::<Value>(call.arguments()) {
         Ok(Value::Object(arguments)) => Ok(arguments),
         Ok(_) => Err(format!(

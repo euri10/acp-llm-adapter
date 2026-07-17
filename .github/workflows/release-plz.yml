@@ -6,14 +6,14 @@
 #   2. release-plz-release — When the release PR is merged, publishes to
 #                           crates.io and creates a GitHub release + git tag.
 #
-# Tag format: <crate_name>-v<version>  (e.g. deepseek-acp-adapter-v0.4.0)
+# Tag format: <crate_name>-v<version>  (e.g. acp-llm-adapter-v0.4.0)
 #
 # ---------------------------------------------------------------------------
 # PREREQUISITES (one-time setup)
 # ---------------------------------------------------------------------------
 #
 # A. GitHub Actions permissions
-#    Go to: https://github.com/euri10/deepseek-acp-adapter/settings/actions
+#    Go to: https://github.com/euri10/acp-llm-adapter/settings/actions
 #    Under "Workflow permissions", select:
 #      ☑ Read and write permissions
 #      ☑ Allow GitHub Actions to create and approve pull requests

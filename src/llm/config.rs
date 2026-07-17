@@ -1,16 +1,16 @@
-use super::DeepSeekError;
+use super::ChatError;
 
 /// Configuration for the `DeepSeek` client.
 ///
-/// Values can be provided explicitly with [`DeepSeekConfig::new`] or loaded
-/// from the process environment with [`DeepSeekConfig::from_env`].
+/// Values can be provided explicitly with [`ChatConfig::new`] or loaded
+/// from the process environment with [`ChatConfig::from_env`].
 ///
 /// # Examples
 ///
 /// ```rust
-/// use deepseek_acp_adapter::deepseek::DeepSeekConfig;
+/// use acp_llm_adapter::llm::ChatConfig;
 ///
-/// let config = DeepSeekConfig::new(
+/// let config = ChatConfig::new(
 ///     "test-key",
 ///     "https://api.deepseek.com",
 ///     "deepseek-v4-pro",
@@ -20,13 +20,13 @@ use super::DeepSeekError;
 /// assert_eq!(config.model(), "deepseek-v4-pro");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeepSeekConfig {
+pub struct ChatConfig {
     api_key: String,
     base_url: String,
     model: String,
 }
 
-impl DeepSeekConfig {
+impl ChatConfig {
     /// Default `DeepSeek` OpenAI-compatible base URL.
     pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
     /// Default model used by the adapter.
@@ -55,13 +55,13 @@ impl DeepSeekConfig {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use deepseek_acp_adapter::deepseek::DeepSeekConfig;
+    /// use acp_llm_adapter::llm::ChatConfig;
     ///
-    /// let config = DeepSeekConfig::from_env()?;
+    /// let config = ChatConfig::from_env()?;
     /// assert!(!config.model().is_empty());
-    /// # Ok::<(), deepseek_acp_adapter::deepseek::DeepSeekError>(())
+    /// # Ok::<(), acp_llm_adapter::llm::ChatError>(())
     /// ```
-    pub fn from_env() -> Result<Self, DeepSeekError> {
+    pub fn from_env() -> Result<Self, ChatError> {
         Self::from_env_fn(|key| std::env::var_os(key).and_then(|value| value.into_string().ok()))
     }
 
@@ -75,12 +75,12 @@ impl DeepSeekConfig {
     /// Same as [`from_env`].
     pub(crate) fn from_env_fn(
         mut get_env: impl FnMut(&str) -> Option<String>,
-    ) -> Result<Self, DeepSeekError> {
-        let api_key = get_env("DEEPSEEK_API_KEY").ok_or(DeepSeekError::MissingApiKey)?;
+    ) -> Result<Self, ChatError> {
+        let api_key = get_env("DEEPSEEK_API_KEY").ok_or(ChatError::MissingApiKey)?;
 
         let api_key = api_key.trim().to_string();
         if api_key.is_empty() {
-            return Err(DeepSeekError::MissingApiKey);
+            return Err(ChatError::MissingApiKey);
         }
 
         let base_url = get_env("DEEPSEEK_BASE_URL")

@@ -2,30 +2,30 @@ use std::error::Error as StdError;
 
 use thiserror::Error;
 
-/// Errors returned by `DeepSeek` configuration, request setup, or SSE parsing.
+/// Errors returned by LLM client configuration, request setup, or SSE parsing.
 #[derive(Debug, Error)]
-pub enum DeepSeekError {
+pub enum ChatError {
     /// The `DEEPSEEK_API_KEY` environment variable was not set or was empty.
     #[error("DEEPSEEK_API_KEY is not set")]
     MissingApiKey,
     /// The SSE transport failed while streaming events.
-    #[error("`DeepSeek` SSE transport error: {0}")]
+    #[error("LLM SSE transport error: {0}")]
     Transport(#[source] Box<dyn StdError + Send + Sync>),
     /// The model returned a chunk that could not be decoded.
-    #[error("invalid DeepSeek response: {0}")]
+    #[error("invalid LLM response: {0}")]
     InvalidResponse(String),
     /// The model returned malformed JSON.
-    #[error("failed to parse DeepSeek response: {0}")]
+    #[error("failed to parse LLM response: {0}")]
     Json(#[from] serde_json::Error),
 }
 
-impl From<reqwest::Error> for DeepSeekError {
+impl From<reqwest::Error> for ChatError {
     fn from(error: reqwest::Error) -> Self {
         Self::Transport(Box::new(error))
     }
 }
 
-impl From<sse_reqwest_client::Error> for DeepSeekError {
+impl From<sse_reqwest_client::Error> for ChatError {
     fn from(error: sse_reqwest_client::Error) -> Self {
         Self::Transport(Box::new(error))
     }

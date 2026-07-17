@@ -1,11 +1,11 @@
 [package]
-name = "deepseek-acp-adapter"
-version = "0.6.0"
+name = "acp-llm-adapter"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Alpha ACP adapter server that exposes DeepSeek as an agent to ACP-capable editors (Zed, Neovim, etc.)"
+description = "ACP adapter server that exposes LLM providers (DeepSeek, GLM) as agents to ACP-capable editors"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/euri10/deepseek-acp-adapter"
+repository = "https://github.com/euri10/acp-llm-adapter"
 readme = "README.md"
 
 [workspace]

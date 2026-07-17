@@ -3,6 +3,33 @@
 version = 4
 
 [[package]]
+name = "acp-llm-adapter"
+version = "0.6.0"
+dependencies = [
+ "agent-client-protocol",
+ "axum",
+ "blocking",
+ "clap",
+ "futures-util",
+ "globset",
+ "grep",
+ "http",
+ "ignore",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sse-reqwest-client",
+ "test-log",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "agent-client-protocol"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -568,33 +595,6 @@ dependencies = [
  "darling_core",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "deepseek-acp-adapter"
-version = "0.6.0"
-dependencies = [
- "agent-client-protocol",
- "axum",
- "blocking",
- "clap",
- "futures-util",
- "globset",
- "grep",
- "http",
- "ignore",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "sse-reqwest-client",
- "test-log",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

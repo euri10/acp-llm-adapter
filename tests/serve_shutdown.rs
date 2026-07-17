@@ -13,7 +13,7 @@
 
 //! Integration test for the serve shutdown path.
 //!
-//! Regression guard for dangling `deepseek-acp-adapter serve` processes: when
+//! Regression guard for dangling `acp-llm-adapter serve` processes: when
 //! the ACP client closes stdin, the adapter must exit instead of hanging
 //! forever. The test spawns the real binary, closes its stdin, and asserts the
 //! process exits within a short timeout.
@@ -39,7 +39,7 @@ use tokio::process::Command;
 /// Panics if the child exits with a non-zero status.
 #[test_log::test(tokio::test)]
 async fn serve_exits_when_stdin_closes() -> Result<(), Box<dyn Error>> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_deepseek-acp-adapter"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"))
         .args(["serve", "--backend", "mock"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -2,15 +2,15 @@
 
 use std::num::NonZeroUsize;
 
+use acp_llm_adapter::llm::{
+    ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
+    ToolCall as ChatToolCall, ToolDefinition, UsageData,
+};
 use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentChunk, Diff, MessageId, Plan, PromptRequest, PromptResponse,
     SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
-};
-use deepseek_acp_adapter::deepseek::{
-    ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
-    ToolCall as DeepSeekToolCall, ToolDefinition, UsageData,
 };
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -22,7 +22,7 @@ use crate::{
     PendingToolCalls, ReasoningEffort, SessionBehavior, SessionStore, session_notification,
     stop_reason_from_finish, text_from_prompt,
 };
-use deepseek_acp_adapter::error::AdapterError;
+use acp_llm_adapter::error::AdapterError;
 
 /// Stable model settings applied to each streamed LLM request in a prompt turn.
 #[derive(Debug, Clone, Copy)]
@@ -477,7 +477,7 @@ async fn run_prompt_turn(
 }
 
 fn transition_mode_from_tool_result(
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     result: &ToolExecution,
 ) -> Result<Option<SessionBehavior>, AdapterError> {
     if call.name() != "exit_plan_mode" || !result.success {
@@ -674,7 +674,7 @@ pub(crate) struct ModelTurn {
     /// Aggregated assistant text from the stream.
     pub(crate) assistant_text: String,
     /// Fully assembled tool calls emitted by the model.
-    pub(crate) tool_calls: Vec<DeepSeekToolCall>,
+    pub(crate) tool_calls: Vec<ChatToolCall>,
     /// Raw finish reason reported by `DeepSeek`.
     pub(crate) finish_reason: FinishReason,
     /// ACP stop reason derived for the client.
@@ -686,7 +686,7 @@ pub(crate) struct ModelTurn {
 fn report_tool_call(
     session_id: &SessionId,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     kind: ToolKind,
 ) -> Result<(), AdapterError> {
     let title = tool_call_title(call);
@@ -705,7 +705,7 @@ fn report_tool_call(
 fn report_tool_result(
     session_id: &SessionId,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-    call: &DeepSeekToolCall,
+    call: &ChatToolCall,
     result: &ToolExecution,
 ) -> Result<(), AdapterError> {
     let mut fields = ToolCallUpdateFields::new()
@@ -760,7 +760,7 @@ fn tool_call_update_content(result: &ToolExecution) -> Vec<ToolCallContent> {
 /// - `grep` + `{"pattern":"fn main"}` → `"Search: fn main"`
 /// - `glob` + `{"pattern":"*.rs"}` → `"Glob: *.rs"`
 #[must_use]
-pub(crate) fn tool_call_title(call: &DeepSeekToolCall) -> String {
+pub(crate) fn tool_call_title(call: &ChatToolCall) -> String {
     let Ok(args) = serde_json::from_str::<serde_json::Value>(call.arguments()) else {
         return call.name().to_string();
     };
@@ -801,7 +801,7 @@ pub(crate) fn tool_call_title(call: &DeepSeekToolCall) -> String {
 ///
 /// Invalid JSON is preserved as a plain string to keep notifications lossless.
 #[must_use]
-pub(crate) fn tool_raw_input(call: &DeepSeekToolCall) -> serde_json::Value {
+pub(crate) fn tool_raw_input(call: &ChatToolCall) -> serde_json::Value {
     serde_json::from_str(call.arguments())
         .unwrap_or_else(|_| serde_json::Value::String(call.arguments().to_string()))
 }

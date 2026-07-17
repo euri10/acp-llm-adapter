@@ -33,7 +33,7 @@ impl MessageRole {
 /// # Examples
 ///
 /// ```rust
-/// use deepseek_acp_adapter::deepseek::{ChatMessage, MessageRole, ToolCall};
+/// use acp_llm_adapter::llm::{ChatMessage, MessageRole, ToolCall};
 ///
 /// let assistant = ChatMessage::assistant_with_tool_calls(
 ///     "I need to inspect a file first.",
@@ -173,7 +173,7 @@ impl From<&ChatMessage> for WireMessage {
 /// # Examples
 ///
 /// ```rust
-/// use deepseek_acp_adapter::deepseek::ToolDefinition;
+/// use acp_llm_adapter::llm::ToolDefinition;
 ///
 /// let tool = ToolDefinition::new(
 ///     "grep",
@@ -240,7 +240,7 @@ impl ToolDefinition {
 /// # Examples
 ///
 /// ```rust
-/// use deepseek_acp_adapter::deepseek::ToolCall;
+/// use acp_llm_adapter::llm::ToolCall;
 ///
 /// let call = ToolCall::new("call-1", "read_file", r#"{"path":"Cargo.toml"}"#);
 ///
@@ -357,7 +357,7 @@ pub(crate) type ChatRequestParts = (
 /// # Examples
 ///
 /// ```rust
-/// use deepseek_acp_adapter::deepseek::{ChatMessage, ChatRequest};
+/// use acp_llm_adapter::llm::{ChatMessage, ChatRequest};
 ///
 /// let request = ChatRequest::new(vec![ChatMessage::user("Summarize the diff")])
 ///     .with_model("deepseek-v4-flash")

@@ -6,11 +6,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use super::client::{DeepSeekClient, LlmClient};
-use super::config::DeepSeekConfig;
+use super::client::{ChatClient, LlmClient};
+use super::config::ChatConfig;
 use super::stream::parse_chat_completion_chunk;
 use super::{
-    ChatMessage, ChatRequest, DeepSeekError, FinishReason, MessageRole, StreamEvent, ToolCall,
+    ChatError, ChatMessage, ChatRequest, FinishReason, MessageRole, StreamEvent, ToolCall,
     ToolCallDelta, ToolDefinition,
 };
 
@@ -19,13 +19,13 @@ use super::{
 async fn spawn_http_json_server(
     status_line: String,
     json_body: String,
-) -> Result<String, DeepSeekError> {
+) -> Result<String, ChatError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
     let address = listener
         .local_addr()
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
     let url = format!("http://{address}");
 
     tokio::spawn(async move {
@@ -51,13 +51,13 @@ async fn spawn_http_json_server(
 async fn spawn_sse_server(
     response_body: String,
     captured_request_body: Arc<Mutex<Option<String>>>,
-) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), DeepSeekError> {
+) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), ChatError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
     let address = listener
         .local_addr()
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
 
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.map_err(|error| error.to_string())?;
@@ -130,44 +130,44 @@ async fn spawn_sse_server(
 }
 
 #[test_log::test]
-fn config_uses_defaults_and_requires_key() -> Result<(), DeepSeekError> {
-    let config = DeepSeekConfig::from_env_fn(|key| match key {
+fn config_uses_defaults_and_requires_key() -> Result<(), ChatError> {
+    let config = ChatConfig::from_env_fn(|key| match key {
         "DEEPSEEK_API_KEY" => Some("secret".to_string()),
         _ => None,
     })?;
 
-    assert_eq!(config.base_url(), DeepSeekConfig::DEFAULT_BASE_URL);
-    assert_eq!(config.model(), DeepSeekConfig::DEFAULT_MODEL);
+    assert_eq!(config.base_url(), ChatConfig::DEFAULT_BASE_URL);
+    assert_eq!(config.model(), ChatConfig::DEFAULT_MODEL);
 
-    let Err(error) = DeepSeekConfig::from_env_fn(|_| None) else {
-        return Err(DeepSeekError::InvalidResponse(
+    let Err(error) = ChatConfig::from_env_fn(|_| None) else {
+        return Err(ChatError::InvalidResponse(
             "expected missing API key to fail".to_string(),
         ));
     };
 
-    assert!(matches!(error, DeepSeekError::MissingApiKey));
+    assert!(matches!(error, ChatError::MissingApiKey));
     assert_eq!(error.to_string(), "DEEPSEEK_API_KEY is not set");
 
     Ok(())
 }
 
 #[test_log::test]
-fn config_trims_values_and_defaults_blank_entries() -> Result<(), DeepSeekError> {
-    let config = DeepSeekConfig::from_env_fn(|key| match key {
+fn config_trims_values_and_defaults_blank_entries() -> Result<(), ChatError> {
+    let config = ChatConfig::from_env_fn(|key| match key {
         "DEEPSEEK_API_KEY" => Some("  secret-token  ".to_string()),
         "DEEPSEEK_BASE_URL" => Some("   ".to_string()),
         "DEEPSEEK_MODEL" => Some("  custom-model  ".to_string()),
         _ => None,
     })?;
 
-    assert_eq!(config.base_url(), DeepSeekConfig::DEFAULT_BASE_URL);
+    assert_eq!(config.base_url(), ChatConfig::DEFAULT_BASE_URL);
     assert_eq!(config.model(), "custom-model");
 
     Ok(())
 }
 
 #[test_log::test]
-fn parses_reasoning_and_text_chunks_in_order() -> Result<(), DeepSeekError> {
+fn parses_reasoning_and_text_chunks_in_order() -> Result<(), ChatError> {
     let fixture = r#"
     {
       "choices": [
@@ -197,7 +197,7 @@ fn parses_reasoning_and_text_chunks_in_order() -> Result<(), DeepSeekError> {
 }
 
 #[test_log::test]
-fn parses_empty_chunks_and_unknown_finish_reasons() -> Result<(), DeepSeekError> {
+fn parses_empty_chunks_and_unknown_finish_reasons() -> Result<(), ChatError> {
     let fixture = r#"
     {
       "choices": [
@@ -225,7 +225,7 @@ fn parses_empty_chunks_and_unknown_finish_reasons() -> Result<(), DeepSeekError>
 }
 
 #[test_log::test]
-fn parses_tool_call_deltas() -> Result<(), DeepSeekError> {
+fn parses_tool_call_deltas() -> Result<(), ChatError> {
     let fixture = r#"
     {
       "choices": [
@@ -251,7 +251,7 @@ fn parses_tool_call_deltas() -> Result<(), DeepSeekError> {
     let updates = parse_chat_completion_chunk(fixture)?;
 
     let StreamEvent::ToolCallDelta(delta) = &updates[0] else {
-        return Err(DeepSeekError::InvalidResponse(
+        return Err(ChatError::InvalidResponse(
             "expected tool call delta".to_string(),
         ));
     };
@@ -265,19 +265,19 @@ fn parses_tool_call_deltas() -> Result<(), DeepSeekError> {
 }
 
 #[test_log::test]
-fn rejects_chunks_without_choices() -> Result<(), DeepSeekError> {
+fn rejects_chunks_without_choices() -> Result<(), ChatError> {
     let fixture = r#"{ "choices": [] }"#;
 
     let Err(error) = parse_chat_completion_chunk(fixture) else {
-        return Err(DeepSeekError::InvalidResponse(
+        return Err(ChatError::InvalidResponse(
             "expected empty choice list to fail".to_string(),
         ));
     };
 
-    assert!(matches!(error, DeepSeekError::InvalidResponse(_)));
+    assert!(matches!(error, ChatError::InvalidResponse(_)));
     assert_eq!(
         error.to_string(),
-        "invalid DeepSeek response: chat completion chunk did not include any choices"
+        "invalid LLM response: chat completion chunk did not include any choices"
     );
 
     Ok(())
@@ -292,8 +292,8 @@ fn message_role_round_trips_to_wire_variant() {
 }
 
 #[test_log::test]
-fn client_rejects_empty_api_key() -> Result<(), DeepSeekError> {
-    let client = DeepSeekClient::new(DeepSeekConfig::new(
+fn client_rejects_empty_api_key() -> Result<(), ChatError> {
+    let client = ChatClient::new(ChatConfig::new(
         "",
         "https://api.deepseek.com",
         "deepseek-v4-pro",
@@ -301,18 +301,18 @@ fn client_rejects_empty_api_key() -> Result<(), DeepSeekError> {
     let request = ChatRequest::new(vec![ChatMessage::user("hello")]);
 
     let Err(error) = client.stream_chat(request, CancellationToken::new()) else {
-        return Err(DeepSeekError::InvalidResponse(
+        return Err(ChatError::InvalidResponse(
             "expected empty API key to be rejected".to_string(),
         ));
     };
 
-    assert!(matches!(error, DeepSeekError::MissingApiKey));
+    assert!(matches!(error, ChatError::MissingApiKey));
     Ok(())
 }
 
 #[test_log::test(tokio::test)]
-async fn deepseek_client_stream_chat_serializes_request_and_parses_events()
--> Result<(), DeepSeekError> {
+async fn deepseek_client_stream_chat_serializes_request_and_parses_events() -> Result<(), ChatError>
+{
     let captured_request_body = Arc::new(Mutex::new(None::<String>));
     let response_body = concat!(
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\",\"content\":\"answer\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"value\\\":1}\"}}]},\"finish_reason\":\"content_filter\"}]}\n\n",
@@ -322,7 +322,7 @@ async fn deepseek_client_stream_chat_serializes_request_and_parses_events()
     let (base_url, server) =
         spawn_sse_server(response_body, Arc::clone(&captured_request_body)).await?;
     let expected_base_url = base_url.clone();
-    let client = DeepSeekClient::new(DeepSeekConfig::new("secret", base_url, "mock-model"));
+    let client = ChatClient::new(ChatConfig::new("secret", base_url, "mock-model"));
     let config = client.config();
     assert_eq!(config.base_url(), expected_base_url);
     assert_eq!(config.model(), "mock-model");
@@ -380,15 +380,15 @@ async fn deepseek_client_stream_chat_serializes_request_and_parses_events()
 
     server
         .await
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
-        .map_err(DeepSeekError::InvalidResponse)?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
 
     let request_guard = captured_request_body
         .lock()
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
     let request_body = request_guard
         .as_ref()
-        .ok_or_else(|| DeepSeekError::InvalidResponse("missing request body".to_string()))?;
+        .ok_or_else(|| ChatError::InvalidResponse("missing request body".to_string()))?;
     let request_json: serde_json::Value = serde_json::from_str(request_body)?;
 
     assert_eq!(request_json["model"], "request-model");
@@ -410,7 +410,7 @@ async fn deepseek_client_stream_chat_serializes_request_and_parses_events()
 }
 
 #[test_log::test(tokio::test)]
-async fn deepseek_client_reports_stream_end_without_finish_reason() -> Result<(), DeepSeekError> {
+async fn deepseek_client_reports_stream_end_without_finish_reason() -> Result<(), ChatError> {
     let captured_request_body = Arc::new(Mutex::new(None::<String>));
     let response_body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
@@ -419,40 +419,40 @@ async fn deepseek_client_reports_stream_end_without_finish_reason() -> Result<()
     .to_string();
     let (base_url, server) =
         spawn_sse_server(response_body, Arc::clone(&captured_request_body)).await?;
-    let client = DeepSeekClient::new(DeepSeekConfig::new("secret", base_url, "mock-model"));
+    let client = ChatClient::new(ChatConfig::new("secret", base_url, "mock-model"));
     let mut stream = client.stream_chat(
         ChatRequest::new(vec![ChatMessage::user("hello")]),
         CancellationToken::new(),
     )?;
 
     let first_event = stream.next().await.ok_or_else(|| {
-        DeepSeekError::InvalidResponse("expected message event before stream error".to_string())
+        ChatError::InvalidResponse("expected message event before stream error".to_string())
     })??;
     assert_eq!(first_event, StreamEvent::Message("partial".to_string()));
 
     let Err(error) = stream
         .next()
         .await
-        .ok_or_else(|| DeepSeekError::InvalidResponse("expected stream error".to_string()))?
+        .ok_or_else(|| ChatError::InvalidResponse("expected stream error".to_string()))?
     else {
-        return Err(DeepSeekError::InvalidResponse(
+        return Err(ChatError::InvalidResponse(
             "expected missing finish reason to fail".to_string(),
         ));
     };
-    assert!(matches!(error, DeepSeekError::InvalidResponse(_)));
+    assert!(matches!(error, ChatError::InvalidResponse(_)));
     assert_eq!(
         error.to_string(),
-        "invalid DeepSeek response: stream ended before a finish reason was received"
+        "invalid LLM response: stream ended before a finish reason was received"
     );
 
     server
         .await
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
-        .map_err(DeepSeekError::InvalidResponse)?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
 
     let request_guard = captured_request_body
         .lock()
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
     assert!(request_guard.as_ref().is_some());
 
     Ok(())
@@ -460,26 +460,26 @@ async fn deepseek_client_reports_stream_end_without_finish_reason() -> Result<()
 
 #[test_log::test]
 fn deepseek_error_from_event_source_error_uses_transport_variant() {
-    let error = DeepSeekError::from(sse_reqwest_client::Error::Status(
+    let error = ChatError::from(sse_reqwest_client::Error::Status(
         http::StatusCode::BAD_REQUEST,
     ));
 
-    assert!(matches!(error, DeepSeekError::Transport(_)));
+    assert!(matches!(error, ChatError::Transport(_)));
     assert!(
         error
             .to_string()
-            .contains("`DeepSeek` SSE transport error: unexpected HTTP status code")
+            .contains("LLM SSE transport error: unexpected HTTP status code")
     );
 }
 
 #[test_log::test(tokio::test)]
-async fn retries_stream_on_connection_drop_before_events() -> Result<(), DeepSeekError> {
+async fn retries_stream_on_connection_drop_before_events() -> Result<(), ChatError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .map_err(|e| DeepSeekError::InvalidResponse(e.to_string()))?;
+        .map_err(|e| ChatError::InvalidResponse(e.to_string()))?;
     let addr = listener
         .local_addr()
-        .map_err(|e| DeepSeekError::InvalidResponse(e.to_string()))?;
+        .map_err(|e| ChatError::InvalidResponse(e.to_string()))?;
 
     let response_body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n",
@@ -516,7 +516,7 @@ async fn retries_stream_on_connection_drop_before_events() -> Result<(), DeepSee
         Ok::<(), String>(())
     });
 
-    let client = DeepSeekClient::new(DeepSeekConfig::new(
+    let client = ChatClient::new(ChatConfig::new(
         "secret",
         format!("http://{addr}"),
         "mock-model",
@@ -529,19 +529,19 @@ async fn retries_stream_on_connection_drop_before_events() -> Result<(), DeepSee
     let event = stream
         .next()
         .await
-        .ok_or_else(|| DeepSeekError::InvalidResponse("expected message event".to_string()))??;
+        .ok_or_else(|| ChatError::InvalidResponse("expected message event".to_string()))??;
     assert_eq!(event, StreamEvent::Message("hello".to_string()));
 
     let event = stream
         .next()
         .await
-        .ok_or_else(|| DeepSeekError::InvalidResponse("expected finish event".to_string()))??;
+        .ok_or_else(|| ChatError::InvalidResponse("expected finish event".to_string()))??;
     assert_eq!(event, StreamEvent::Finished(FinishReason::EndTurn));
 
     server
         .await
-        .map_err(|e| DeepSeekError::InvalidResponse(e.to_string()))?
-        .map_err(DeepSeekError::InvalidResponse)?;
+        .map_err(|e| ChatError::InvalidResponse(e.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
 
     Ok(())
 }
@@ -549,11 +549,11 @@ async fn retries_stream_on_connection_drop_before_events() -> Result<(), DeepSee
 #[test_log::test]
 fn deepseek_config_rejects_blank_api_key_from_environment() {
     assert!(matches!(
-        DeepSeekConfig::from_env_fn(|key| match key {
+        ChatConfig::from_env_fn(|key| match key {
             "DEEPSEEK_API_KEY" => Some("   ".to_string()),
             _ => None,
         }),
-        Err(DeepSeekError::MissingApiKey)
+        Err(ChatError::MissingApiKey)
     ));
 }
 
@@ -595,7 +595,7 @@ fn finish_reason_unknown_maps_to_other() {
 fn parse_chunk_with_invalid_json_fails() {
     assert!(matches!(
         parse_chat_completion_chunk("not json"),
-        Err(DeepSeekError::Json(_))
+        Err(ChatError::Json(_))
     ));
 }
 
@@ -627,7 +627,7 @@ fn chat_request_tool_call_id_accessor() {
 }
 
 #[test_log::test]
-fn parse_chunk_with_tool_call_no_function() -> Result<(), DeepSeekError> {
+fn parse_chunk_with_tool_call_no_function() -> Result<(), ChatError> {
     let fixture = r#"
     {
       "choices": [
@@ -648,7 +648,7 @@ fn parse_chunk_with_tool_call_no_function() -> Result<(), DeepSeekError> {
 
     let updates = parse_chat_completion_chunk(fixture)?;
     let StreamEvent::ToolCallDelta(delta) = &updates[0] else {
-        return Err(DeepSeekError::InvalidResponse(
+        return Err(ChatError::InvalidResponse(
             "expected tool call delta".to_string(),
         ));
     };
@@ -661,7 +661,7 @@ fn parse_chunk_with_tool_call_no_function() -> Result<(), DeepSeekError> {
 }
 
 #[test_log::test]
-fn parse_chunk_with_no_tool_calls_and_empty_delta() -> Result<(), DeepSeekError> {
+fn parse_chunk_with_no_tool_calls_and_empty_delta() -> Result<(), ChatError> {
     let fixture = r#"
     {
       "choices": [
@@ -765,12 +765,12 @@ fn tool_definition_accessors_expose_fields() {
 }
 
 #[test_log::test(tokio::test)]
-async fn deepseek_client_reports_parse_errors_from_sse_payloads() -> Result<(), DeepSeekError> {
+async fn deepseek_client_reports_parse_errors_from_sse_payloads() -> Result<(), ChatError> {
     let captured_request_body = Arc::new(Mutex::new(None::<String>));
     let response_body = "data: not-json\n\n".to_string();
     let (base_url, server) =
         spawn_sse_server(response_body, Arc::clone(&captured_request_body)).await?;
-    let client = DeepSeekClient::new(DeepSeekConfig::new("secret", base_url, "mock-model"));
+    let client = ChatClient::new(ChatConfig::new("secret", base_url, "mock-model"));
     let mut stream = client.stream_chat(
         ChatRequest::new(vec![ChatMessage::user("hello")]),
         CancellationToken::new(),
@@ -779,29 +779,29 @@ async fn deepseek_client_reports_parse_errors_from_sse_payloads() -> Result<(), 
     let Err(error) = stream
         .next()
         .await
-        .ok_or_else(|| DeepSeekError::InvalidResponse("expected parse error".to_string()))?
+        .ok_or_else(|| ChatError::InvalidResponse("expected parse error".to_string()))?
     else {
-        return Err(DeepSeekError::InvalidResponse(
+        return Err(ChatError::InvalidResponse(
             "expected invalid JSON to fail".to_string(),
         ));
     };
-    assert!(matches!(error, DeepSeekError::Json(_)));
+    assert!(matches!(error, ChatError::Json(_)));
 
     server
         .await
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?
-        .map_err(DeepSeekError::InvalidResponse)?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
 
     let request_guard = captured_request_body
         .lock()
-        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
     assert!(request_guard.as_ref().is_some());
 
     Ok(())
 }
 
 #[test_log::test(tokio::test)]
-async fn fetch_available_models_parses_openai_model_list() -> Result<(), DeepSeekError> {
+async fn fetch_available_models_parses_openai_model_list() -> Result<(), ChatError> {
     let json_body = serde_json::json!({
         "object": "list",
         "data": [
@@ -814,7 +814,7 @@ async fn fetch_available_models_parses_openai_model_list() -> Result<(), DeepSee
     .to_string();
 
     let base_url = spawn_http_json_server("HTTP/1.1 200 OK".to_string(), json_body).await?;
-    let client = DeepSeekClient::new(DeepSeekConfig::new("test-key", base_url, "glm-4.6"));
+    let client = ChatClient::new(ChatConfig::new("test-key", base_url, "glm-4.6"));
 
     let models = client.fetch_available_models("glm-4.6").await;
 
@@ -831,14 +831,14 @@ async fn fetch_available_models_parses_openai_model_list() -> Result<(), DeepSee
 }
 
 #[test_log::test(tokio::test)]
-async fn fetch_available_models_falls_back_on_http_error() -> Result<(), DeepSeekError> {
+async fn fetch_available_models_falls_back_on_http_error() -> Result<(), ChatError> {
     let json_body = r#"{"error": "internal server error"}"#;
     let base_url = spawn_http_json_server(
         "HTTP/1.1 500 Internal Server Error".to_string(),
         json_body.to_string(),
     )
     .await?;
-    let client = DeepSeekClient::new(DeepSeekConfig::new("test-key", base_url, "my-model"));
+    let client = ChatClient::new(ChatConfig::new("test-key", base_url, "my-model"));
 
     let models = client.fetch_available_models("my-model").await;
 

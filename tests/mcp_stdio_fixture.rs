@@ -24,7 +24,7 @@ use rmcp::transport::stdio;
 use rmcp::{ServerHandler, ServiceExt};
 use serde_json::Value;
 
-const RUN_FIXTURE_ENV: &str = "DEEPSEEK_ACP_ADAPTER_RUN_MCP_FIXTURE";
+const RUN_FIXTURE_ENV: &str = "ACP_LLM_ADAPTER_RUN_MCP_FIXTURE";
 
 #[derive(Debug, Clone)]
 struct StdioFixtureServer {

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+use acp_llm_adapter::llm::{ChatMessage, LlmClient, MessageRole, ToolCall as ChatToolCall};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
@@ -21,9 +22,6 @@ use agent_client_protocol::schema::v1::{
     ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent_client_protocol::{Agent, ConnectTo};
-use deepseek_acp_adapter::deepseek::{
-    ChatMessage, LlmClient, MessageRole, ToolCall as DeepSeekToolCall,
-};
 use uuid::Uuid;
 
 use crate::tools::ToolRegistry;
@@ -120,7 +118,7 @@ async fn serve_with_transport_impl(
 
     Agent
         .builder()
-        .name("deepseek-acp-adapter")
+        .name("acp-llm-adapter")
         .on_receive_request(
             async move |request: InitializeRequest, responder, _cx| {
                 responder.respond(handle_initialize_request(&initialize_store, request)?)
@@ -587,7 +585,7 @@ fn replay_message_id(
         MessageRole::Tool => "tool",
     };
     let name = format!(
-        "deepseek-acp-adapter:replay:{}:{message_index}:{role_name}:{content}",
+        "acp-llm-adapter:replay:{}:{message_index}:{role_name}:{content}",
         session_id.0.as_ref(),
     );
     Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
@@ -595,7 +593,7 @@ fn replay_message_id(
         .into()
 }
 
-fn replayed_tool_call(tool_call: &DeepSeekToolCall, history: &[ChatMessage]) -> AcpToolCall {
+fn replayed_tool_call(tool_call: &ChatToolCall, history: &[ChatMessage]) -> AcpToolCall {
     let output = tool_result_content(tool_call.id(), history).unwrap_or_default();
     AcpToolCall::new(
         tool_call.id().to_string(),

@@ -10,12 +10,12 @@ use crate::session::{
 };
 use crate::tools::{AdapterToolRegistry, ToolContext, ToolRegistry};
 use crate::{PermissionRequester, test_store};
+use acp_llm_adapter::llm::ToolCall as ChatToolCall;
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerAcp, McpServerHttp, McpServerStdio,
     NewSessionRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SetSessionModeRequest, ToolKind,
 };
-use deepseek_acp_adapter::deepseek::ToolCall as DeepSeekToolCall;
 use futures_util::future::BoxFuture;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock as McpContent, ListToolsResult,
@@ -32,7 +32,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-const RUN_STDIO_FIXTURE_ENV: &str = "DEEPSEEK_ACP_ADAPTER_RUN_MCP_FIXTURE";
+const RUN_STDIO_FIXTURE_ENV: &str = "ACP_LLM_ADAPTER_RUN_MCP_FIXTURE";
 
 #[derive(Debug, Clone)]
 struct EchoMcpServer;
@@ -293,7 +293,7 @@ async fn adapter_registry_exposes_and_executes_session_mcp_tools()
 
     let result = registry
         .execute(
-            &DeepSeekToolCall::new(
+            &ChatToolCall::new(
                 "call-mcp",
                 "mcp__echo_server__echo",
                 serde_json::json!({ "message": "hello" }).to_string(),
@@ -326,7 +326,7 @@ async fn mcp_tools_use_explicit_execute_permission_kind() -> Result<(), agent_cl
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "call-mcp-permission",
         "mcp__server__tool",
         serde_json::json!({ "message": "hello" }).to_string(),
@@ -357,7 +357,7 @@ async fn mcp_tools_use_explicit_execute_permission_kind() -> Result<(), agent_cl
 
 #[test]
 fn mcp_call_arguments_rejects_non_object_json() -> Result<(), agent_client_protocol::Error> {
-    let call = DeepSeekToolCall::new("mcp-args", "mcp__server__tool", "[1,2,3]");
+    let call = ChatToolCall::new("mcp-args", "mcp__server__tool", "[1,2,3]");
     let Err(error) = mcp_call_arguments(&call) else {
         return Err(
             agent_client_protocol::Error::internal_error().data("expected object rejection")
@@ -369,7 +369,7 @@ fn mcp_call_arguments_rejects_non_object_json() -> Result<(), agent_client_proto
 
 #[test]
 fn mcp_call_arguments_rejects_invalid_json() -> Result<(), agent_client_protocol::Error> {
-    let call = DeepSeekToolCall::new("mcp-args", "mcp__server__tool", "{oops");
+    let call = ChatToolCall::new("mcp-args", "mcp__server__tool", "{oops");
     let Err(error) = mcp_call_arguments(&call) else {
         return Err(agent_client_protocol::Error::internal_error().data("expected JSON rejection"));
     };
@@ -379,7 +379,7 @@ fn mcp_call_arguments_rejects_invalid_json() -> Result<(), agent_client_protocol
 
 #[test]
 fn mcp_call_arguments_accepts_object_json() -> Result<(), agent_client_protocol::Error> {
-    let call = DeepSeekToolCall::new(
+    let call = ChatToolCall::new(
         "mcp-args",
         "mcp__server__tool",
         serde_json::json!({
@@ -523,7 +523,7 @@ async fn mcp_tool_execution_unknown_tool() -> Result<(), agent_client_protocol::
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("mcp-unknown", "mcp__nonexistent__tool", "{}");
+    let call = ChatToolCall::new("mcp-unknown", "mcp__nonexistent__tool", "{}");
     let result = mcp_tool_execution(&store, &call, &context).await;
     assert!(!result.success);
     assert!(result.content.contains("unknown MCP tool"));
@@ -840,7 +840,7 @@ async fn mcp_tool_execution_bad_arguments_for_registered_tool()
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("mcp-bad-args", "mcp__echo_server__echo", "[1,2,3]");
+    let call = ChatToolCall::new("mcp-bad-args", "mcp__echo_server__echo", "[1,2,3]");
     let result = mcp_tool_execution(&store, &call, &context).await;
     assert!(!result.success);
     assert!(result.content.contains("arguments must be a JSON object"));
@@ -940,7 +940,7 @@ async fn mcp_tool_execution_peer_call_tool_error() -> Result<(), agent_client_pr
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("mcp-failing", "mcp__failing_server__failer", "{}");
+    let call = ChatToolCall::new("mcp-failing", "mcp__failing_server__failer", "{}");
     let result = mcp_tool_execution(&store, &call, &context).await;
     assert!(!result.success);
     assert!(
@@ -1043,7 +1043,7 @@ async fn mcp_tool_execution_is_error_flag() -> Result<(), agent_client_protocol:
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("mcp-errflag", "mcp__error_flag_server__error_flag", "{}");
+    let call = ChatToolCall::new("mcp-errflag", "mcp__error_flag_server__error_flag", "{}");
     let result = mcp_tool_execution(&store, &call, &context).await;
     assert!(!result.success);
     assert_eq!(result.content, "err output");
@@ -1059,7 +1059,7 @@ async fn mcp_tool_execution_unknown_session() {
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let call = DeepSeekToolCall::new("mcp-unknown-session", "mcp__server__tool", "{}");
+    let call = ChatToolCall::new("mcp-unknown-session", "mcp__server__tool", "{}");
     let result = mcp_tool_execution(&store, &call, &context).await;
     assert!(!result.success);
     assert!(result.content.contains("unknown session id"));

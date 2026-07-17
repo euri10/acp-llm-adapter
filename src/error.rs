@@ -1,4 +1,4 @@
-//! Unified error type for the `DeepSeek` ACP adapter.
+//! Unified error type for the `acp-llm-adapter`.
 //!
 //! `AdapterError` wraps all domain-level errors produced by the adapter so
 //! that callers (primarily the ACP protocol boundary) can convert a single
@@ -7,7 +7,7 @@
 
 use thiserror::Error;
 
-use crate::deepseek::DeepSeekError;
+use crate::llm::ChatError;
 
 // ---------------------------------------------------------------------------
 // SessionPersistenceError — moved here from the library crate so AdapterError
@@ -35,7 +35,7 @@ pub enum SessionPersistenceError {
 // AdapterError — single domain error for the whole adapter
 // ---------------------------------------------------------------------------
 
-/// Unified domain error for the `DeepSeek` ACP adapter.
+/// Unified domain error for the `acp-llm-adapter`.
 ///
 /// Every public fallible function in the domain layer returns this type (or a
 /// `Result` whose error variant is this type).  The ACP boundary owns the
@@ -48,7 +48,7 @@ pub enum SessionPersistenceError {
 ///
 /// | Variant | Source | Typical cause |
 /// |---|---|---|
-/// | `DeepSeek` | [`DeepSeekError`] | API key missing, transport failure, bad response |
+/// | `Llm` | [`ChatError`] | API key missing, transport failure, bad response |
 /// | `SessionPersistence` | [`SessionPersistenceError`] | I/O, JSON, invalid session id |
 /// | `InvalidParams` | — | Invalid method parameters |
 /// | `InvalidRequest` | — | Invalid request structure |
@@ -56,9 +56,9 @@ pub enum SessionPersistenceError {
 /// | `Internal` | — | Unexpected internal invariant violations |
 #[derive(Debug, Error)]
 pub enum AdapterError {
-    /// The `DeepSeek` API client returned an error.
-    #[error("DeepSeek API error: {0}")]
-    DeepSeek(#[from] DeepSeekError),
+    /// The LLM client returned an error.
+    #[error("LLM API error: {0}")]
+    Llm(#[from] ChatError),
 
     /// Session persistence (filesystem I/O, JSON) failed.
     #[error("session persistence error: {0}")]
@@ -186,11 +186,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test_log::test]
-    fn adapter_error_deepseek_display() {
-        let deepseek_err = DeepSeekError::MissingApiKey;
-        let err = AdapterError::DeepSeek(deepseek_err);
+    fn adapter_error_llm_display() {
+        let deepseek_err = ChatError::MissingApiKey;
+        let err = AdapterError::Llm(deepseek_err);
         let msg = err.to_string();
-        assert!(msg.contains("DeepSeek API error"));
+        assert!(msg.contains("LLM API error"));
         assert!(msg.contains("DEEPSEEK_API_KEY is not set"));
     }
 
@@ -277,11 +277,11 @@ mod tests {
     }
 
     #[test_log::test]
-    fn from_adapter_error_deepseek_to_acp_internal_error() {
-        let adapter_err = AdapterError::DeepSeek(DeepSeekError::MissingApiKey);
+    fn from_adapter_error_llm_to_acp_internal_error() {
+        let adapter_err = AdapterError::Llm(ChatError::MissingApiKey);
         let acp_err: agent_client_protocol::Error = adapter_err.into();
         let msg = acp_err.to_string();
-        // DeepSeek variant hits the `other => into_internal_error` arm.
+        // LLM variant hits the `other => into_internal_error` arm.
         assert!(msg.contains("DEEPSEEK_API_KEY is not set") || msg.contains("MissingApiKey"));
     }
 
@@ -349,10 +349,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test_log::test]
-    fn deepseek_error_into_adapter_error_via_from() {
-        let deepseek_err = DeepSeekError::MissingApiKey;
+    fn llm_error_into_adapter_error_via_from() {
+        let deepseek_err = ChatError::MissingApiKey;
         let adapter_err: AdapterError = deepseek_err.into();
-        assert!(matches!(adapter_err, AdapterError::DeepSeek(_)));
+        assert!(matches!(adapter_err, AdapterError::Llm(_)));
     }
 
     #[test_log::test]

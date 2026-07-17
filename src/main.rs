@@ -22,13 +22,13 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
 
+use acp_llm_adapter::error::AdapterError;
+use acp_llm_adapter::llm::FinishReason;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
     SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
 };
 use clap::{Parser, Subcommand};
-use deepseek_acp_adapter::deepseek::FinishReason;
-use deepseek_acp_adapter::error::AdapterError;
 use tracing_subscriber::EnvFilter;
 
 mod acp;
@@ -103,7 +103,7 @@ fn adapter_available_commands() -> Vec<AvailableCommand> {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "deepseek-acp-adapter",
+    name = "acp-llm-adapter",
     version,
     about = "ACP stdio adapter for DeepSeek-backed coding sessions"
 )]
@@ -291,7 +291,7 @@ async fn serve(
             .filter(|v| !v.trim().is_empty());
 
         if let Some(ref key) = api_key {
-            let models = deepseek_acp_adapter::deepseek::fetch_available_models(
+            let models = acp_llm_adapter::llm::fetch_available_models(
                 backend.default_base_url(),
                 key,
                 &default_model,
@@ -462,7 +462,7 @@ mod tests {
 
     #[test_log::test]
     fn parses_serve_subcommand() {
-        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve"]);
+        let parsed = Cli::try_parse_from(["acp-llm-adapter", "serve"]);
         assert!(
             matches!(
                 parsed,
@@ -488,7 +488,7 @@ mod tests {
     #[test_log::test]
     fn parses_dev_subcommand() {
         let parsed = Cli::try_parse_from([
-            "deepseek-acp-adapter",
+            "acp-llm-adapter",
             "dev",
             "--backend",
             "mock",
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_invalid_subcommand() {
-        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "bogus"]);
+        let parsed = Cli::try_parse_from(["acp-llm-adapter", "bogus"]);
         assert!(
             parsed.is_err(),
             "expected parse failure for invalid subcommand"
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_invalid_backend_for_serve() {
-        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--backend", "invalid"]);
+        let parsed = Cli::try_parse_from(["acp-llm-adapter", "serve", "--backend", "invalid"]);
         assert!(
             parsed.is_err(),
             "expected parse failure for invalid backend"
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_invalid_backend_for_dev() {
-        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "dev", "--backend", "bogus"]);
+        let parsed = Cli::try_parse_from(["acp-llm-adapter", "dev", "--backend", "bogus"]);
         assert!(
             parsed.is_err(),
             "expected parse failure for invalid backend"
@@ -716,8 +716,7 @@ mod tests {
 
     #[test_log::test]
     fn parses_serve_with_custom_max_turn_requests() {
-        let parsed =
-            Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--max-turn-requests", "5"]);
+        let parsed = Cli::try_parse_from(["acp-llm-adapter", "serve", "--max-turn-requests", "5"]);
 
         assert!(matches!(
             parsed,
@@ -741,7 +740,7 @@ mod tests {
 
     #[test_log::test]
     fn parses_serve_with_mock_backend() {
-        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--backend", "mock"]);
+        let parsed = Cli::try_parse_from(["acp-llm-adapter", "serve", "--backend", "mock"]);
         assert!(matches!(
             parsed,
             Ok(Cli {
@@ -755,8 +754,7 @@ mod tests {
 
     #[test_log::test]
     fn parses_serve_with_deepseek_backend_explicitly() {
-        let parsed =
-            Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--backend", "deepseek"]);
+        let parsed = Cli::try_parse_from(["acp-llm-adapter", "serve", "--backend", "deepseek"]);
         assert!(matches!(
             parsed,
             Ok(Cli {
@@ -771,7 +769,7 @@ mod tests {
     #[test_log::test]
     fn parses_dev_with_deepseek_backend_and_custom_prompt() {
         let parsed = Cli::try_parse_from([
-            "deepseek-acp-adapter",
+            "acp-llm-adapter",
             "dev",
             "--backend",
             "deepseek",
@@ -819,7 +817,7 @@ mod tests {
     #[test]
     fn stop_reason_from_finish_all_branches() {
         use super::stop_reason_from_finish;
-        use deepseek_acp_adapter::deepseek::FinishReason;
+        use acp_llm_adapter::llm::FinishReason;
 
         assert_eq!(
             stop_reason_from_finish(&FinishReason::EndTurn),
