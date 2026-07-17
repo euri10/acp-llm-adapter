@@ -17,6 +17,9 @@ cargo install acp-llm-adapter
 
 CodeCompanion uses ACP adapters for chat interactions. Extend the adapter config with this server and select it for chat.
 
+For an isolated runnable Neovim repro, see [`examples/codecompanion-minimal.lua`](examples/codecompanion-minimal.lua):
+`nvim --clean -u examples/codecompanion-minimal.lua`.
+
 For the DeepSeek backend:
 
 ```lua
