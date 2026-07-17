@@ -1,10 +1,9 @@
 #![allow(clippy::indexing_slicing)]
 use super::{ModelRequestSettings, handle_prompt_request, stream_model_turn};
 use crate::acp::{
-    CreateTerminalRequester, KillTerminalRequester, PermissionRequester, ReadTextFileRequester,
-    ReleaseTerminalRequester, TerminalOutputRequester, ToolCallRequester,
-    WaitForTerminalExitRequester, WriteTextFileRequester, handle_delete_session_request,
-    handle_new_session_request, handle_set_session_config_option_request,
+    PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
+    WriteTextFileRequester, handle_delete_session_request, handle_new_session_request,
+    handle_set_session_config_option_request,
 };
 use crate::session::{DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SessionBehavior, SessionStore};
 use crate::test_store;
@@ -183,7 +182,7 @@ impl WriteTextFileRequester for TransitionRequester {
     }
 }
 
-impl CreateTerminalRequester for TransitionRequester {
+impl TerminalRequester for TransitionRequester {
     fn create_terminal(
         &self,
         _request: agent_client_protocol::schema::v1::CreateTerminalRequest,
@@ -199,9 +198,7 @@ impl CreateTerminalRequester for TransitionRequester {
                 .data("unexpected create_terminal request"))
         })
     }
-}
 
-impl TerminalOutputRequester for TransitionRequester {
     fn terminal_output(
         &self,
         _request: agent_client_protocol::schema::v1::TerminalOutputRequest,
@@ -217,9 +214,7 @@ impl TerminalOutputRequester for TransitionRequester {
                 .data("unexpected terminal_output request"))
         })
     }
-}
 
-impl WaitForTerminalExitRequester for TransitionRequester {
     fn wait_for_terminal_exit(
         &self,
         _request: agent_client_protocol::schema::v1::WaitForTerminalExitRequest,
@@ -235,9 +230,7 @@ impl WaitForTerminalExitRequester for TransitionRequester {
                 .data("unexpected wait_for_terminal_exit request"))
         })
     }
-}
 
-impl ReleaseTerminalRequester for TransitionRequester {
     fn release_terminal(
         &self,
         _request: agent_client_protocol::schema::v1::ReleaseTerminalRequest,
@@ -253,9 +246,7 @@ impl ReleaseTerminalRequester for TransitionRequester {
                 .data("unexpected release_terminal request"))
         })
     }
-}
 
-impl KillTerminalRequester for TransitionRequester {
     fn kill_terminal(
         &self,
         _request: agent_client_protocol::schema::v1::KillTerminalRequest,

@@ -12,6 +12,7 @@ use super::{
     validate_session_paths,
 };
 use crate::dev::MockLlmClient;
+use crate::session::tests::permission_mode_fixture;
 use crate::session::{
     AdapterState, DEFAULT_MAX_TURN_REQUESTS, PERMISSION_ALLOW_ALWAYS_OPTION_ID,
     PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision,
@@ -1991,9 +1992,8 @@ fn logout_request_returns_ok() -> Result<(), agent_client_protocol::Error> {
 // wrappers* while a client role responds, so the wrappers'
 // `self.send_request(request).block_task()` bodies are genuinely covered.
 use super::{
-    CreateTerminalRequester, KillTerminalRequester, PermissionRequester, ReadTextFileRequester,
-    ReleaseTerminalRequester, TerminalOutputRequester, WaitForTerminalExitRequester,
-    WriteTextFileRequester, recover_null_write_response,
+    PermissionRequester, ReadTextFileRequester, TerminalRequester, WriteTextFileRequester,
+    recover_null_write_response,
 };
 use agent_client_protocol::Agent;
 use agent_client_protocol::schema::v1::{

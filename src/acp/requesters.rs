@@ -29,44 +29,32 @@ pub(crate) trait WriteTextFileRequester: Send + Sync {
     ) -> AcpRequestFuture<'_, WriteTextFileResponse>;
 }
 
-/// Trait for creating a terminal via ACP client `terminal/create`.
-pub(crate) trait CreateTerminalRequester: Send + Sync {
+/// Trait for all terminal operations via ACP client.
+pub(crate) trait TerminalRequester: Send + Sync {
     /// Create a terminal and execute a command.
     fn create_terminal(
         &self,
         request: CreateTerminalRequest,
     ) -> AcpRequestFuture<'_, CreateTerminalResponse>;
-}
 
-/// Trait for getting terminal output via ACP client `terminal/output`.
-pub(crate) trait TerminalOutputRequester: Send + Sync {
     /// Get the current output and status of a terminal.
     fn terminal_output(
         &self,
         request: TerminalOutputRequest,
     ) -> AcpRequestFuture<'_, TerminalOutputResponse>;
-}
 
-/// Trait for waiting for terminal exit via ACP client `terminal/wait_for_exit`.
-pub(crate) trait WaitForTerminalExitRequester: Send + Sync {
     /// Wait for a terminal command to exit.
     fn wait_for_terminal_exit(
         &self,
         request: WaitForTerminalExitRequest,
     ) -> AcpRequestFuture<'_, WaitForTerminalExitResponse>;
-}
 
-/// Trait for releasing a terminal via ACP client `terminal/release`.
-pub(crate) trait ReleaseTerminalRequester: Send + Sync {
     /// Release a terminal and free its resources.
     fn release_terminal(
         &self,
         request: ReleaseTerminalRequest,
     ) -> AcpRequestFuture<'_, ReleaseTerminalResponse>;
-}
 
-/// Trait for killing a terminal command via ACP client `terminal/kill`.
-pub(crate) trait KillTerminalRequester: Send + Sync {
     /// Kill a terminal's running command without releasing the terminal.
     fn kill_terminal(
         &self,
@@ -74,63 +62,35 @@ pub(crate) trait KillTerminalRequester: Send + Sync {
     ) -> AcpRequestFuture<'_, KillTerminalResponse>;
 }
 
-/// Combined trait for all terminal operations.
-pub(crate) trait TerminalRequester:
-    CreateTerminalRequester
-    + TerminalOutputRequester
-    + WaitForTerminalExitRequester
-    + ReleaseTerminalRequester
-    + KillTerminalRequester
-{
-}
-
-impl<T> TerminalRequester for T where
-    T: CreateTerminalRequester
-        + TerminalOutputRequester
-        + WaitForTerminalExitRequester
-        + ReleaseTerminalRequester
-        + KillTerminalRequester
-        + ?Sized
-{
-}
-
-impl CreateTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
+impl TerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     fn create_terminal(
         &self,
         request: CreateTerminalRequest,
     ) -> AcpRequestFuture<'_, CreateTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
-}
 
-impl TerminalOutputRequester for agent_client_protocol::ConnectionTo<Client> {
     fn terminal_output(
         &self,
         request: TerminalOutputRequest,
     ) -> AcpRequestFuture<'_, TerminalOutputResponse> {
         Box::pin(self.send_request(request).block_task())
     }
-}
 
-impl WaitForTerminalExitRequester for agent_client_protocol::ConnectionTo<Client> {
     fn wait_for_terminal_exit(
         &self,
         request: WaitForTerminalExitRequest,
     ) -> AcpRequestFuture<'_, WaitForTerminalExitResponse> {
         Box::pin(self.send_request(request).block_task())
     }
-}
 
-impl ReleaseTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     fn release_terminal(
         &self,
         request: ReleaseTerminalRequest,
     ) -> AcpRequestFuture<'_, ReleaseTerminalResponse> {
         Box::pin(self.send_request(request).block_task())
     }
-}
 
-impl KillTerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     fn kill_terminal(
         &self,
         request: KillTerminalRequest,

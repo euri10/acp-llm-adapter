@@ -3,12 +3,10 @@ use futures_util::{
     stream::{self, BoxStream},
 };
 use reqwest::Client as HttpClient;
-use serde::Serialize;
 use sse_reqwest_client::RequestBuilderExt as _;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::config::SystemEnvironment;
 use super::stream::run_stream_attempt;
 use super::types::{ChatRequest, WireMessage, WireToolDefinition};
 use super::{DeepSeekConfig, DeepSeekError, StreamEvent};
@@ -63,9 +61,7 @@ impl DeepSeekClient {
     /// # Ok::<(), deepseek_acp_adapter::deepseek::DeepSeekError>(())
     /// ```
     pub fn from_env() -> Result<Self, DeepSeekError> {
-        Ok(Self::new(DeepSeekConfig::from_environment(
-            &SystemEnvironment,
-        )?))
+        Ok(Self::new(DeepSeekConfig::from_env()?))
     }
 
     /// Return the client configuration.
@@ -112,19 +108,6 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<BoxStream<'static, Result<StreamEvent, DeepSeekError>>, DeepSeekError>;
 }
 
-#[derive(Debug, Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<WireMessage>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<WireToolDefinition>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-}
-
 impl LlmClient for DeepSeekClient {
     fn stream_chat(
         &self,
@@ -135,18 +118,31 @@ impl LlmClient for DeepSeekClient {
             return Err(DeepSeekError::MissingApiKey);
         }
 
-        let (messages, tools, model, reasoning_effort, max_tokens) = request.into_parts();
-        let body = ChatCompletionRequest {
-            model: model.unwrap_or_else(|| self.config.model().to_string()),
-            messages: messages
-                .into_iter()
-                .map(|message| WireMessage::from(&message))
-                .collect(),
-            tools: tools.iter().map(WireToolDefinition::from).collect(),
-            stream: true,
-            reasoning_effort,
-            max_tokens,
-        };
+        let (messages, tools, model_opt, reasoning_effort, max_tokens) = request.into_parts();
+        let model = model_opt.unwrap_or_else(|| self.config.model().to_string());
+        let wire_messages: Vec<WireMessage> = messages
+            .into_iter()
+            .map(|message| WireMessage::from(&message))
+            .collect();
+        let wire_tools: Vec<WireToolDefinition> =
+            tools.iter().map(WireToolDefinition::from).collect();
+
+        // Build the body using a map so that empty/null fields are omitted
+        // (matching the previous `#[serde(skip_serializing_if = "...")]` behavior).
+        let mut fields = serde_json::Map::new();
+        fields.insert("model".to_string(), serde_json::json!(model));
+        fields.insert("messages".to_string(), serde_json::json!(wire_messages));
+        fields.insert("stream".to_string(), serde_json::json!(true));
+        if !wire_tools.is_empty() {
+            fields.insert("tools".to_string(), serde_json::json!(wire_tools));
+        }
+        if let Some(ref effort) = reasoning_effort {
+            fields.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+        }
+        if let Some(ref tokens) = max_tokens {
+            fields.insert("max_tokens".to_string(), serde_json::json!(tokens));
+        }
+        let body = serde_json::Value::Object(fields);
 
         let http = self.http.clone();
         let url = format!(
@@ -166,22 +162,23 @@ impl LlmClient for DeepSeekClient {
 
             tracing::debug!(
                 url = %url,
-                model = %body.model,
-                message_count = body.messages.len(),
-                tool_count = body.tools.len(),
-                stream = body.stream,
-                reasoning_effort = ?body.reasoning_effort,
-                max_tokens = ?body.max_tokens,
+                model = %model,
+                message_count = wire_messages.len(),
+                tool_count = wire_tools.len(),
+                stream = true,
+                reasoning_effort = ?reasoning_effort,
+                max_tokens = ?max_tokens,
                 "sending chat completion request to DeepSeek"
             );
 
-            if tracing::enabled!(tracing::Level::TRACE)
-                && let Ok(request_json) = serde_json::to_string(&body)
-            {
-                tracing::trace!(request_body = %request_json, "DeepSeek request body");
+            if tracing::enabled!(tracing::Level::TRACE) {
+                // Serialize the full body for trace-level debugging
+                if let Ok(request_json) = serde_json::to_string(&body) {
+                    tracing::trace!(request_body = %request_json, "DeepSeek request body");
+                }
             }
 
-            let _ = run_stream_attempt(event_source, &tx, &cancellation_token).await;
+            run_stream_attempt(event_source, &tx, &cancellation_token).await;
         });
 
         Ok(stream::unfold(rx, |mut rx| async move {
