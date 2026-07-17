@@ -14,6 +14,40 @@ use super::{
     ToolCallDelta, ToolDefinition,
 };
 
+/// Spawn a simple HTTP server on a random local port that returns a single
+/// JSON response to any request, then shuts down.
+async fn spawn_http_json_server(
+    status_line: String,
+    json_body: String,
+) -> Result<String, DeepSeekError> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
+    let url = format!("http://{address}");
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+
+        let response = format!(
+            "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status_line,
+            json_body.len(),
+            json_body,
+        );
+
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(())
+    });
+
+    Ok(url)
+}
+
 async fn spawn_sse_server(
     response_body: String,
     captured_request_body: Arc<Mutex<Option<String>>>,
@@ -763,5 +797,51 @@ async fn deepseek_client_reports_parse_errors_from_sse_payloads() -> Result<(), 
         .map_err(|error| DeepSeekError::InvalidResponse(error.to_string()))?;
     assert!(request_guard.as_ref().is_some());
 
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn fetch_available_models_parses_openai_model_list() -> Result<(), DeepSeekError> {
+    let json_body = serde_json::json!({
+        "object": "list",
+        "data": [
+            {"id": "deepseek-v4-pro", "object": "model", "created": 1, "owned_by": "deepseek"},
+            {"id": "glm-4.6", "object": "model", "created": 2, "owned_by": "zai"},
+            {"id": "deepseek-v4-flash", "object": "model", "created": 3, "owned_by": "deepseek"},
+            {"id": "abc-alpha", "object": "model", "created": 4, "owned_by": "org"}
+        ]
+    })
+    .to_string();
+
+    let base_url = spawn_http_json_server("HTTP/1.1 200 OK".to_string(), json_body).await?;
+    let client = DeepSeekClient::new(DeepSeekConfig::new("test-key", base_url, "glm-4.6"));
+
+    let models = client.fetch_available_models("glm-4.6").await;
+
+    assert_eq!(
+        models,
+        vec![
+            "glm-4.6",
+            "abc-alpha",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+        ]
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn fetch_available_models_falls_back_on_http_error() -> Result<(), DeepSeekError> {
+    let json_body = r#"{"error": "internal server error"}"#;
+    let base_url = spawn_http_json_server(
+        "HTTP/1.1 500 Internal Server Error".to_string(),
+        json_body.to_string(),
+    )
+    .await?;
+    let client = DeepSeekClient::new(DeepSeekConfig::new("test-key", base_url, "my-model"));
+
+    let models = client.fetch_available_models("my-model").await;
+
+    assert_eq!(models, vec!["my-model"]);
     Ok(())
 }

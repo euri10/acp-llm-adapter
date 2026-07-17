@@ -100,7 +100,9 @@ impl DeepSeekConfig {
         })
     }
 
-    pub(crate) fn api_key(&self) -> &str {
+    /// Return the configured API key.
+    #[must_use]
+    pub fn api_key(&self) -> &str {
         &self.api_key
     }
 

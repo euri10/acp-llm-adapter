@@ -44,8 +44,6 @@ pub(crate) const SESSION_CONFIG_MODE_ID: &str = "mode";
 pub(crate) const SESSION_CONFIG_MODEL_ID: &str = "model";
 pub(crate) const SESSION_CONFIG_REASONING_EFFORT_ID: &str = "reasoning_effort";
 pub(crate) const SESSION_CONFIG_MAX_TOKENS_ID: &str = "max_tokens";
-pub(crate) const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
-pub(crate) const DEEPSEEK_V4_PRO_MODEL_ID: &str = "deepseek-v4-pro";
 pub(crate) const REASONING_EFFORT_HIGH_ID: &str = "high";
 pub(crate) const REASONING_EFFORT_MAX_ID: &str = "max";
 pub(crate) const MAX_TOKENS_DEFAULT_ID: &str = "default";
@@ -344,7 +342,10 @@ pub(crate) fn default_session_modes() -> SessionModeState {
     session_modes(SessionBehavior::Ask)
 }
 
-pub(crate) fn session_config_options(session: &SessionRecord) -> Vec<SessionConfigOption> {
+pub(crate) fn session_config_options(
+    session: &SessionRecord,
+    available_models: &[String],
+) -> Vec<SessionConfigOption> {
     vec![
         SessionConfigOption::select(
             SESSION_CONFIG_MODE_ID,
@@ -358,10 +359,10 @@ pub(crate) fn session_config_options(session: &SessionRecord) -> Vec<SessionConf
             SESSION_CONFIG_MODEL_ID,
             "Model",
             session.model.clone(),
-            model_select_options(session.model.as_str()),
+            model_select_options(session.model.as_str(), available_models),
         )
         .category(SessionConfigOptionCategory::Model)
-        .description("Choose which DeepSeek model the adapter should use."),
+        .description("Choose which model the adapter should use."),
         SessionConfigOption::select(
             SESSION_CONFIG_REASONING_EFFORT_ID,
             "Reasoning Effort",
@@ -369,14 +370,14 @@ pub(crate) fn session_config_options(session: &SessionRecord) -> Vec<SessionConf
             reasoning_effort_select_options(),
         )
         .category(SessionConfigOptionCategory::ThoughtLevel)
-        .description("Choose how much DeepSeek thinking effort to request."),
+        .description("Choose how much thinking effort to request."),
         SessionConfigOption::select(
             SESSION_CONFIG_MAX_TOKENS_ID,
             "Max Output Tokens",
             max_tokens_value_id(session.max_tokens),
             max_tokens_select_options(),
         )
-        .description("Cap the number of tokens DeepSeek may generate in a response."),
+        .description("Cap the number of tokens the model may generate in a response."),
     ]
 }
 
@@ -388,21 +389,33 @@ fn session_mode_select_options() -> Vec<SessionConfigSelectOption> {
         .collect()
 }
 
-pub(crate) fn model_select_options(current_model: &str) -> Vec<SessionConfigSelectOption> {
-    let mut options = Vec::new();
-    if !is_known_model(current_model) {
+/// Build the selectable model list from the dynamically-discovered model IDs.
+///
+/// If `current_model` is not already in the known list, it is prepended so the
+/// current selection is always displayed.
+pub(crate) fn model_select_options(
+    current_model: &str,
+    available_models: &[String],
+) -> Vec<SessionConfigSelectOption> {
+    let mut options: Vec<SessionConfigSelectOption> = Vec::new();
+
+    if !is_known_model(current_model, available_models) {
         options.push(
             SessionConfigSelectOption::new(current_model.to_string(), current_model.to_string())
                 .description("Current model from DEEPSEEK_MODEL."),
         );
     }
 
-    options.extend([
-        SessionConfigSelectOption::new(DEEPSEEK_V4_PRO_MODEL_ID, "DeepSeek V4 Pro")
-            .description("DeepSeek V4 Pro thinking model."),
-        SessionConfigSelectOption::new(DEEPSEEK_V4_FLASH_MODEL_ID, "DeepSeek V4 Flash")
-            .description("DeepSeek V4 Flash model."),
-    ]);
+    for model_id in available_models {
+        // Avoid duplicating the custom entry we may have prepended.
+        if model_id == current_model && options.iter().any(|o| o.value.0.as_ref() == model_id) {
+            continue;
+        }
+        options.push(
+            SessionConfigSelectOption::new(model_id.clone(), model_id.clone())
+                .description("Available model."),
+        );
+    }
 
     options
 }
@@ -463,42 +476,67 @@ pub(crate) fn max_tokens_from_value_id(
 pub(crate) fn validate_session_model(
     session: &SessionRecord,
     model: &str,
+    available_models: &[String],
 ) -> Result<(), AdapterError> {
-    if is_known_model(model) || model == session.model {
+    if is_known_model(model, available_models) || model == session.model {
         return Ok(());
     }
 
     Err(AdapterError::InvalidParams(format!(
-        "unsupported DeepSeek model: {model}"
+        "unsupported model: {model}"
     )))
 }
 
-fn is_known_model(model: &str) -> bool {
-    matches!(model, DEEPSEEK_V4_PRO_MODEL_ID | DEEPSEEK_V4_FLASH_MODEL_ID)
+fn is_known_model(model: &str, available_models: &[String]) -> bool {
+    available_models.iter().any(|m| m == model)
 }
 
-pub(crate) fn initial_model_from_env() -> String {
-    std::env::var("DEEPSEEK_MODEL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DeepSeekConfig::DEFAULT_MODEL.to_string())
+/// Return the model the adapter should default to at startup.
+///
+/// Checks `DEEPSEEK_MODEL` first, then `GLM_MODEL`, then falls back to
+/// `fallback_model`.
+pub(crate) fn initial_model(fallback_model: impl Into<String>) -> String {
+    for var in &["DEEPSEEK_MODEL", "GLM_MODEL"] {
+        if let Ok(value) = std::env::var(var) {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    fallback_model.into()
 }
 
 #[derive(Debug)]
 pub(crate) struct AdapterState {
     pub(crate) default_model: String,
+    /// Model IDs available for selection. Set at startup via
+    /// `DeepSeekClient::fetch_available_models` or initialised to
+    /// `[default_model]` as a fallback.
+    pub(crate) available_models: Vec<String>,
     pub(crate) client_capabilities: Option<ClientCapabilities>,
     pub(crate) sessions: HashMap<SessionId, SessionRecord>,
 }
 
 impl AdapterState {
     pub(crate) fn new(default_model: impl Into<String>) -> Self {
+        let model = default_model.into();
+        let available_models = vec![model.clone()];
         Self {
-            default_model: default_model.into(),
+            default_model: model,
+            available_models,
             client_capabilities: None,
             sessions: HashMap::new(),
         }
+    }
+
+    /// Replace the known model list with the result of dynamic discovery.
+    ///
+    /// The first element must be the current `default_model` so the UI
+    /// selector defaults correctly.
+    #[allow(dead_code)] // wired in Phase 5 (model fetch at startup)
+    pub(crate) fn set_available_models(&mut self, models: Vec<String>) {
+        self.available_models = models;
     }
 }
 
@@ -836,6 +874,29 @@ impl SessionStore {
         Ok(guard.default_model.clone())
     }
 
+    /// Return the list of model IDs available for selection.
+    ///
+    /// The list is populated at startup by dynamic model discovery or falls
+    /// back to `[default_model]` when discovery is unavailable.
+    pub(crate) fn available_models(&self) -> Result<Vec<String>, AdapterError> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
+        Ok(guard.available_models.clone())
+    }
+
+    /// Replace the known model list (called once at startup).
+    #[allow(dead_code)] // wired in Phase 5 (model fetch at startup)
+    pub(crate) fn set_available_models(&self, models: Vec<String>) -> Result<(), AdapterError> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
+        guard.set_available_models(models);
+        Ok(())
+    }
+
     /// Look up a session and return a read-only reference via a callback.
     ///
     /// The lock is held only for the duration of the callback.
@@ -1123,7 +1184,10 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<SessionConfigOption>, AdapterError> {
-        self.with_session(session_id, |session| Ok(session_config_options(session)))
+        let available_models = self.available_models()?;
+        self.with_session(session_id, |session| {
+            Ok(session_config_options(session, &available_models))
+        })
     }
 
     /// Look up a session record for a new-session response.

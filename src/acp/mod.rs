@@ -669,8 +669,11 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
         }
         SESSION_CONFIG_MODEL_ID => {
             let model = value.0.as_ref();
+            let available_models = store
+                .available_models()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
             store.with_session(&request.session_id, |session| {
-                validate_session_model(session, model)?;
+                validate_session_model(session, model, &available_models)?;
                 Ok(())
             })?;
             store.set_model(&request.session_id, model.to_string())?;

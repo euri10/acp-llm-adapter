@@ -18,7 +18,7 @@ use crate::session::{
     PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision,
     ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
     SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, SessionStore,
-    initial_model_from_env, model_select_options, request_tool_permission, validate_session_model,
+    initial_model, model_select_options, request_tool_permission, validate_session_model,
 };
 use crate::session_store::{FilesystemSessionStore, PersistedSessionMeta};
 use crate::test_utils::*;
@@ -43,7 +43,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 fn test_store() -> SessionStore {
-    SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+    let mut state = AdapterState::default();
+    // Seed the known model list so tests that exercise model switching work.
+    state.set_available_models(vec![
+        "deepseek-v4-pro".to_string(),
+        "deepseek-v4-flash".to_string(),
+    ]);
+    SessionStore::new(Arc::new(Mutex::new(state)))
 }
 
 fn select_current_value(
@@ -963,7 +969,11 @@ async fn request_permission_rejects_unknown_option() -> Result<(), agent_client_
 
 #[test]
 fn model_select_options_includes_custom_model_when_unknown() {
-    let options = model_select_options("my-custom-model");
+    let available = &[
+        "deepseek-v4-pro".to_string(),
+        "deepseek-v4-flash".to_string(),
+    ];
+    let options = model_select_options("my-custom-model", available);
     let custom = options
         .iter()
         .find(|opt| opt.value.0.as_ref() == "my-custom-model");
@@ -973,7 +983,11 @@ fn model_select_options_includes_custom_model_when_unknown() {
 
 #[test]
 fn model_select_options_omits_custom_model_when_known() {
-    let options = model_select_options("deepseek-v4-pro");
+    let available = &[
+        "deepseek-v4-pro".to_string(),
+        "deepseek-v4-flash".to_string(),
+    ];
+    let options = model_select_options("deepseek-v4-pro", available);
     let custom = options
         .iter()
         .find(|opt| opt.value.0.as_ref() == "deepseek-v4-pro");
@@ -997,9 +1011,13 @@ fn validate_session_model_accepts_known_models() -> Result<(), agent_client_prot
         .sessions
         .get(&session.session_id)
         .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing session"))?;
-    assert!(validate_session_model(record, "deepseek-v4-pro").is_ok());
-    assert!(validate_session_model(record, "deepseek-v4-flash").is_ok());
-    assert!(validate_session_model(record, "deepseek-v4-pro").is_ok());
+    let available = &[
+        "deepseek-v4-pro".to_string(),
+        "deepseek-v4-flash".to_string(),
+    ];
+    assert!(validate_session_model(record, "deepseek-v4-pro", available).is_ok());
+    assert!(validate_session_model(record, "deepseek-v4-flash", available).is_ok());
+    assert!(validate_session_model(record, "deepseek-v4-pro", available).is_ok());
     Ok(())
 }
 
@@ -1015,13 +1033,14 @@ fn validate_session_model_rejects_unknown_models() -> Result<(), agent_client_pr
         .sessions
         .get(&session.session_id)
         .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing session"))?;
-    assert!(validate_session_model(record, "bogus-model").is_err());
+    let available = &["deepseek-v4-pro".to_string()];
+    assert!(validate_session_model(record, "bogus-model", available).is_err());
     Ok(())
 }
 
 #[test]
-fn initial_model_from_env_uses_default_when_not_set() {
-    let model = initial_model_from_env();
+fn initial_model_uses_fallback_when_not_set() {
+    let model = initial_model("deepseek-v4-pro");
     assert_eq!(model, "deepseek-v4-pro");
 }
 

@@ -22,7 +22,8 @@ use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{AcpAgent, Client, ConnectTo, SessionMessage};
 use clap::ValueEnum;
 use deepseek_acp_adapter::deepseek::{
-    ChatRequest, DeepSeekClient, DeepSeekError, FinishReason, LlmClient, StreamEvent,
+    ChatRequest, DeepSeekClient, DeepSeekConfig, DeepSeekError, FinishReason, LlmClient,
+    StreamEvent,
 };
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
@@ -32,20 +33,48 @@ use crate::acp::{PermissionRequester, handle_new_session_request};
 use crate::session::{AdapterState, PermissionDecision, SessionStore, request_tool_permission};
 use crate::tools::ToolContext;
 
-/// Mock or real backend selection.
+/// Provider backend selection.
+///
+/// Each variant carries default connection and model settings so the adapter
+/// can target different OpenAI-compatible APIs without env-var gymnastics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum Backend {
-    /// Connect to the real `DeepSeek` API.
-    Real,
+    /// Connect to the `DeepSeek` API (`api.deepseek.com`).
+    #[value(name = "deepseek")]
+    DeepSeek,
+    /// Connect to the `Z.ai` GLM API (`api.z.ai`).
+    #[value(name = "glm")]
+    Glm,
     /// Use a mock LLM client that returns canned responses.
+    #[value(name = "mock")]
     Mock,
 }
 
 impl Backend {
+    /// CLI flag value used in `--backend <VALUE>`.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Real => "real",
+            Self::DeepSeek => "deepseek",
+            Self::Glm => "glm",
             Self::Mock => "mock",
+        }
+    }
+
+    /// Default base URL for the provider's chat-completions endpoint.
+    pub(crate) const fn default_base_url(self) -> &'static str {
+        match self {
+            Self::DeepSeek => DeepSeekConfig::DEFAULT_BASE_URL,
+            Self::Glm => "https://api.z.ai/api/paas/v4",
+            Self::Mock => "http://localhost:0",
+        }
+    }
+
+    /// Default model name for the provider.
+    pub(crate) const fn default_model(self) -> &'static str {
+        match self {
+            Self::DeepSeek => DeepSeekConfig::DEFAULT_MODEL,
+            Self::Glm => "glm-4.6",
+            Self::Mock => "mock-model",
         }
     }
 }
@@ -54,16 +83,26 @@ impl Backend {
 ///
 /// # Errors
 ///
-/// Returns an ACP internal error if the `DeepSeek` environment variables are
-/// missing in real mode.
+/// Returns an ACP internal error if the required API key environment variable
+/// is missing or empty.
 pub(crate) fn llm_client_for_backend(
     backend: Backend,
 ) -> Result<Arc<dyn LlmClient>, agent_client_protocol::Error> {
     match backend {
-        Backend::Real => Ok(Arc::new(
+        Backend::DeepSeek => Ok(Arc::new(
             DeepSeekClient::from_env()
                 .map_err(agent_client_protocol::Error::into_internal_error)?,
         )),
+        Backend::Glm => {
+            let config = DeepSeekConfig::from_env()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let config = DeepSeekConfig::new(
+                config.api_key().to_string(),
+                backend.default_base_url(),
+                backend.default_model(),
+            );
+            Ok(Arc::new(DeepSeekClient::new(config)))
+        }
         Backend::Mock => Ok(Arc::new(MockLlmClient)),
     }
 }
@@ -410,8 +449,9 @@ mod tests {
     }
 
     #[test_log::test]
-    fn backend_as_str_covers_real_and_mock() {
-        assert_eq!(Backend::Real.as_str(), "real");
+    fn backend_as_str_covers_all_variants() {
+        assert_eq!(Backend::DeepSeek.as_str(), "deepseek");
+        assert_eq!(Backend::Glm.as_str(), "glm");
         assert_eq!(Backend::Mock.as_str(), "mock");
     }
 
@@ -464,7 +504,7 @@ mod tests {
     }
 
     #[test_log::test]
-    fn llm_client_for_backend_real_uses_process_environment()
+    fn llm_client_for_backend_deepseek_uses_process_environment()
     -> Result<(), agent_client_protocol::Error> {
         assert!(crate::init_tracing().is_err());
         assert!(std::env::var("DEEPSEEK_API_KEY").is_ok());
@@ -475,7 +515,7 @@ mod tests {
         assert!(!config.base_url().is_empty());
         assert!(!config.model().is_empty());
 
-        let client = llm_client_for_backend(Backend::Real)?;
+        let client = llm_client_for_backend(Backend::DeepSeek)?;
         drop(client);
 
         Ok(())
@@ -501,10 +541,10 @@ mod tests {
     }
 
     #[test_log::test]
-    fn build_dev_agent_uses_real_backend_args() -> Result<(), agent_client_protocol::Error> {
+    fn build_dev_agent_uses_deepseek_backend_args() -> Result<(), agent_client_protocol::Error> {
         let agent = build_dev_agent(
             std::path::Path::new("/tmp/deepseek-acp-adapter"),
-            Backend::Real,
+            Backend::DeepSeek,
         )?;
 
         let McpServer::Stdio(stdio) = agent.server() else {
@@ -516,7 +556,7 @@ mod tests {
             stdio.command,
             std::path::PathBuf::from("/tmp/deepseek-acp-adapter")
         );
-        assert_eq!(stdio.args, vec!["serve", "--backend", "real"]);
+        assert_eq!(stdio.args, vec!["serve", "--backend", "deepseek"]);
         Ok(())
     }
 

@@ -61,7 +61,7 @@ pub(crate) use session::{
     AdapterState, DEFAULT_MAX_TURN_REQUESTS, PendingToolCalls, PermissionDecision, ReasoningEffort,
     SESSION_CONFIG_MAX_TOKENS_ID, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
     SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, SessionStore,
-    default_session_modes, derive_session_title, initial_model_from_env, iso_timestamp_now,
+    default_session_modes, derive_session_title, initial_model, iso_timestamp_now,
     max_tokens_from_value_id, request_tool_permission, session_modes, validate_session_model,
 };
 
@@ -116,7 +116,7 @@ struct Cli {
 enum Command {
     /// Run the ACP server over standard input and output.
     Serve {
-        #[arg(long, value_enum, default_value_t = Backend::Real)]
+        #[arg(long, value_enum, default_value_t = Backend::DeepSeek)]
         backend: Backend,
         /// Maximum tool-call/response cycles per prompt turn (must be ≥ 1).
         #[arg(long, default_value_t = DEFAULT_MAX_TURN_REQUESTS)]
@@ -278,7 +278,30 @@ async fn serve(
 ) -> Result<(), agent_client_protocol::Error> {
     let llm_client = llm_client_for_backend(backend)?;
     let tool_registry = Arc::new(AdapterToolRegistry);
-    let state = Arc::new(Mutex::new(AdapterState::new(initial_model_from_env())));
+
+    let default_model = initial_model(backend.default_model());
+    let state = Arc::new(Mutex::new(AdapterState::new(default_model.clone())));
+
+    // Fetch the live model list from the provider. Uses the backend's known
+    // base URL and the API key from the process environment so the endpoint
+    // always matches the provider (DeepSeek → api.deepseek.com, GLM → api.z.ai).
+    if backend != Backend::Mock {
+        let api_key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+
+        if let Some(ref key) = api_key {
+            let models = deepseek_acp_adapter::deepseek::fetch_available_models(
+                backend.default_base_url(),
+                key,
+                &default_model,
+            )
+            .await;
+            if let Err(e) = state.lock().map(|mut g| g.set_available_models(models)) {
+                tracing::warn!(%e, "failed to store fetched model list");
+            }
+        }
+    }
 
     let shutdown = CancellationToken::new();
     let transport = stdio_transport_with_eof(shutdown.clone());
@@ -410,7 +433,13 @@ fn stop_reason_from_finish(reason: &FinishReason) -> StopReason {
 /// `Arc<Mutex<AdapterState>>` directly.
 #[cfg(test)]
 pub(crate) fn test_store() -> SessionStore {
-    SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+    let mut state = AdapterState::default();
+    // Seed the known model list so tests that exercise model switching work.
+    state.set_available_models(vec![
+        "deepseek-v4-pro".to_string(),
+        "deepseek-v4-flash".to_string(),
+    ]);
+    SessionStore::new(Arc::new(Mutex::new(state)))
 }
 
 #[cfg(test)]
@@ -439,7 +468,7 @@ mod tests {
                 parsed,
                 Ok(Cli {
                     command: Command::Serve {
-                        backend: Backend::Real,
+                        backend: Backend::DeepSeek,
                         ..
                     }
                 })
@@ -694,7 +723,7 @@ mod tests {
             parsed,
             Ok(Cli {
                 command: Command::Serve {
-                    backend: Backend::Real,
+                    backend: Backend::DeepSeek,
                     ..
                 }
             })
@@ -725,13 +754,14 @@ mod tests {
     }
 
     #[test_log::test]
-    fn parses_serve_with_real_backend_explicitly() {
-        let parsed = Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--backend", "real"]);
+    fn parses_serve_with_deepseek_backend_explicitly() {
+        let parsed =
+            Cli::try_parse_from(["deepseek-acp-adapter", "serve", "--backend", "deepseek"]);
         assert!(matches!(
             parsed,
             Ok(Cli {
                 command: Command::Serve {
-                    backend: Backend::Real,
+                    backend: Backend::DeepSeek,
                     ..
                 }
             })
@@ -739,12 +769,12 @@ mod tests {
     }
 
     #[test_log::test]
-    fn parses_dev_with_real_backend_and_custom_prompt() {
+    fn parses_dev_with_deepseek_backend_and_custom_prompt() {
         let parsed = Cli::try_parse_from([
             "deepseek-acp-adapter",
             "dev",
             "--backend",
-            "real",
+            "deepseek",
             "--prompt",
             "custom prompt",
         ]);
@@ -753,7 +783,7 @@ mod tests {
             parsed,
             Ok(Cli {
                 command: Command::Dev {
-                    backend: Backend::Real,
+                    backend: Backend::DeepSeek,
                     prompt,
                 }
             }) if prompt == "custom prompt"

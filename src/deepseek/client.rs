@@ -69,6 +69,71 @@ impl DeepSeekClient {
     pub fn config(&self) -> &DeepSeekConfig {
         &self.config
     }
+
+    /// Fetch the list of available model IDs from the provider's `/models` endpoint.
+    ///
+    /// Delegates to the free function [`fetch_available_models`].
+    pub async fn fetch_available_models(&self, preferred_default: &str) -> Vec<String> {
+        fetch_available_models(
+            self.config.base_url(),
+            self.config.api_key(),
+            preferred_default,
+        )
+        .await
+    }
+}
+
+/// Fetch model IDs from an OpenAI-compatible `GET /models` endpoint.
+///
+/// `preferred_default` is placed first in the returned list. On any failure
+/// (transport, auth, parse) the function logs a warning and returns
+/// `vec![preferred_default.to_string()]` so callers can always proceed.
+pub async fn fetch_available_models(
+    base_url: &str,
+    api_key: &str,
+    preferred_default: &str,
+) -> Vec<String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let http = HttpClient::new();
+
+    let response = match http.get(&url).bearer_auth(api_key).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                %url,
+                "failed to fetch /models; falling back to default model list"
+            );
+            return vec![preferred_default.to_string()];
+        }
+    };
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                %url,
+                "failed to parse /models response; falling back to default model list"
+            );
+            return vec![preferred_default.to_string()];
+        }
+    };
+
+    let mut models: Vec<String> = body
+        .get("data")
+        .and_then(|data| data.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("id")?.as_str().map(String::from))
+        .collect();
+
+    // Ensure the preferred default is present and first.
+    models.retain(|id| id != preferred_default);
+    models.sort();
+    let mut result = vec![preferred_default.to_string()];
+    result.append(&mut models);
+    result
 }
 
 /// A client abstraction for streaming chat-completions turns.
