@@ -27,7 +27,7 @@ futures-util = { version = "^0.3.32", features = ["io", "sink"] }
 globset = "^0.4.19"
 grep = "^0.4.1"
 http = "^1.4.2"
-ignore = "^0.4.29"
+ignore = "^0.4.31"
 reqwest = { version = "0.13.4", default-features = false, features = [
   "json",
   "rustls",
