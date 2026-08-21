@@ -17,7 +17,7 @@ use crate::tools::{
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{
     ChatError, ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
-    ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition,
+    ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition, UsageData,
 };
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, DeleteSessionRequest, PromptRequest,
@@ -1412,6 +1412,119 @@ async fn stream_model_turn_respects_cancellation_token() -> Result<(), agent_cli
     assert_eq!(turn.stop_reason, StopReason::Cancelled);
     assert_eq!(turn.assistant_text, "");
     assert!(turn.tool_calls.is_empty());
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn stream_model_turn_fills_missing_context_window_from_model_table()
+-> Result<(), agent_client_protocol::Error> {
+    let client = FakeLlmClient::new(vec![
+        Ok(StreamEvent::Usage(UsageData {
+            input_tokens: 3,
+            output_tokens: 4,
+            context_length: 0,
+        })),
+        Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+    ]);
+    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-usage-known");
+    let messages: Vec<ChatMessage> = Vec::new();
+    let tool_definitions: Vec<ToolDefinition> = Vec::new();
+    let mut notifications = Vec::new();
+
+    let turn = stream_model_turn(
+        &client,
+        &messages,
+        &tool_definitions,
+        ModelRequestSettings {
+            model: "deepseek-v4-pro",
+            reasoning_effort: None,
+            max_tokens: None,
+        },
+        CancellationToken::new(),
+        &session_id,
+        &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        turn.usage,
+        Some(UsageData {
+            input_tokens: 3,
+            output_tokens: 4,
+            context_length: 0,
+        })
+    );
+
+    let usage_updates: Vec<&SessionUpdate> = notifications
+        .iter()
+        .filter_map(|notification| match &notification.update {
+            SessionUpdate::UsageUpdate(_) => Some(&notification.update),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage_updates.len(), 1);
+    let SessionUpdate::UsageUpdate(update) = usage_updates[0] else {
+        return Err(agent_client_protocol::Error::internal_error()
+            .data("expected usage_update notification"));
+    };
+    assert_eq!(update.used, 7);
+    assert_eq!(update.size, 1_000_000);
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn stream_model_turn_skips_usage_update_for_unknown_model()
+-> Result<(), agent_client_protocol::Error> {
+    let client = FakeLlmClient::new(vec![
+        Ok(StreamEvent::Usage(UsageData {
+            input_tokens: 3,
+            output_tokens: 4,
+            context_length: 0,
+        })),
+        Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+    ]);
+    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-usage-unknown");
+    let messages: Vec<ChatMessage> = Vec::new();
+    let tool_definitions: Vec<ToolDefinition> = Vec::new();
+    let mut notifications = Vec::new();
+
+    let turn = stream_model_turn(
+        &client,
+        &messages,
+        &tool_definitions,
+        ModelRequestSettings {
+            model: "mock-model",
+            reasoning_effort: None,
+            max_tokens: None,
+        },
+        CancellationToken::new(),
+        &session_id,
+        &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        turn.usage,
+        Some(UsageData {
+            input_tokens: 3,
+            output_tokens: 4,
+            context_length: 0,
+        })
+    );
+    assert!(
+        notifications
+            .iter()
+            .all(|notification| !matches!(notification.update, SessionUpdate::UsageUpdate(_))),
+        "usage_update must not be emitted for a model with an unknown context window"
+    );
 
     Ok(())
 }

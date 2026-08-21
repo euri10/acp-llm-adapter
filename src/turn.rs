@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 
 use acp_llm_adapter::llm::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
-    ToolCall as ChatToolCall, ToolDefinition, UsageData,
+    ToolCall as ChatToolCall, ToolDefinition, UsageData, context_window_for_model,
 };
 use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentChunk, Diff, MessageId, Plan, PromptRequest, PromptResponse,
@@ -643,9 +643,22 @@ pub(crate) async fn stream_model_turn(
 
     // Send usage update if available
     if let Some(mut usage_data) = usage {
-        // Fill in context_length from model if not provided by API
+        // Fill in context_length from the model table when the API omits it.
         if usage_data.context_length == 0 {
-            usage_data.context_length = get_context_length_for_model(model_settings.model);
+            let Some(window) = context_window_for_model(model_settings.model) else {
+                tracing::warn!(
+                    model = model_settings.model,
+                    "skipping usage_update: API reported no context_length and model has no known context window"
+                );
+                return Ok(ModelTurn {
+                    assistant_text,
+                    tool_calls,
+                    finish_reason,
+                    stop_reason,
+                    usage,
+                });
+            };
+            usage_data.context_length = window;
         }
         let used_tokens = usage_data.input_tokens + usage_data.output_tokens;
         tracing::debug!(
@@ -804,19 +817,6 @@ pub(crate) fn tool_call_title(call: &ChatToolCall) -> String {
 pub(crate) fn tool_raw_input(call: &ChatToolCall) -> serde_json::Value {
     serde_json::from_str(call.arguments())
         .unwrap_or_else(|_| serde_json::Value::String(call.arguments().to_string()))
-}
-
-/// Get the context window size for a model.
-///
-/// Returns the context window size in tokens. Falls back to `1_000_000` for unknown models.
-/// Only `deepseek-chat` has an explicit override; GLM models fall through to the default.
-/// See: <https://api-docs.deepseek.com/quick_start/pricing>
-#[must_use]
-fn get_context_length_for_model(model: &str) -> u64 {
-    match model {
-        "deepseek-chat" => 4_096,
-        _ => 1_000_000,
-    }
 }
 
 #[cfg(test)]

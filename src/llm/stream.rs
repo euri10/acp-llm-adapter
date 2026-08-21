@@ -171,8 +171,8 @@ pub(crate) fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEve
         );
         if usage.context_length == 0 {
             tracing::debug!(
-                payload = %payload,
-                "API chunk did not include context_length/context_window in usage"
+                "API chunk did not include context_length/context_window in usage; \
+                 falling back to the model context-window table"
             );
         }
         updates.push(StreamEvent::Usage(UsageData {
