@@ -237,9 +237,13 @@ impl LlmClient for ChatClient {
             );
 
             if tracing::enabled!(tracing::Level::TRACE) {
-                // Serialize the full body for trace-level debugging
+                // Never emit the full request body at TRACE: it contains user
+                // prompts, injected skills/context, and tool results, which
+                // would be written unredacted to the debug log. Log only the
+                // serialized size so trace diagnostics can still spot payload
+                // shape regressions without leaking content.
                 if let Ok(request_json) = serde_json::to_string(&body) {
-                    tracing::trace!(request_body = %request_json, "LLM request body");
+                    tracing::trace!(body_bytes = request_json.len(), "LLM request body size");
                 }
             }
 

@@ -95,7 +95,7 @@ require("codecompanion").setup({
           },
           env = {
             LLM_API_KEY = os.getenv "DEEPSEEK_API_KEY",
-            RUST_LOG = "acp_llm_adapter::llm=trace,debug",
+            RUST_LOG = "acp_llm_adapter::llm=debug",
           },
           defaults = {
             mcpServers = {},
@@ -159,6 +159,8 @@ If Zed is launched from a GUI app launcher, it may not inherit your shell enviro
 ## Debugging
 
 For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending streams to `.local/state/acp-llm-adapter` using filenames like `20260610-080836-32451-acp-llm-adapter-deepseek-stderr.log` and `20260610-080836-32451-codex-acp-stdout-jsonrpc.log` (`<timestamp>-<pid>-<binary>[-<label>]...`). The label is `ACP_DEBUG_LABEL` when set; otherwise it is auto-derived from `--backend` (supports both `--backend value` and `--backend=value`).
+
+The wrapper defaults `RUST_LOG` to `acp_llm_adapter::llm=debug`; set `RUST_LOG` explicitly (for example `acp_llm_adapter::llm=trace`) to opt into trace-level diagnostics. Request bodies are never written to the log at trace — only their serialized byte size is recorded, since the body contains prompts, injected skills/context, and tool results.
 
 ## Architecture
 

@@ -40,8 +40,11 @@ echo "argv: $*" >> "$STDERR_LOG"
 echo "label: ${SANITIZED_LABEL:-<none>}" >> "$STDERR_LOG"
 echo "env PATH: $PATH" >> "$STDERR_LOG"
 
-# Enable TRACE logging for the llm module if not already set
-export RUST_LOG="${RUST_LOG:-acp_llm_adapter::llm=trace}"
+# Enable DEBUG logging for the llm module if not already set. TRACE-level
+# request-body logging is deliberately not the default: request bodies contain
+# prompts, injected skills/context, and tool results, which would be written
+# unredacted to the stderr log. Set RUST_LOG explicitly to opt into TRACE.
+export RUST_LOG="${RUST_LOG:-acp_llm_adapter::llm=debug}"
 echo "RUST_LOG: $RUST_LOG" >> "$STDERR_LOG"
 
 # stdout is ACP JSON-RPC, so tee it without adding anything.
