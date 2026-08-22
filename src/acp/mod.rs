@@ -295,6 +295,9 @@ async fn serve_with_transport_impl(
         .await
 }
 
+/// The initialize handshake has no session yet, so it is deliberately traced
+/// with `session_id = "none"`.
+#[tracing::instrument(name = "acp_initialize", skip_all, fields(session_id = "none"))]
 pub(crate) fn handle_initialize_request(
     store: &SessionStore,
     request: InitializeRequest,
@@ -327,6 +330,7 @@ pub(crate) fn handle_list_sessions_request(
     Ok(ListSessionsResponse::new(sessions))
 }
 
+#[tracing::instrument(skip(store, request), fields(session_id = %request.session_id))]
 pub(crate) fn handle_close_session_request(
     store: &SessionStore,
     request: &CloseSessionRequest,
@@ -340,6 +344,7 @@ pub(crate) fn handle_close_session_request(
     Ok(CloseSessionResponse::new())
 }
 
+#[tracing::instrument(skip(store, request), fields(session_id = %request.session_id))]
 pub(crate) fn handle_delete_session_request(
     store: &SessionStore,
     request: &DeleteSessionRequest,
@@ -360,6 +365,7 @@ pub(crate) fn handle_logout_request() -> LogoutResponse {
     LogoutResponse::new()
 }
 
+#[tracing::instrument(name = "acp_new_session", skip_all, fields(session_id = "none"))]
 pub(crate) fn handle_new_session_request(
     store: &SessionStore,
     request: &NewSessionRequest,
@@ -371,6 +377,7 @@ pub(crate) fn handle_new_session_request(
     insert_session_record(store, request, Vec::new())
 }
 
+#[tracing::instrument(skip(store, request), fields(session_id = tracing::field::Empty))]
 pub(crate) async fn handle_new_session_request_connected(
     store: &SessionStore,
     request: &NewSessionRequest,
@@ -380,6 +387,7 @@ pub(crate) async fn handle_new_session_request_connected(
     insert_session_record(store, request, mcp_sessions)
 }
 
+#[tracing::instrument(skip(store, request, notify), fields(session_id = %request.session_id))]
 pub(crate) async fn handle_load_session_request(
     store: &SessionStore,
     request: &LoadSessionRequest,
@@ -399,6 +407,7 @@ pub(crate) async fn handle_load_session_request(
     Ok(response)
 }
 
+#[tracing::instrument(skip(store, request), fields(session_id = %request.session_id))]
 pub(crate) async fn handle_resume_session_request(
     store: &SessionStore,
     request: &ResumeSessionRequest,
@@ -625,6 +634,7 @@ pub(crate) fn handle_set_session_mode_request(
     handle_set_session_mode_request_notifying(store, request, |_| Ok(()))
 }
 
+#[tracing::instrument(skip(store, request, notify), fields(session_id = %request.session_id))]
 pub(crate) fn handle_set_session_mode_request_notifying(
     store: &SessionStore,
     request: &SetSessionModeRequest,
@@ -651,6 +661,7 @@ pub(crate) fn handle_set_session_config_option_request(
     handle_set_session_config_option_request_notifying(store, request, |_| Ok(()))
 }
 
+#[tracing::instrument(skip(store, request, notify), fields(session_id = %request.session_id))]
 pub(crate) fn handle_set_session_config_option_request_notifying(
     store: &SessionStore,
     request: &SetSessionConfigOptionRequest,

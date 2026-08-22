@@ -166,6 +166,8 @@ The adapter's structured wire log is enabled with `ACP_LOG=1` (the proxy writes 
 
 DeepSeek `usage_update` notifications include cumulative session cost for `deepseek-v4-flash` and `deepseek-v4-pro`, calculated from cache-hit, cache-miss, and output tokens. The default prices follow [DeepSeek's pricing table](https://api-docs.deepseek.com/quick_start/pricing/). For local testing or a provider price change, `DEEPSEEK_PRICING` accepts JSON such as `{"deepseek-v4-pro":{"cache_hit":0.003625,"cache_miss":0.435,"output":0.87}}`, with values in USD per million tokens.
 
+Tracing spans for prompt turns, tool dispatch, LLM requests, and session lifecycle handlers carry `session_id`. Startup, model-list discovery, `initialize`, and new-session setup intentionally use `session_id="none"` because no ACP session exists at those entry points; child prompt spans replace that value once a session is established.
+
 ## Architecture
 
 The adapter bridges two independent channels:

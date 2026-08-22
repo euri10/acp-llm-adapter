@@ -292,6 +292,7 @@ fn estimate_message_size(msg: &ChatMessage) -> usize {
 /// Returns an ACP protocol error when the prompt is invalid, session setup
 /// fails, a streamed model event fails, a tool notification fails, or the
 /// session store cannot be updated.
+#[tracing::instrument(skip_all, fields(session_id = %request.session_id))]
 pub(crate) async fn handle_prompt_request(
     store: &SessionStore,
     llm_client: &dyn LlmClient,

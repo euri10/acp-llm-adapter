@@ -326,6 +326,7 @@ async fn shutdown_signal() -> Result<(), agent_client_protocol::Error> {
     Ok(())
 }
 
+#[tracing::instrument(name = "acp_serve", skip_all, fields(session_id = "none"))]
 async fn serve(
     backend: Backend,
     max_turn_requests: NonZeroUsize,

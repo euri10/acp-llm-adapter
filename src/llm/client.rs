@@ -88,6 +88,7 @@ impl ChatClient {
 /// `preferred_default` is placed first in the returned list. On any failure
 /// (transport, auth, parse) the function logs a warning and returns
 /// `vec![preferred_default.to_string()]` so callers can always proceed.
+#[tracing::instrument(name = "model_list_fetch", skip_all, fields(session_id = "none"))]
 pub async fn fetch_available_models(
     base_url: &str,
     api_key: &str,
