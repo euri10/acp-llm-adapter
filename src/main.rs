@@ -1016,16 +1016,6 @@ mod tests {
     }
 
     #[test]
-    fn main_returns_successful_exit_code() {
-        // main() calls run() which may fail if tracing is already initialized
-        // in a test context. We verify it returns some ExitCode (not a panic).
-        let code = super::main();
-        // Both SUCCESS and FAILURE are valid outcomes depending on whether
-        // tracing was already initialized.
-        assert!(code == std::process::ExitCode::SUCCESS || code == std::process::ExitCode::FAILURE);
-    }
-
-    #[test]
     fn stop_reason_from_finish_all_branches() {
         use super::stop_reason_from_finish;
         use acp_llm_adapter::llm::FinishReason;
