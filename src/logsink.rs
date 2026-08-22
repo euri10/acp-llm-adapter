@@ -63,6 +63,12 @@ pub const KIND_TRACE: &str = "trace-event";
 pub const ENV_MAX_BYTES: &str = "ACP_LOG_MAX_BYTES";
 /// Environment variable overriding the log age limit in days.
 pub const ENV_MAX_AGE_DAYS: &str = "ACP_LOG_MAX_AGE_DAYS";
+/// Environment variable disabling redaction of sensitive log fields.
+///
+/// Off by default: logs redact prompts, messages, and tool arguments. Set to
+/// any value other than empty or `0` to write those fields in the clear, for
+/// local debugging where the real content is what you're chasing.
+pub const ENV_UNREDACTED: &str = "ACP_LOG_UNREDACTED";
 /// Default aggregate size limit for structured logs.
 pub const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// Default age limit for structured logs.
@@ -161,12 +167,30 @@ impl LogRecord {
     /// The session id is filled in by [`ConnectionLog::log`] when the
     /// connection already knows it, so callers rarely set it themselves.
     pub fn new(direction: Direction, kind: impl Into<String>, payload: Value) -> Self {
+        Self::new_with_redaction(direction, kind, payload, redaction_enabled())
+    }
+
+    /// Build a record, choosing redaction explicitly rather than from the
+    /// environment.
+    ///
+    /// This is the testable core of [`LogRecord::new`]; production code
+    /// should use [`LogRecord::new`] directly.
+    fn new_with_redaction(
+        direction: Direction,
+        kind: impl Into<String>,
+        payload: Value,
+        redact: bool,
+    ) -> Self {
         Self {
             timestamp: iso_timestamp_millis_now(),
             session_id: None,
             direction,
             kind: kind.into(),
-            payload: redact_value(payload),
+            payload: if redact {
+                redact_value(payload)
+            } else {
+                payload
+            },
         }
     }
 
@@ -560,6 +584,24 @@ fn collect_log_files(
         }
     }
     Ok(())
+}
+
+/// Whether records should be redacted before being written.
+///
+/// Read fresh on every call rather than cached: `ACP_LOG_MAX_BYTES` and
+/// `ACP_LOG_MAX_AGE_DAYS` are resolved once at sink startup because they
+/// configure a background writer thread, but redaction happens inline at
+/// record construction, far from any sink, so there is no natural place to
+/// cache it — and `var_os` is a process-table lookup, not a syscall.
+fn redaction_enabled() -> bool {
+    redaction_enabled_fn(|key| std::env::var_os(key).and_then(|value| value.into_string().ok()))
+}
+
+/// Testable core of [`redaction_enabled`], injected with a lookup function so
+/// tests do not need to mutate real process environment, which is unsound
+/// under parallel test execution.
+fn redaction_enabled_fn(mut lookup: impl FnMut(&str) -> Option<String>) -> bool {
+    !lookup(ENV_UNREDACTED).is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 fn redact_value(value: Value) -> Value {

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ACP_LOG_UNREDACTED` opts out of the always-on redaction of prompts, messages, and tool arguments in `ACP_LOG`/`acp-proxy` logs, for local debugging where the real content is what you're chasing
+
 ### Fixed
 
 - stop the legacy debug wrapper from enabling `llm=trace` request-body logging by default; default to `debug` and never write LLM request bodies to the log (only their serialized byte size at trace)

@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    ConnectionLog, Direction, KIND_FRAME, KIND_SESSION_BOUND, LogRecord, LogSink, LogSinkError,
-    LogWriter, RetentionPolicy,
+    ConnectionLog, Direction, ENV_UNREDACTED, KIND_FRAME, KIND_SESSION_BOUND, LogRecord, LogSink,
+    LogSinkError, LogWriter, RetentionPolicy, redaction_enabled_fn,
 };
 
 /// A temp root that removes itself, so tests do not litter the state directory.
@@ -125,6 +125,45 @@ fn structured_payloads_share_one_redaction_policy() {
         params.and_then(|params| params.get("prompt")),
         Some(&json!("[REDACTED]"))
     );
+}
+
+#[test]
+fn unredacted_env_disables_the_shared_redaction_policy() {
+    let secret = "prompt and tool secret";
+    let payload = json!({
+        "method": "session/prompt",
+        "params": {"prompt": [{"text": secret}], "arguments": secret}
+    });
+
+    let record =
+        LogRecord::new_with_redaction(Direction::ClientToAgent, KIND_FRAME, payload, false);
+
+    assert!(record.payload.to_string().contains(secret));
+}
+
+#[test]
+fn redaction_enabled_fn_defaults_to_redacting() {
+    assert!(redaction_enabled_fn(|_| None));
+}
+
+#[test]
+fn redaction_enabled_fn_treats_unset_and_zero_as_redact() {
+    assert!(redaction_enabled_fn(
+        |key| (key == ENV_UNREDACTED).then(|| "0".to_string())
+    ));
+    assert!(redaction_enabled_fn(
+        |key| (key == ENV_UNREDACTED).then(String::new)
+    ));
+}
+
+#[test]
+fn redaction_enabled_fn_treats_any_other_value_as_opt_out() {
+    assert!(!redaction_enabled_fn(
+        |key| (key == ENV_UNREDACTED).then(|| "1".to_string())
+    ));
+    assert!(!redaction_enabled_fn(
+        |key| (key == ENV_UNREDACTED).then(|| "true".to_string())
+    ));
 }
 
 #[test]
