@@ -1619,6 +1619,7 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
+                cost_micros: 0,
             },
             &[ChatMessage::user("persisted")],
         )
@@ -1687,6 +1688,7 @@ async fn load_session_restores_state_and_replays_history()
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
+                cost_micros: 0,
             },
             &history,
         )
@@ -1787,6 +1789,7 @@ async fn resume_session_restores_state_without_replay() -> Result<(), agent_clie
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
+                cost_micros: 0,
             },
             &history,
         )
@@ -1858,6 +1861,7 @@ async fn load_session_rejects_mismatched_cwd() -> Result<(), agent_client_protoc
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
+                cost_micros: 0,
             },
             &[ChatMessage::user("hello")],
         )
@@ -1939,6 +1943,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
             mcp_sessions: Vec::new(),
             title: "temporary title".to_string(),
             updated_at: "2026-06-14T00:00:00Z".to_string(),
+            cost_micros: 0,
         },
     )?;
     persistence
@@ -1954,6 +1959,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
                 mcp_servers: Vec::new(),
                 title: Some("temporary title".to_string()),
                 updated_at: Some("2026-06-14T00:00:00Z".to_string()),
+                cost_micros: 0,
             },
             &[ChatMessage::user("hello")],
         )
@@ -2754,6 +2760,7 @@ async fn restore_persisted_session_rejects_mismatched_id()
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
+                cost_micros: 0,
             },
             &[ChatMessage::user("hello")],
         )
@@ -2773,6 +2780,7 @@ async fn restore_persisted_session_rejects_mismatched_id()
         mcp_servers: Vec::new(),
         title: None,
         updated_at: None,
+        cost_micros: 0,
     };
     let meta_json = serde_json::to_string(&mismatched_meta)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -2853,6 +2861,7 @@ async fn load_session_response_includes_history_jsonl_path_in_meta()
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
+                cost_micros: 0,
             },
             &[ChatMessage::user("hello")],
         )
@@ -2908,6 +2917,7 @@ async fn resume_session_response_includes_history_jsonl_path_in_meta()
                 mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
+                cost_micros: 0,
             },
             &[ChatMessage::user("hello")],
         )

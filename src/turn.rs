@@ -5,9 +5,10 @@ use std::num::NonZeroUsize;
 use acp_llm_adapter::llm::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
     ToolCall as ChatToolCall, ToolDefinition, UsageData, context_window_for_model,
+    deepseek_cost_micros,
 };
 use agent_client_protocol::schema::v1::{
-    ConfigOptionUpdate, ContentChunk, Diff, MessageId, Plan, PromptRequest, PromptResponse,
+    ConfigOptionUpdate, ContentChunk, Cost, Diff, MessageId, Plan, PromptRequest, PromptResponse,
     SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
@@ -47,6 +48,13 @@ struct PromptTurnEnvironment<'a> {
     request: PromptRequest,
     cancellation_token: CancellationToken,
     max_turn_requests: NonZeroUsize,
+}
+
+pub(crate) struct StreamContext<'a> {
+    llm_client: &'a dyn LlmClient,
+    store: Option<&'a SessionStore>,
+    messages: &'a [ChatMessage],
+    tool_definitions: &'a [ToolDefinition],
 }
 
 /// Filter messages to fit within a byte budget, keeping the first and most recent messages.
@@ -382,9 +390,12 @@ async fn run_prompt_turn(
     for _ in 0..env.max_turn_requests.get() {
         let request_messages = request_messages_for_behavior(env.behavior, &messages);
         let turn = stream_model_turn(
-            env.llm_client,
-            &request_messages,
-            &tool_definitions,
+            StreamContext {
+                llm_client: env.llm_client,
+                store: Some(env.store),
+                messages: &request_messages,
+                tool_definitions: &tool_definitions,
+            },
             model_settings,
             env.cancellation_token.clone(),
             &env.request.session_id,
@@ -563,9 +574,7 @@ fn emit_mode_transition_notifications(
 /// a session update notification fails.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn stream_model_turn(
-    llm_client: &dyn LlmClient,
-    messages: &[ChatMessage],
-    tool_definitions: &[ToolDefinition],
+    context: StreamContext<'_>,
     model_settings: ModelRequestSettings<'_>,
     cancellation_token: CancellationToken,
     session_id: &SessionId,
@@ -577,11 +586,11 @@ pub(crate) async fn stream_model_turn(
     // - JSON serialization overhead (quotes, escapes, structure)
     // - Request metadata (model, stream flag, etc.)
     let max_message_bytes = 256 * 1024; // 256KB
-    let filtered_messages = filter_messages_by_size(messages, max_message_bytes);
+    let filtered_messages = filter_messages_by_size(context.messages, max_message_bytes);
 
-    if filtered_messages.len() < messages.len() {
+    if filtered_messages.len() < context.messages.len() {
         tracing::warn!(
-            total_messages = messages.len(),
+            total_messages = context.messages.len(),
             kept_messages = filtered_messages.len(),
             "truncated conversation history to fit request size limit"
         );
@@ -593,7 +602,7 @@ pub(crate) async fn stream_model_turn(
     let filtered_messages = sanitize_conversation(filtered_messages);
 
     let mut chat_request = ChatRequest::new(filtered_messages)
-        .with_tools(tool_definitions.to_vec())
+        .with_tools(context.tool_definitions.to_vec())
         .with_model(model_settings.model);
     if let Some(effort) = model_settings.reasoning_effort {
         chat_request = chat_request.with_reasoning_effort(effort.id());
@@ -602,7 +611,8 @@ pub(crate) async fn stream_model_turn(
         chat_request = chat_request.with_max_tokens(max_tokens);
     }
 
-    let mut stream = llm_client
+    let mut stream = context
+        .llm_client
         .stream_chat(chat_request, cancellation_token.clone())
         .map_err(AdapterError::from)?;
     let mut assistant_text = String::new();
@@ -699,9 +709,21 @@ pub(crate) async fn stream_model_turn(
             size = usage_data.context_length,
             "sending usage_update notification"
         );
+        let cost = deepseek_cost_micros(model_settings.model, &usage_data)
+            .zip(context.store)
+            .map(|(cost_micros, store)| store.add_cost_micros(session_id, cost_micros))
+            .transpose()?;
+        let mut usage_update = UsageUpdate::new(used_tokens, usage_data.context_length);
+        if let Some(cost_micros) = cost {
+            let amount = cost_micros
+                .to_string()
+                .parse::<f64>()
+                .map_or(0.0, |value| value / 1_000_000.0);
+            usage_update = usage_update.cost(Cost::new(amount, "USD"));
+        }
         notify(session_notification(
             session_id.clone(),
-            SessionUpdate::UsageUpdate(UsageUpdate::new(used_tokens, usage_data.context_length)),
+            SessionUpdate::UsageUpdate(usage_update),
         ))?;
     }
 

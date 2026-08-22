@@ -1,5 +1,5 @@
 #![allow(clippy::indexing_slicing)]
-use super::{ModelRequestSettings, handle_prompt_request, stream_model_turn};
+use super::{ModelRequestSettings, StreamContext, handle_prompt_request, stream_model_turn};
 use crate::acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
     WriteTextFileRequester, handle_delete_session_request, handle_new_session_request,
@@ -1386,9 +1386,12 @@ async fn stream_model_turn_respects_cancellation_token() -> Result<(), agent_cli
     let turn_task = tokio::spawn(async move {
         let mut notify = |_| Ok(());
         stream_model_turn(
-            &client,
-            &messages,
-            &tool_definitions,
+            StreamContext {
+                llm_client: &client,
+                store: None,
+                messages: &messages,
+                tool_definitions: &tool_definitions,
+            },
             ModelRequestSettings {
                 model: "deepseek-v4-pro",
                 reasoning_effort: Some(ReasoningEffort::High),
@@ -1431,15 +1434,23 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
         })),
         Ok(StreamEvent::Finished(FinishReason::EndTurn)),
     ]);
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-usage-known");
+    let store = test_store();
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+    )?;
+    let session_id = session.session_id;
     let messages: Vec<ChatMessage> = Vec::new();
     let tool_definitions: Vec<ToolDefinition> = Vec::new();
     let mut notifications = Vec::new();
 
     let turn = stream_model_turn(
-        &client,
-        &messages,
-        &tool_definitions,
+        StreamContext {
+            llm_client: &client,
+            store: Some(&store),
+            messages: &messages,
+            tool_definitions: &tool_definitions,
+        },
         ModelRequestSettings {
             model: "deepseek-v4-pro",
             reasoning_effort: None,
@@ -1481,6 +1492,14 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
     };
     assert_eq!(update.used, 10);
     assert_eq!(update.size, 1_000_000);
+    assert_eq!(
+        update.cost.as_ref().map(|cost| cost.amount),
+        Some(0.000_004)
+    );
+    assert_eq!(
+        update.cost.as_ref().map(|cost| cost.currency.as_str()),
+        Some("USD")
+    );
 
     Ok(())
 }
@@ -1541,9 +1560,12 @@ async fn stream_model_turn_skips_usage_update_for_unknown_model()
     let mut notifications = Vec::new();
 
     let turn = stream_model_turn(
-        &client,
-        &messages,
-        &tool_definitions,
+        StreamContext {
+            llm_client: &client,
+            store: None,
+            messages: &messages,
+            tool_definitions: &tool_definitions,
+        },
         ModelRequestSettings {
             model: "mock-model",
             reasoning_effort: None,

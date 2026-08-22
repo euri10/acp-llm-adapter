@@ -164,6 +164,8 @@ The wrapper defaults `RUST_LOG` to `acp_llm_adapter::llm=debug`; set `RUST_LOG` 
 
 The adapter's structured wire log is enabled with `ACP_LOG=1` (the proxy writes its structured log whenever it runs). Both paths use the same retention and redaction policy. Log files are limited to 100 MiB total and 30 days by default; override those bounds with `ACP_LOG_MAX_BYTES` and `ACP_LOG_MAX_AGE_DAYS`. Prompt, message, content, text, input, and tool-argument fields are replaced with `[REDACTED]` before structured records are written. Retention only removes `connections/*.jsonl` and session `log.jsonl` files, never session metadata or history.
 
+DeepSeek `usage_update` notifications include cumulative session cost for `deepseek-v4-flash` and `deepseek-v4-pro`, calculated from cache-hit, cache-miss, and output tokens. The default prices follow [DeepSeek's pricing table](https://api-docs.deepseek.com/quick_start/pricing/). For local testing or a provider price change, `DEEPSEEK_PRICING` accepts JSON such as `{"deepseek-v4-pro":{"cache_hit":0.003625,"cache_miss":0.435,"output":0.87}}`, with values in USD per million tokens.
+
 ## Architecture
 
 The adapter bridges two independent channels:

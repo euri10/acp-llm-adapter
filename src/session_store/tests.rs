@@ -22,6 +22,7 @@ fn round_trips_session_metadata_and_history()
         mcp_servers: Vec::new(),
         title: None,
         updated_at: None,
+        cost_micros: 0,
     };
 
     store.persist_turn(&meta, &[ChatMessage::user("hello")])?;
@@ -58,6 +59,7 @@ fn delete_session_removes_persisted_record()
         mcp_servers: Vec::new(),
         title: Some("delete me".to_string()),
         updated_at: Some("2026-06-14T00:00:00Z".to_string()),
+        cost_micros: 0,
     };
 
     store.persist_turn(&meta, &[ChatMessage::user("hello")])?;
@@ -113,6 +115,7 @@ fn proxy_logs_never_surface_as_resumable_sessions()
         mcp_servers: Vec::new(),
         title: None,
         updated_at: None,
+        cost_micros: 0,
     };
     store.persist_turn(&meta, &[ChatMessage::user("hello")])?;
 

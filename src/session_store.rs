@@ -45,6 +45,9 @@ pub(crate) struct PersistedSessionMeta {
     pub(crate) title: Option<String>,
     /// ISO 8601 timestamp of last activity (absent in sessions created before this field was added).
     pub(crate) updated_at: Option<String>,
+    /// Cumulative `DeepSeek` cost in microdollars.
+    #[serde(default)]
+    pub(crate) cost_micros: u64,
 }
 
 /// Persisted session metadata plus replayable chat history.

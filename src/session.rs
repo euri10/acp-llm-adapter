@@ -598,6 +598,8 @@ pub(crate) struct SessionRecord {
     pub(crate) title: String,
     /// ISO 8601 timestamp of the last activity.
     pub(crate) updated_at: String,
+    /// Cumulative `DeepSeek` cost in microdollars.
+    pub(crate) cost_micros: u64,
 }
 
 /// Narrow boundary around shared adapter state.
@@ -1117,6 +1119,7 @@ impl SessionStore {
                     mcp_servers: session.mcp_servers.clone(),
                     title: Some(session.title.clone()),
                     updated_at: Some(session.updated_at.clone()),
+                    cost_micros: session.cost_micros,
                 },
                 new_messages,
             )
@@ -1131,6 +1134,18 @@ impl SessionStore {
         self.with_session_mut(session_id, |session| {
             session.history = messages.to_vec();
             Ok(())
+        })
+    }
+
+    /// Add a model cost to a session and return its cumulative cost.
+    pub(crate) fn add_cost_micros(
+        &self,
+        session_id: &SessionId,
+        cost_micros: u64,
+    ) -> Result<u64, AdapterError> {
+        self.with_session_mut(session_id, |session| {
+            session.cost_micros = session.cost_micros.saturating_add(cost_micros);
+            Ok(session.cost_micros)
         })
     }
 

@@ -470,6 +470,7 @@ async fn restore_persisted_session(
             mcp_sessions,
             title,
             updated_at,
+            cost_micros: persisted.meta.cost_micros,
         },
     )?;
 
@@ -502,6 +503,7 @@ fn insert_session_record(
             mcp_sessions,
             title: String::new(),
             updated_at: now,
+            cost_micros: 0,
         },
     )?;
 
