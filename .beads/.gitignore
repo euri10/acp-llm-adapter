@@ -3,6 +3,7 @@
 *.db-journal
 *.db-shm
 *.db-wal
+*.db-wal-cert*
 
 # Lock files
 *.lock
@@ -19,6 +20,8 @@ last-touched
 # `br doctor --repair`. Filename suffix `.truncated-wal` slips past the
 # generic `*.db-wal` glob above, so it needs an explicit entry (#271).
 .br_recovery/
+# Schema-migration vacuum sidecars
+.beads.db.schema-migration-*.vacuum-*
 
 # Sync state (local-only, per-machine)
 .sync.lock

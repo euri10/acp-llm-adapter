@@ -4,3 +4,6 @@
 .doctor/
 # Rust build output
 target/
+# Python bytecode
+__pycache__/
+*.py[cod]
