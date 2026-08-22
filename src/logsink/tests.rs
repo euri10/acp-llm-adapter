@@ -1,12 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
     ConnectionLog, Direction, KIND_FRAME, KIND_SESSION_BOUND, LogRecord, LogSink, LogSinkError,
-    LogWriter,
+    LogWriter, RetentionPolicy,
 };
 
 /// A temp root that removes itself, so tests do not litter the state directory.
@@ -35,6 +36,11 @@ impl Drop for TempRoot {
 /// no sleeps, no polling for a background thread to catch up.
 fn drain(sink: std::sync::Arc<LogSink>, connection: ConnectionLog, writer: LogWriter) {
     drop(connection);
+    drop(sink);
+    writer.run();
+}
+
+fn drain_writer(sink: std::sync::Arc<LogSink>, writer: LogWriter) {
     drop(sink);
     writer.run();
 }
@@ -91,6 +97,34 @@ fn unparseable_frame_is_kept_verbatim_as_a_string() {
 
     assert_eq!(record.payload, Value::String("not json at all".to_string()));
     assert_eq!(record.kind, KIND_FRAME);
+}
+
+#[test]
+fn structured_payloads_share_one_redaction_policy() {
+    let secret = "prompt and tool secret";
+    let payload = json!({
+        "method": "session/prompt",
+        "params": {
+            "prompt": [{"text": secret}],
+            "arguments": secret,
+            "model": "safe-metadata"
+        }
+    });
+
+    let frame = LogRecord::new(Direction::ClientToAgent, KIND_FRAME, payload.clone());
+    let event = LogRecord::new(Direction::Internal, "trace-event", payload);
+
+    assert!(!frame.payload.to_string().contains(secret));
+    assert!(!event.payload.to_string().contains(secret));
+    let params = frame.payload.get("params").and_then(Value::as_object);
+    assert_eq!(
+        params.and_then(|params| params.get("model")),
+        Some(&json!("safe-metadata"))
+    );
+    assert_eq!(
+        params.and_then(|params| params.get("prompt")),
+        Some(&json!("[REDACTED]"))
+    );
 }
 
 #[test]
@@ -314,4 +348,80 @@ fn a_migrated_legacy_record_deserialises() {
         "migrated records keep the session they were routed to"
     );
     assert!(decoded.timestamp.ends_with('Z'));
+}
+
+#[test]
+fn retention_bounds_apply_on_startup_and_preserve_session_artifacts() {
+    let root = TempRoot::new("retention");
+    let old_log = root.path().join("connections/old.jsonl");
+    let session_log = root.path().join("sessions/session-1/log.jsonl");
+    let metadata = root.path().join("sessions/session-1/meta.json");
+    let history = root.path().join("sessions/session-1/history.jsonl");
+    for path in [&old_log, &session_log, &metadata, &history] {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap_or_default();
+        }
+        fs::write(path, "seed").unwrap_or_default();
+    }
+
+    let policy = RetentionPolicy {
+        max_bytes: u64::MAX,
+        max_age: Duration::ZERO,
+    };
+    let (sink, writer) = LogSink::channel_with_policy(root.path(), 4, policy);
+    drain_writer(sink, writer);
+
+    assert!(!old_log.exists());
+    assert!(!session_log.exists());
+    assert!(
+        metadata.exists(),
+        "retention must not remove session metadata"
+    );
+    assert!(
+        history.exists(),
+        "retention must not remove session history"
+    );
+}
+
+#[test]
+fn size_bound_is_rechecked_after_a_restart() {
+    let root = TempRoot::new("size-restart");
+    let policy = RetentionPolicy {
+        max_bytes: 1,
+        max_age: Duration::from_hours(30 * 24),
+    };
+    let (sink, writer) = LogSink::channel_with_policy(root.path(), 4, policy);
+    let connection = open(&sink, "conn-size");
+    connection.log(LogRecord::text(
+        Direction::Internal,
+        "large-record",
+        "this exceeds the one byte bound",
+    ));
+    drain(sink, connection, writer);
+
+    let (sink, writer) = LogSink::channel_with_policy(root.path(), 4, policy);
+    drain_writer(sink, writer);
+
+    let total = ["connections", "sessions"]
+        .iter()
+        .map(|directory| directory_size(&root.path().join(directory)))
+        .sum::<u64>();
+    assert!(total <= policy.max_bytes);
+}
+
+fn directory_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                directory_size(&path)
+            } else {
+                fs::metadata(path).map_or(0, |metadata| metadata.len())
+            }
+        })
+        .sum()
 }

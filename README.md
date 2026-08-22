@@ -162,6 +162,8 @@ For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead
 
 The wrapper defaults `RUST_LOG` to `acp_llm_adapter::llm=debug`; set `RUST_LOG` explicitly (for example `acp_llm_adapter::llm=trace`) to opt into trace-level diagnostics. Request bodies are never written to the log at trace — only their serialized byte size is recorded, since the body contains prompts, injected skills/context, and tool results.
 
+The adapter's structured wire log is enabled with `ACP_LOG=1` (the proxy writes its structured log whenever it runs). Both paths use the same retention and redaction policy. Log files are limited to 100 MiB total and 30 days by default; override those bounds with `ACP_LOG_MAX_BYTES` and `ACP_LOG_MAX_AGE_DAYS`. Prompt, message, content, text, input, and tool-argument fields are replaced with `[REDACTED]` before structured records are written. Retention only removes `connections/*.jsonl` and session `log.jsonl` files, never session metadata or history.
+
 ## Architecture
 
 The adapter bridges two independent channels:

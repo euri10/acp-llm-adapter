@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,6 +56,57 @@ const SESSION_LOG_FILE: &str = "log.jsonl";
 pub const KIND_SESSION_BOUND: &str = "session-bound";
 /// Record kind for a raw JSON-RPC frame crossing the wire.
 pub const KIND_FRAME: &str = "frame";
+
+/// Environment variable overriding the aggregate log size limit.
+pub const ENV_MAX_BYTES: &str = "ACP_LOG_MAX_BYTES";
+/// Environment variable overriding the log age limit in days.
+pub const ENV_MAX_AGE_DAYS: &str = "ACP_LOG_MAX_AGE_DAYS";
+/// Default aggregate size limit for structured logs.
+pub const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
+/// Default age limit for structured logs.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_hours(30 * 24);
+
+/// Retention bounds applied to log files only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Maximum combined size of all connection and session log files.
+    pub max_bytes: u64,
+    /// Maximum age of a log file before it is removed.
+    pub max_age: Duration,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_MAX_BYTES,
+            max_age: DEFAULT_MAX_AGE,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Read retention overrides, falling back to documented defaults when an
+    /// override is missing, zero, or malformed.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        let max_bytes = std::env::var(ENV_MAX_BYTES)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(defaults.max_bytes);
+        let max_age_days = std::env::var(ENV_MAX_AGE_DAYS)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value: &u64| *value > 0)
+            .unwrap_or(defaults.max_age.as_secs() / (24 * 60 * 60));
+        let max_age = max_age_days
+            .checked_mul(24 * 60 * 60)
+            .map_or(defaults.max_age, Duration::from_secs);
+
+        Self { max_bytes, max_age }
+    }
+}
 
 /// Error returned when configuring or writing through the log sink.
 #[derive(Debug, Error)]
@@ -112,7 +164,7 @@ impl LogRecord {
             session_id: None,
             direction,
             kind: kind.into(),
-            payload,
+            payload: redact_value(payload),
         }
     }
 
@@ -215,6 +267,15 @@ impl LogSink {
     /// the number of records that may be queued before further records are
     /// dropped.
     pub fn channel(root: impl Into<PathBuf>, capacity: usize) -> (Arc<Self>, LogWriter) {
+        Self::channel_with_policy(root, capacity, RetentionPolicy::default())
+    }
+
+    /// Build a sink and its writer with explicit retention bounds.
+    pub fn channel_with_policy(
+        root: impl Into<PathBuf>,
+        capacity: usize,
+        policy: RetentionPolicy,
+    ) -> (Arc<Self>, LogWriter) {
         let (sender, receiver) = sync_channel(capacity);
         let layout = LogLayout::new(root);
         let counters = Arc::new(Counters::default());
@@ -229,6 +290,7 @@ impl LogSink {
             layout,
             counters,
             files: HashMap::new(),
+            policy,
         };
 
         (sink, writer)
@@ -244,7 +306,20 @@ impl LogSink {
     ///
     /// Returns [`LogSinkError::Io`] if the writer thread cannot be spawned.
     pub fn spawn(root: impl Into<PathBuf>, capacity: usize) -> Result<Arc<Self>, LogSinkError> {
-        let (sink, writer) = Self::channel(root, capacity);
+        Self::spawn_with_policy(root, capacity, RetentionPolicy::from_env())
+    }
+
+    /// Build a sink with explicit retention bounds and run its writer thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogSinkError::Io`] if the writer thread cannot be spawned.
+    pub fn spawn_with_policy(
+        root: impl Into<PathBuf>,
+        capacity: usize,
+        policy: RetentionPolicy,
+    ) -> Result<Arc<Self>, LogSinkError> {
+        let (sink, writer) = Self::channel_with_policy(root, capacity, policy);
         std::thread::Builder::new()
             .name("acp-log-writer".to_string())
             .spawn(move || writer.run())?;
@@ -339,11 +414,13 @@ pub struct LogWriter {
     layout: LogLayout,
     counters: Arc<Counters>,
     files: HashMap<Destination, File>,
+    policy: RetentionPolicy,
 }
 
 impl LogWriter {
     /// Drain commands until every sink handle has been dropped.
     pub fn run(mut self) {
+        self.prune_and_report();
         while let Ok(command) = self.receiver.recv() {
             match command {
                 Command::Write(destination, record) => self.write(&destination, &record),
@@ -360,6 +437,13 @@ impl LogWriter {
             // The sink cannot log its own failure through itself, and stderr is
             // the adapter's existing diagnostic channel.
             tracing::warn!(%error, "log sink write failed");
+        }
+    }
+
+    fn prune_and_report(&mut self) {
+        if let Err(error) = self.prune() {
+            self.counters.write_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, "log sink retention sweep failed");
         }
     }
 
@@ -385,8 +469,120 @@ impl LogWriter {
         // Records are written unbuffered: a debugging log that loses its last
         // lines to a crash is useless precisely when it is needed.
         file.write_all(&line)?;
+        self.prune()?;
         Ok(())
     }
+
+    fn prune(&mut self) -> Result<(), LogSinkError> {
+        let now = SystemTime::now();
+        let cutoff = now.checked_sub(self.policy.max_age).unwrap_or(UNIX_EPOCH);
+        let mut files = self.log_files()?;
+
+        for file in files.iter().filter(|file| file.modified < cutoff) {
+            self.remove_log_file(&file.path)?;
+        }
+
+        files = self.log_files()?;
+        let mut total = files.iter().map(|file| file.size).sum::<u64>();
+        files.sort_by_key(|file| file.modified);
+        for file in files {
+            if total <= self.policy.max_bytes {
+                break;
+            }
+            total = total.saturating_sub(file.size);
+            self.remove_log_file(&file.path)?;
+        }
+        Ok(())
+    }
+
+    fn log_files(&self) -> Result<Vec<LogFile>, LogSinkError> {
+        let mut files = Vec::new();
+        collect_log_files(&self.layout.root.join(CONNECTIONS_DIR), false, &mut files)?;
+        collect_log_files(&self.layout.root.join(SESSIONS_DIR), true, &mut files)?;
+        Ok(files)
+    }
+
+    fn remove_log_file(&mut self, path: &Path) -> Result<(), LogSinkError> {
+        let destinations = self
+            .files
+            .keys()
+            .filter(|destination| self.layout.path_for(destination) == path)
+            .cloned()
+            .collect::<Vec<_>>();
+        for destination in destinations {
+            self.files.remove(&destination);
+        }
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LogFile {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+}
+
+fn collect_log_files(
+    directory: &Path,
+    session_logs_only: bool,
+    files: &mut Vec<LogFile>,
+) -> Result<(), LogSinkError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_log_files(&path, session_logs_only, files)?;
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+            && (!session_logs_only
+                || path
+                    .file_name()
+                    .is_some_and(|name| name == SESSION_LOG_FILE))
+        {
+            let metadata = fs::metadata(&path)?;
+            files.push(LogFile {
+                path,
+                size: metadata.len(),
+                modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn redact_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(redact_value).collect()),
+        Value::Object(mut object) => {
+            for (key, value) in &mut object {
+                if is_sensitive_key(key) {
+                    *value = Value::String("[REDACTED]".to_string());
+                } else {
+                    let current = std::mem::take(value);
+                    *value = redact_value(current);
+                }
+            }
+            Value::Object(object)
+        }
+        value => value,
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    matches!(
+        key,
+        "arguments" | "content" | "input" | "messages" | "prompt" | "text"
+    )
 }
 
 fn open_append(path: &Path) -> Result<File, LogSinkError> {
