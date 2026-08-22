@@ -109,8 +109,11 @@ impl FilesystemSessionStore {
         Ok(true)
     }
 
-    /// List all persisted sessions regardless of working directory.
-    pub(crate) fn list_persisted(&self) -> Result<Vec<SessionInfo>, SessionPersistenceError> {
+    /// List persisted sessions, optionally filtered by working directory.
+    pub(crate) fn list_persisted(
+        &self,
+        cwd_filter: Option<&Path>,
+    ) -> Result<Vec<SessionInfo>, SessionPersistenceError> {
         let sessions_dir = self.state_dir.join(SESSIONS_DIR);
         if !sessions_dir.exists() {
             return Ok(Vec::new());
@@ -123,6 +126,9 @@ impl FilesystemSessionStore {
                 continue;
             }
             if let Ok(meta) = Self::read_meta(&entry.path()) {
+                if cwd_filter.is_some_and(|cwd| meta.cwd != cwd) {
+                    continue;
+                }
                 let mut info = SessionInfo::new(SessionId::new(meta.session_id), meta.cwd)
                     .additional_directories(meta.additional_directories);
                 if let Some(title) = &meta.title {

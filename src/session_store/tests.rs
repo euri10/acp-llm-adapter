@@ -34,7 +34,7 @@ fn round_trips_session_metadata_and_history()
     assert_eq!(record.history[0], ChatMessage::user("hello"));
     assert_eq!(record.history[1], ChatMessage::assistant("world"));
 
-    let listed = store.list_persisted()?;
+    let listed = store.list_persisted(None)?;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].session_id, SessionId::new("session-roundtrip"));
     assert_eq!(listed[0].cwd, cwd);
@@ -128,7 +128,7 @@ fn proxy_logs_never_surface_as_resumable_sessions()
     std::fs::create_dir_all(&proxied)?;
     std::fs::write(proxied.join("log.jsonl"), "{\"kind\":\"frame\"}\n")?;
 
-    let listed = store.list_persisted()?;
+    let listed = store.list_persisted(None)?;
 
     assert_eq!(
         listed.len(),

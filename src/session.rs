@@ -751,12 +751,9 @@ impl SessionStore {
 
         if let Some(persistence) = persistence {
             let persisted_list = persistence
-                .list_persisted()
+                .list_persisted(cwd_filter)
                 .map_err(|e| AdapterError::Internal(e.to_string()))?;
             for persisted in persisted_list {
-                // Always include ALL persisted sessions, regardless of cwd_filter.
-                // Users need to see all saved sessions to resume them, even from different directories.
-                // The cwd validation (if needed) happens during the actual resume call.
                 if !sessions
                     .iter()
                     .any(|session| session.session_id == persisted.session_id)

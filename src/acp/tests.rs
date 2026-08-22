@@ -1622,6 +1622,54 @@ fn list_sessions_includes_persisted_sessions_for_requested_cwd()
 }
 
 #[test]
+fn list_sessions_filters_persisted_sessions_by_requested_cwd()
+-> Result<(), agent_client_protocol::Error> {
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-list-filter-{}", Uuid::new_v4()));
+    let workspace = state_dir.join("workspace");
+    let other_workspace = state_dir.join("other-workspace");
+    let persistence = FilesystemSessionStore::new(&state_dir);
+    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+        .with_persistence(persistence.clone());
+
+    for (session_id, cwd) in [
+        ("session-matching", workspace.clone()),
+        ("session-other", other_workspace),
+    ] {
+        persistence
+            .persist_turn(
+                &PersistedSessionMeta {
+                    session_id: session_id.to_string(),
+                    cwd,
+                    additional_directories: Vec::new(),
+                    mode: SessionBehavior::Ask,
+                    model: "deepseek-v4-pro".to_string(),
+                    reasoning_effort: ReasoningEffort::High,
+                    max_tokens: None,
+                    mcp_servers: Vec::new(),
+                    title: None,
+                    updated_at: None,
+                    cost_micros: 0,
+                },
+                &[ChatMessage::user("persisted")],
+            )
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+    }
+
+    let filtered =
+        handle_list_sessions_request(&store, &ListSessionsRequest::new().cwd(&workspace))?;
+    assert_eq!(filtered.sessions.len(), 1);
+    assert_eq!(
+        filtered.sessions[0].session_id.0.as_ref(),
+        "session-matching"
+    );
+
+    let all_workspaces = handle_list_sessions_request(&store, &ListSessionsRequest::new())?;
+    assert_eq!(all_workspaces.sessions.len(), 2);
+
+    Ok(())
+}
+
+#[test]
 fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
 -> Result<(), agent_client_protocol::Error> {
     let state_dir = std::env::temp_dir().join(format!("acp-llm-list-merge-{}", Uuid::new_v4()));
