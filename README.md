@@ -168,6 +168,8 @@ DeepSeek `usage_update` notifications include cumulative session cost for `deeps
 
 Tracing spans for prompt turns, tool dispatch, LLM requests, and session lifecycle handlers carry `session_id`. Startup, model-list discovery, `initialize`, and new-session setup intentionally use `session_id="none"` because no ACP session exists at those entry points; child prompt spans replace that value once a session is established.
 
+When serve logging is enabled, those tracing events are written alongside wire records: session-scoped events go to that session's `log.jsonl`, while unscoped events stay in the connection fallback log. They continue to be emitted to stderr and remain controlled by `RUST_LOG`.
+
 ## Architecture
 
 The adapter bridges two independent channels:

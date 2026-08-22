@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use acp_llm_adapter::logsink::{ConnectionLog, Direction, LogRecord, LogSink};
+use acp_llm_adapter::logsink::{ConnectionLog, Direction, KIND_TRACE, LogRecord, LogSink};
 use acp_llm_adapter::paths::default_state_dir;
 use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
@@ -31,7 +31,10 @@ use agent_client_protocol::schema::v1::{
     SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
 };
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 use uuid::Uuid;
 
 mod acp;
@@ -147,13 +150,16 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), AdapterError> {
-    init_tracing()?;
+    let command = Cli::parse().command;
+    if matches!(command, Command::Dev { .. }) {
+        init_tracing(None)?;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     runtime.block_on(async {
-        match Cli::parse().command {
+        match command {
             Command::Serve {
                 backend,
                 max_turn_requests,
@@ -165,13 +171,143 @@ fn run() -> Result<(), AdapterError> {
     Ok(())
 }
 
-fn init_tracing() -> Result<(), AdapterError> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
+fn init_tracing(connection: Option<ConnectionLog>) -> Result<(), AdapterError> {
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(SessionLogLayer::new(connection))
         .try_init()
         .map_err(|e| AdapterError::Internal(e.to_string()))?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct SessionLogLayer {
+    connection: Option<ConnectionLog>,
+}
+
+impl SessionLogLayer {
+    fn new(connection: Option<ConnectionLog>) -> Self {
+        Self { connection }
+    }
+
+    fn route(
+        &self,
+        session_id: Option<&str>,
+        level: &str,
+        target: &str,
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "level": level,
+            "target": target,
+            "fields": fields,
+        });
+        let record = LogRecord::new(Direction::Internal, KIND_TRACE, payload);
+        if let Some(session_id) = session_id {
+            connection.log(record.with_session(session_id));
+        } else {
+            connection.log_fallback(record);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionField {
+    session_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct EventFields {
+    values: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for EventFields {
+    fn default() -> Self {
+        Self {
+            values: serde_json::Map::new(),
+        }
+    }
+}
+
+impl tracing::field::Visit for SessionField {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "session_id" {
+            self.session_id = Some(format!("{value:?}").trim_matches('"').to_string());
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "session_id" {
+            self.session_id = Some(value.to_string());
+        }
+    }
+}
+
+impl tracing::field::Visit for EventFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.values.insert(
+            field.name().to_string(),
+            serde_json::Value::String(format!("{value:?}")),
+        );
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.values.insert(
+            field.name().to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.values.insert(field.name().to_string(), value.into());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.values.insert(field.name().to_string(), value.into());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.values.insert(field.name().to_string(), value.into());
+    }
+}
+
+impl<S> Layer<S> for SessionLogLayer
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        let mut fields = SessionField::default();
+        attrs.record(&mut fields);
+        if let Some(session_id) = fields.session_id
+            && let Some(span) = ctx.span(id)
+        {
+            span.extensions_mut().insert(session_id);
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        let session_id = ctx
+            .event_scope(event)
+            .and_then(|mut scope| scope.find_map(|span| span.extensions().get::<String>().cloned()))
+            .filter(|session_id| session_id != "none");
+        let mut fields = EventFields::default();
+        event.record(&mut fields);
+        self.route(
+            session_id.as_deref(),
+            event.metadata().level().as_str(),
+            event.metadata().target(),
+            &fields.values,
+        );
+    }
 }
 
 /// Cancels its [`CancellationToken`] when dropped.
@@ -331,6 +467,14 @@ async fn serve(
     backend: Backend,
     max_turn_requests: NonZeroUsize,
 ) -> Result<(), agent_client_protocol::Error> {
+    let log_sink = serve_log()?;
+    let connection = log_sink
+        .as_ref()
+        .map(|sink| sink.connection(Uuid::new_v4().to_string()))
+        .transpose()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    init_tracing(connection.clone()).map_err(agent_client_protocol::Error::into_internal_error)?;
+
     let llm_client = llm_client_for_backend(backend)?;
     let tool_registry = Arc::new(AdapterToolRegistry);
 
@@ -358,12 +502,6 @@ async fn serve(
         }
     }
 
-    let log_sink = serve_log()?;
-    let connection = log_sink
-        .as_ref()
-        .map(|sink| sink.connection(Uuid::new_v4().to_string()))
-        .transpose()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
     let shutdown = CancellationToken::new();
     let transport = stdio_transport_with_eof(shutdown.clone(), connection);
 
@@ -513,8 +651,8 @@ pub(crate) fn test_store() -> SessionStore {
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
-        Backend, Cli, Command, EofGuard, LogSink, Uuid, attach_eof_guard, bind_session_from_frame,
-        text_from_prompt,
+        Backend, Cli, Command, EofGuard, LogSink, SessionLogLayer, Uuid, attach_eof_guard,
+        bind_session_from_frame, text_from_prompt,
     };
     use crate::acp::validate_session_paths;
     use agent_client_protocol::schema::v1::{
@@ -524,6 +662,7 @@ mod tests {
     use clap::Parser;
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
+    use tracing_subscriber::prelude::*;
 
     #[test_log::test]
     fn rejects_serve_subcommand_without_backend() {
@@ -862,7 +1001,7 @@ mod tests {
         // init_tracing uses try_init so it either succeeds or returns
         // an error if a global subscriber is already registered (e.g. by
         // test-log). Either outcome is valid.
-        let result = super::init_tracing();
+        let result = super::init_tracing(None);
         // The only acceptable error is "already set".
         if let Err(ref error) = result {
             let msg = error.to_string();
@@ -984,5 +1123,56 @@ mod tests {
         drop(connection);
         drop(sink);
         drop(writer);
+    }
+
+    #[test_log::test]
+    fn tracing_events_route_to_session_or_connection_fallback() {
+        let root = std::env::temp_dir().join(format!("acp-trace-layer-test-{}", Uuid::new_v4()));
+        let (sink, writer) = LogSink::channel(&root, 16);
+        let Ok(connection) = sink.connection("connection-test") else {
+            return;
+        };
+        let layer = SessionLogLayer::new(Some(connection.clone()));
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let first_span = tracing::info_span!("session", session_id = "session-first");
+            let first_guard = first_span.enter();
+            tracing::info!(message = "first-only");
+            drop(first_guard);
+
+            let second_span = tracing::info_span!("session", session_id = "session-second");
+            let second_guard = second_span.enter();
+            tracing::info!(message = "second-only");
+            drop(second_guard);
+
+            tracing::info!(message = "fallback-only");
+        });
+
+        let Ok(first_path) = sink.session_log_path("session-first") else {
+            return;
+        };
+        let Ok(second_path) = sink.session_log_path("session-second") else {
+            return;
+        };
+        let Ok(connection_path) = sink.connection_log_path("connection-test") else {
+            return;
+        };
+
+        drop(connection);
+        drop(sink);
+        writer.run();
+
+        let first_log = std::fs::read_to_string(first_path).unwrap_or_default();
+        let second_log = std::fs::read_to_string(second_path).unwrap_or_default();
+        let fallback_log = std::fs::read_to_string(connection_path).unwrap_or_default();
+        assert!(first_log.contains("first-only"));
+        assert!(!first_log.contains("second-only"));
+        assert!(second_log.contains("second-only"));
+        assert!(!second_log.contains("first-only"));
+        assert!(fallback_log.contains("fallback-only"));
+        assert!(!fallback_log.contains("first-only"));
+        assert!(!fallback_log.contains("second-only"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

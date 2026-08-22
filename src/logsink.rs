@@ -56,6 +56,8 @@ const SESSION_LOG_FILE: &str = "log.jsonl";
 pub const KIND_SESSION_BOUND: &str = "session-bound";
 /// Record kind for a raw JSON-RPC frame crossing the wire.
 pub const KIND_FRAME: &str = "frame";
+/// Record kind for an internal tracing event.
+pub const KIND_TRACE: &str = "trace-event";
 
 /// Environment variable overriding the aggregate log size limit.
 pub const ENV_MAX_BYTES: &str = "ACP_LOG_MAX_BYTES";
@@ -643,6 +645,13 @@ impl ConnectionLog {
                 .sink
                 .enqueue(Destination::Connection(self.connection_id.clone()), record),
         }
+    }
+
+    /// Write a record to this connection's fallback file, without inheriting
+    /// its session binding.
+    pub fn log_fallback(&self, record: LogRecord) {
+        self.sink
+            .enqueue(Destination::Connection(self.connection_id.clone()), record);
     }
 
     /// Route this connection's subsequent records to `session_id`.
