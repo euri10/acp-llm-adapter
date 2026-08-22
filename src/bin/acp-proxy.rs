@@ -20,6 +20,11 @@
 //! ```text
 //! acp-proxy -- claude-agent-acp --some-flag
 //! ```
+//!
+//! The `--` separator is required. Without it the agent command and its flags
+//! are parsed as proxy options and the proxy exits with `unexpected argument`.
+//! Programmatic callers must include a literal `"--"` argv element before the
+//! agent command.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -48,6 +53,10 @@ struct Cli {
     queue_capacity: usize,
 
     /// The agent to run, and its arguments.
+    ///
+    /// Must follow a literal `--`: `acp-proxy -- <COMMAND>...`. The separator
+    /// is what stops the agent name and its flags from being read as proxy
+    /// options.
     #[arg(required = true, last = true, num_args = 1.., value_name = "COMMAND")]
     command: Vec<OsString>,
 }
