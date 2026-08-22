@@ -19,6 +19,8 @@ use std::num::NonZeroUsize;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+use acp_llm_adapter::logsink::{ConnectionLog, Direction, LogRecord, LogSink};
+use acp_llm_adapter::paths::default_state_dir;
 use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +32,7 @@ use agent_client_protocol::schema::v1::{
 };
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 mod acp;
 mod dev;
@@ -67,6 +70,8 @@ pub(crate) use session::{
 
 const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");
 const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ACP_LOG_ENV: &str = "ACP_LOG";
+const LOG_QUEUE_CAPACITY: usize = 1024;
 
 /// Returns the list of available slash commands for the ACP LLM adapter.
 ///
@@ -219,23 +224,72 @@ where
 /// but attaches an [`EofGuard`] to the incoming line stream so the serve loop
 /// can detect client disconnect (stdin close) and exit instead of hanging,
 /// because the ACP agent server otherwise runs forever.
-fn stdio_transport_with_eof(shutdown: CancellationToken) -> impl ConnectTo<Agent> + 'static {
+fn stdio_transport_with_eof(
+    shutdown: CancellationToken,
+    connection: Option<ConnectionLog>,
+) -> impl ConnectTo<Agent> + 'static {
     use futures_util::io::BufReader;
-    use futures_util::{AsyncBufReadExt, AsyncWriteExt};
+    use futures_util::{AsyncBufReadExt, AsyncWriteExt, StreamExt};
 
     let stdin = blocking::Unblock::new(std::io::stdin());
     let stdout = blocking::Unblock::new(std::io::stdout());
 
-    let incoming = attach_eof_guard(BufReader::new(stdin).lines(), shutdown);
+    let incoming_log = connection.clone();
+    let incoming = attach_eof_guard(BufReader::new(stdin).lines(), shutdown).map(move |line| {
+        if let (Some(log), Ok(line)) = (&incoming_log, &line) {
+            log.log(LogRecord::frame(Direction::ClientToAgent, line));
+        }
+        line
+    });
 
-    let outgoing = futures_util::sink::unfold(stdout, |mut writer, line: String| async move {
-        let mut bytes = line.into_bytes();
-        bytes.push(b'\n');
-        writer.write_all(&bytes).await?;
-        Ok::<_, std::io::Error>(writer)
+    let outgoing_log = connection;
+    let outgoing = futures_util::sink::unfold(stdout, move |mut writer, line: String| {
+        let log = outgoing_log.clone();
+        async move {
+            if let Some(log) = log {
+                bind_session_from_frame(&log, &line);
+                log.log(LogRecord::frame(Direction::AgentToClient, &line));
+            }
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+            writer.write_all(&bytes).await?;
+            Ok::<_, std::io::Error>(writer)
+        }
     });
 
     Lines::new(outgoing, incoming)
+}
+
+fn bind_session_from_frame(connection: &ConnectionLog, line: &str) {
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let Some(session_id) = frame
+        .get("result")
+        .and_then(|result| result.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    if let Err(error) = connection.bind_session(session_id) {
+        tracing::warn!(%error, "failed to bind serve log to ACP session");
+    }
+}
+
+fn serve_log() -> Result<Option<Arc<LogSink>>, agent_client_protocol::Error> {
+    let enabled =
+        std::env::var_os(ACP_LOG_ENV).is_some_and(|value| !value.is_empty() && value != "0");
+    if !enabled {
+        return Ok(None);
+    }
+
+    let Some(state_dir) = default_state_dir() else {
+        return Err(agent_client_protocol::Error::internal_error()
+            .data("ACP_LOG is enabled but neither XDG_STATE_HOME nor HOME is set"));
+    };
+    LogSink::spawn(state_dir, LOG_QUEUE_CAPACITY)
+        .map(Some)
+        .map_err(agent_client_protocol::Error::into_internal_error)
 }
 
 /// Resolve when the process receives `SIGTERM`, `SIGINT`, or `SIGHUP`.
@@ -303,10 +357,16 @@ async fn serve(
         }
     }
 
+    let log_sink = serve_log()?;
+    let connection = log_sink
+        .as_ref()
+        .map(|sink| sink.connection(Uuid::new_v4().to_string()))
+        .transpose()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
     let shutdown = CancellationToken::new();
-    let transport = stdio_transport_with_eof(shutdown.clone());
+    let transport = stdio_transport_with_eof(shutdown.clone(), connection);
 
-    tokio::select! {
+    let result = tokio::select! {
         result = serve_with_transport(
             transport,
             state,
@@ -325,7 +385,11 @@ async fn serve(
             tracing::info!("termination signal received; shutting down");
             result
         }
+    };
+    if let Some(sink) = log_sink {
+        sink.flush();
     }
+    result
 }
 
 async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protocol::Error> {
@@ -447,7 +511,10 @@ pub(crate) fn test_store() -> SessionStore {
 // every `slice[i]` with `.get(i).unwrap()` adds noise without safety benefit in tests.
 #[allow(clippy::indexing_slicing)]
 mod tests {
-    use super::{Backend, Cli, Command, EofGuard, attach_eof_guard, text_from_prompt};
+    use super::{
+        Backend, Cli, Command, EofGuard, LogSink, Uuid, attach_eof_guard, bind_session_from_frame,
+        text_from_prompt,
+    };
     use crate::acp::validate_session_paths;
     use agent_client_protocol::schema::v1::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
@@ -893,5 +960,28 @@ mod tests {
         assert!(!token.is_cancelled());
         drop(wrapped);
         assert!(token.is_cancelled());
+    }
+
+    #[test_log::test]
+    fn session_new_response_binds_serve_log() {
+        let (sink, writer) = LogSink::channel(
+            std::env::temp_dir().join(format!("acp-llm-serve-log-test-{}", Uuid::new_v4())),
+            8,
+        );
+        let connection = sink.connection("connection-test");
+        assert!(connection.is_ok());
+        let Some(connection) = connection.ok() else {
+            return;
+        };
+
+        bind_session_from_frame(
+            &connection,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session-test"}}"#,
+        );
+
+        assert_eq!(connection.session_id().as_deref(), Some("session-test"));
+        drop(connection);
+        drop(sink);
+        drop(writer);
     }
 }
