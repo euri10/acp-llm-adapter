@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3](https://github.com/euri10/acp-llm-adapter/compare/v0.7.2...v0.7.3) - 2026-08-22
+
+### Added
+
+- *(logsink)* add ACP_LOG_UNREDACTED opt-out for local debugging
+- *(acp)* expose session log paths
+- *(logging)* route tracing events by session
+- *(tracing)* scope events to ACP sessions
+- *(usage)* report DeepSeek session cost
+- *(logging)* bound and redact shared sink
+- *(logging)* log serve ACP frames
+- *(logging)* add proxy and session logs
+
+### Fixed
+
+- *(deps)* update rust crate clap to ^4.6.6 ([#36](https://github.com/euri10/acp-llm-adapter/pull/36))
+- *(deps)* update rust crate globset to ^0.4.20 ([#37](https://github.com/euri10/acp-llm-adapter/pull/37))
+- *(deps)* update rust crate ignore to ^0.4.33 ([#38](https://github.com/euri10/acp-llm-adapter/pull/38))
+- *(deps)* update rust crate thiserror to ^2.0.20 ([#39](https://github.com/euri10/acp-llm-adapter/pull/39))
+- *(deps)* update rust crate uuid to ^1.25.0 ([#41](https://github.com/euri10/acp-llm-adapter/pull/41))
+- *(test)* remove main_returns_successful_exit_code test
+- *(session)* honor cwd in persisted listing
+- *(session)* record cwd filter bug
+- report accurate context windows from explicit model table (daa-qej)
+- stop debug wrapper from logging LLM request bodies (daa-4hf)
+- *(deps)* update rust crate thiserror to ^2.0.19 ([#33](https://github.com/euri10/acp-llm-adapter/pull/33))
+- *(deps)* update rust crate ignore to ^0.4.32 ([#32](https://github.com/euri10/acp-llm-adapter/pull/32))
+- *(deps)* update rust crate clap to ^4.6.5 ([#34](https://github.com/euri10/acp-llm-adapter/pull/34))
+- *(deps)* update rust crate http to ^1.5.0 ([#35](https://github.com/euri10/acp-llm-adapter/pull/35))
+
+### Other
+
+- *(deps)* update dependency rust to 1.98 ([#40](https://github.com/euri10/acp-llm-adapter/pull/40))
+- *(acp-proxy)* require -- separator before agent command
+- *(beads)* close logging feature
+- *(logging)* remove legacy wrapper
+- *(beads)* close session filter bug
+- ignore local artifacts
+- add CodeCompanion repro (daa-5op)
+
 ### Added
 
 - `ACP_LOG_UNREDACTED` opts out of the always-on redaction of prompts, messages, and tool arguments in `ACP_LOG`/`acp-proxy` logs, for local debugging where the real content is what you're chasing
