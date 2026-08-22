@@ -86,7 +86,6 @@ require("codecompanion").setup({
           },
           commands = {
             default = {
-              "/home/lotso/code/acp-llm-adapter/acp-debug.sh",
               "acp-llm-adapter",
               "serve",
               "--backend",
@@ -158,11 +157,12 @@ If Zed is launched from a GUI app launcher, it may not inherit your shell enviro
 
 ## Debugging
 
-For debugging prefer the included [`acp-debug.sh`](acp-debug.sh) wrapper instead of invoking the adapter binary directly. It keeps normal stdio behavior intact for ACP while appending streams to `.local/state/acp-llm-adapter` using filenames like `20260610-080836-32451-acp-llm-adapter-deepseek-stderr.log` and `20260610-080836-32451-codex-acp-stdout-jsonrpc.log` (`<timestamp>-<pid>-<binary>[-<label>]...`). The label is `ACP_DEBUG_LABEL` when set; otherwise it is auto-derived from `--backend` (supports both `--backend value` and `--backend=value`).
+The two binaries provide adapter-owned logging without a shell wrapper:
 
-The wrapper defaults `RUST_LOG` to `acp_llm_adapter::llm=debug`; set `RUST_LOG` explicitly (for example `acp_llm_adapter::llm=trace`) to opt into trace-level diagnostics. Request bodies are never written to the log at trace — only their serialized byte size is recorded, since the body contains prompts, injected skills/context, and tool results.
+- `acp-llm-adapter serve --backend <backend>` writes both ACP wire records and internal tracing events for the adapter. Set `ACP_LOG=1` to enable structured logging. Session records are written to `$XDG_STATE_HOME/acp-llm-adapter/sessions/<session-id>/log.jsonl` (or `~/.local/state/acp-llm-adapter/sessions/<session-id>/log.jsonl` when `XDG_STATE_HOME` is unset); records before a session exists use `connections/<connection-id>.jsonl`.
+- `acp-proxy -- <agent> [args...]` records both directions of a foreign ACP agent's traffic and its stderr. Proxy logs use the separate `.../acp-llm-adapter/proxy/` root, with the same `connections/` and `sessions/` layout. This keeps foreign sessions out of the adapter's session store.
 
-The adapter's structured wire log is enabled with `ACP_LOG=1` (the proxy writes its structured log whenever it runs). Both paths use the same retention and redaction policy. Log files are limited to 100 MiB total and 30 days by default; override those bounds with `ACP_LOG_MAX_BYTES` and `ACP_LOG_MAX_AGE_DAYS`. Prompt, message, content, text, input, and tool-argument fields are replaced with `[REDACTED]` before structured records are written. Retention only removes `connections/*.jsonl` and session `log.jsonl` files, never session metadata or history.
+Both binaries use the same retention and redaction policy. Log files are limited to 100 MiB total and 30 days by default; override those bounds with `ACP_LOG_MAX_BYTES` and `ACP_LOG_MAX_AGE_DAYS`. Prompt, message, content, text, input, and tool-argument fields are replaced with `[REDACTED]` before structured records are written. Retention only removes `connections/*.jsonl` and session `log.jsonl` files, never session metadata or history. Set `RUST_LOG` (for example `acp_llm_adapter::llm=trace`) to control tracing output; LLM request bodies are not written at trace, only their serialized byte size.
 
 DeepSeek `usage_update` notifications include cumulative session cost for `deepseek-v4-flash` and `deepseek-v4-pro`, calculated from cache-hit, cache-miss, and output tokens. The default prices follow [DeepSeek's pricing table](https://api-docs.deepseek.com/quick_start/pricing/). For local testing or a provider price change, `DEEPSEEK_PRICING` accepts JSON such as `{"deepseek-v4-pro":{"cache_hit":0.003625,"cache_miss":0.435,"output":0.87}}`, with values in USD per million tokens.
 

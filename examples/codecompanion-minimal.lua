@@ -20,9 +20,6 @@ local function acp_adapter(opts)
     opts.backend,
   }
 
-  -- To capture adapter stdio logs from this repo checkout, use:
-  -- command = { "./acp-debug.sh", "acp-llm-adapter", "serve", "--backend", opts.backend }
-
   return {
     name = opts.name,
     formatted_name = opts.formatted_name,

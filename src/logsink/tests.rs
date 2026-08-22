@@ -330,9 +330,8 @@ fn a_separate_root_keeps_proxy_logs_out_of_the_session_store() {
 
 #[test]
 fn a_migrated_legacy_record_deserialises() {
-    // Emitted by scripts/migrate-legacy-logs.py when converting acp-debug.sh
-    // output. The script writes this shape by hand, so the envelope contract
-    // between the two has to be asserted somewhere.
+    // Emitted by the one-time legacy log migration. The script wrote this
+    // shape by hand, so the envelope contract has to be asserted somewhere.
     let line = r#"{"timestamp": "2026-08-20T14:32:15.000Z", "direction": "agent_to_client", "kind": "frame", "session_id": "session-36d6f05c-0022-4401-89cb-315ccf1f8467", "payload": {"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "session-36d6f05c-0022-4401-89cb-315ccf1f8467"}}}"#;
 
     let decoded: LogRecord = match serde_json::from_str(line) {

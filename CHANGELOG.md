@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- stop `acp-debug.sh` from enabling `llm=trace` request-body logging by default; default to `debug` and never write LLM request bodies to the log (only their serialized byte size at trace)
+- stop the legacy debug wrapper from enabling `llm=trace` request-body logging by default; default to `debug` and never write LLM request bodies to the log (only their serialized byte size at trace)
 - report accurate context windows from an explicit model table (`deepseek-v4-pro`/`deepseek-v4-flash` 1M, `glm-4.6` 128K) instead of silently asserting 1M for every unknown model; unknown models no longer emit a misleading `usage_update`
 
 ## [0.7.2](https://github.com/euri10/acp-llm-adapter/compare/v0.7.1...v0.7.2) - 2026-07-17
@@ -119,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - cargo audit fails in CI (daa-nnu)
 - close daa-fj0 - root cause identified and fixed (daa-fj0)
 - investigate root cause of 400 errors (daa-fj0)
-- enable TRACE logging in acp-debug.sh for easier debugging
+- enable TRACE logging in the legacy debug wrapper for easier debugging
 - clarify EventSource error response body limitation
 - DeepSeek API returns 400 Bad Request on streaming chat completion (daa-gd9)
 
