@@ -65,7 +65,7 @@ jobs:
         name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.97"        # MSRV from Cargo.toml
+          toolchain: "1.98"        # MSRV from Cargo.toml
 
       - name: Run release-plz release
         uses: release-plz/action@v0.5
