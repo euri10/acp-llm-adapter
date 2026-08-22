@@ -14,7 +14,6 @@ use crate::{ReasoningEffort, SessionBehavior};
 const SESSIONS_DIR: &str = "sessions";
 const META_FILE: &str = "meta.json";
 const HISTORY_FILE: &str = "history.jsonl";
-const APPLICATION_STATE_DIR: &str = "acp-llm-adapter";
 
 /// Filesystem-backed persistence for ACP session metadata and chat history.
 #[derive(Debug, Clone)]
@@ -211,21 +210,13 @@ impl FilesystemSessionStore {
     }
 }
 
+/// Resolve the state directory, raising this module's error on failure.
+///
+/// The resolution rules live in the library so the proxy binary shares them.
 fn default_state_dir() -> Result<PathBuf, SessionPersistenceError> {
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(path).join(APPLICATION_STATE_DIR));
-    }
-
-    let Some(home) = std::env::var_os("HOME") else {
-        return Err(SessionPersistenceError::StateDir(
-            "neither XDG_STATE_HOME nor HOME is set".to_string(),
-        ));
-    };
-
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join(APPLICATION_STATE_DIR))
+    acp_llm_adapter::paths::default_state_dir().ok_or_else(|| {
+        SessionPersistenceError::StateDir("neither XDG_STATE_HOME nor HOME is set".to_string())
+    })
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), SessionPersistenceError> {

@@ -543,52 +543,10 @@ impl Default for AdapterState {
     }
 }
 
-/// Produce an ISO 8601 UTC timestamp string from the system clock.
-///
-/// Uses public-domain calendar arithmetic (Hinnant) to avoid pulling in
-/// `chrono` or `time` as a direct dependency.  The format is
-/// `YYYY-MM-DDTHH:MM:SSZ` with second precision.
-pub(crate) fn iso_timestamp_now() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map_or_else(
-            || "1970-01-01T00:00:00Z".to_string(),
-            |dur| {
-                let secs = dur.as_secs();
-                let days = secs / 86400;
-                let seconds_today = secs % 86400;
-
-                let hours = seconds_today / 3600;
-                let minutes = (seconds_today % 3600) / 60;
-                let seconds = seconds_today % 60;
-
-                let (year, month, day) = unix_days_to_ymd(days);
-
-                format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
-            },
-        )
-}
-
-fn unix_days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    days += 719_468; // Adjust to proleptic Gregorian calendar
-    let era = days / 146_097;
-    let day_of_era = days % 146_097;
-
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-
-    let month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month + 2) / 5 + 1;
-
-    let month = if month < 10 { month + 3 } else { month - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-
-    (year, month, day)
-}
+// The calendar arithmetic behind this helper moved into the library crate so
+// the log sink — shared with the proxy binary — can stamp records without a
+// second copy of it.
+pub(crate) use acp_llm_adapter::timestamp::iso_timestamp_now;
 
 /// Derive a human-readable session title from the message history.
 ///

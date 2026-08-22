@@ -225,6 +225,44 @@ fn parses_empty_chunks_and_unknown_finish_reasons() -> Result<(), ChatError> {
 }
 
 #[test_log::test]
+fn parses_deepseek_usage_details() -> Result<(), ChatError> {
+    let fixture = r#"
+    {
+      "choices": [{"delta": {}, "finish_reason": "stop"}],
+      "usage": {
+        "prompt_tokens": 3196,
+        "completion_tokens": 269,
+        "total_tokens": 3465,
+        "context_window": 1000000,
+        "prompt_tokens_details": {"cached_tokens": 3072},
+        "completion_tokens_details": {"reasoning_tokens": 173},
+        "prompt_cache_hit_tokens": 3072,
+        "prompt_cache_miss_tokens": 124
+      }
+    }
+    "#;
+
+    let updates = parse_chat_completion_chunk(fixture)?;
+    assert_eq!(
+        updates,
+        vec![
+            StreamEvent::Finished(FinishReason::EndTurn),
+            StreamEvent::Usage(super::UsageData {
+                input_tokens: 3196,
+                output_tokens: 269,
+                context_length: 1_000_000,
+                total_tokens: Some(3465),
+                thought_tokens: Some(173),
+                cached_read_tokens: Some(3072),
+                cached_write_tokens: Some(124),
+            }),
+        ]
+    );
+
+    Ok(())
+}
+
+#[test_log::test]
 fn parses_tool_call_deltas() -> Result<(), ChatError> {
     let fixture = r#"
     {

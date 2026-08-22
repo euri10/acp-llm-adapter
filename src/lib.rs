@@ -81,6 +81,18 @@ pub mod llm;
 /// Unified domain error type for the adapter crate.
 pub mod error;
 
+/// Shared NDJSON log sink used by the adapter and the proxy.
+pub mod logsink;
+
+/// Well-known filesystem locations shared by the adapter and the proxy.
+pub mod paths;
+
+/// ACP debugging proxy for external agents.
+pub mod proxy;
+
+/// ISO 8601 UTC timestamp helpers.
+pub mod timestamp;
+
 #[cfg(test)]
 // Test assertions legitimately use indexing to access elements by position; replacing
 // every `slice[i]` with `.get(i).unwrap()` adds noise without safety benefit in tests.

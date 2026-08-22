@@ -468,6 +468,17 @@ pub struct UsageData {
     pub output_tokens: u64,
     /// Context window size in tokens.
     pub context_length: u64,
+    /// Total tokens reported by the provider, when available.
+    ///
+    /// When the provider does not report a total, callers fall back to
+    /// `input_tokens + output_tokens`.
+    pub total_tokens: Option<u64>,
+    /// Reasoning/thinking tokens reported by the provider, when available.
+    pub thought_tokens: Option<u64>,
+    /// Prompt cache read (cache hit) tokens, when available.
+    pub cached_read_tokens: Option<u64>,
+    /// Prompt cache write (cache miss) tokens, when available.
+    pub cached_write_tokens: Option<u64>,
 }
 
 /// A normalized update emitted while streaming an LLM response.

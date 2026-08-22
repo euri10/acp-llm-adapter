@@ -1424,6 +1424,10 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
             input_tokens: 3,
             output_tokens: 4,
             context_length: 0,
+            total_tokens: Some(10),
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
         })),
         Ok(StreamEvent::Finished(FinishReason::EndTurn)),
     ]);
@@ -1456,6 +1460,10 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
             input_tokens: 3,
             output_tokens: 4,
             context_length: 0,
+            total_tokens: Some(10),
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
         })
     );
 
@@ -1471,10 +1479,45 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected usage_update notification"));
     };
-    assert_eq!(update.used, 7);
+    assert_eq!(update.used, 10);
     assert_eq!(update.size, 1_000_000);
 
     Ok(())
+}
+
+#[test_log::test]
+fn usage_totals_preserve_provider_total_and_sum_optional_fields() {
+    let mut totals = super::UsageTotals::default();
+    totals.add(&UsageData {
+        input_tokens: 100,
+        output_tokens: 20,
+        context_length: 1_000_000,
+        total_tokens: Some(200),
+        thought_tokens: Some(12),
+        cached_read_tokens: Some(80),
+        cached_write_tokens: Some(8),
+    });
+    totals.add(&UsageData {
+        input_tokens: 30,
+        output_tokens: 10,
+        context_length: 1_000_000,
+        total_tokens: None,
+        thought_tokens: Some(3),
+        cached_read_tokens: None,
+        cached_write_tokens: Some(2),
+    });
+
+    let usage = totals.into_acp_usage();
+    assert!(usage.is_some());
+    let Some(usage) = usage else {
+        return;
+    };
+    assert_eq!(usage.total_tokens, 240);
+    assert_eq!(usage.input_tokens, 130);
+    assert_eq!(usage.output_tokens, 30);
+    assert_eq!(usage.thought_tokens, Some(15));
+    assert_eq!(usage.cached_read_tokens, Some(80));
+    assert_eq!(usage.cached_write_tokens, Some(10));
 }
 
 #[test_log::test(tokio::test)]
@@ -1485,6 +1528,10 @@ async fn stream_model_turn_skips_usage_update_for_unknown_model()
             input_tokens: 3,
             output_tokens: 4,
             context_length: 0,
+            total_tokens: None,
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
         })),
         Ok(StreamEvent::Finished(FinishReason::EndTurn)),
     ]);
@@ -1517,6 +1564,10 @@ async fn stream_model_turn_skips_usage_update_for_unknown_model()
             input_tokens: 3,
             output_tokens: 4,
             context_length: 0,
+            total_tokens: None,
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
         })
     );
     assert!(

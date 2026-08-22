@@ -85,8 +85,32 @@ struct ChatCompletionUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: Option<u64>,
     #[serde(default, alias = "context_window")]
     context_length: u64,
+    #[serde(default)]
+    prompt_tokens_details: PromptTokensDetails,
+    #[serde(default)]
+    completion_tokens_details: CompletionTokensDetails,
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
+}
+
+/// Per-input token detail `DeepSeek` reports alongside the flat usage counters.
+#[derive(Debug, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+/// Per-output token detail `DeepSeek` reports alongside the flat usage counters.
+#[derive(Debug, Default, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +203,19 @@ pub(crate) fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEve
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
             context_length: usage.context_length,
+            total_tokens: usage.total_tokens,
+            thought_tokens: usage.completion_tokens_details.reasoning_tokens,
+            // DeepSeek reports cache hits twice: once as the OpenAI-style
+            // `prompt_tokens_details.cached_tokens` and once as the flat
+            // `prompt_cache_hit_tokens`. Prefer the structured field when
+            // both are present and fall back to the flat counter otherwise.
+            cached_read_tokens: usage
+                .prompt_tokens_details
+                .cached_tokens
+                .or(usage.prompt_cache_hit_tokens),
+            // Tokens that missed the prompt cache are newly written to it,
+            // so they map to ACP's "cache write" counter.
+            cached_write_tokens: usage.prompt_cache_miss_tokens,
         }));
     }
 

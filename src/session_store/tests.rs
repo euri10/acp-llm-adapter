@@ -96,3 +96,44 @@ fn rejects_session_ids_that_are_not_path_components() {
     let error = store.load_record("../escape").err();
     assert!(error.is_some());
 }
+
+#[test_log::test]
+fn proxy_logs_never_surface_as_resumable_sessions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-proxy-guard-{}", Uuid::new_v4()));
+    let store = FilesystemSessionStore::new(&state_dir);
+    let meta = PersistedSessionMeta {
+        session_id: "session-mine".to_string(),
+        cwd: state_dir.join("workspace"),
+        additional_directories: Vec::new(),
+        mode: SessionBehavior::Plan,
+        model: "deepseek-v4-pro".to_string(),
+        reasoning_effort: ReasoningEffort::Max,
+        max_tokens: None,
+        mcp_servers: Vec::new(),
+        title: None,
+        updated_at: None,
+    };
+    store.persist_turn(&meta, &[ChatMessage::user("hello")])?;
+
+    // A proxied foreign session, written where the proxy actually writes it:
+    // under the proxy root, not the directory the store enumerates.
+    let proxied = state_dir
+        .join(acp_llm_adapter::paths::PROXY_DIR)
+        .join("sessions")
+        .join("session-someone-elses");
+    std::fs::create_dir_all(&proxied)?;
+    std::fs::write(proxied.join("log.jsonl"), "{\"kind\":\"frame\"}\n")?;
+
+    let listed = store.list_persisted()?;
+
+    assert_eq!(
+        listed.len(),
+        1,
+        "a proxied agent's session is not an adapter session and must not be offered for resume"
+    );
+    assert_eq!(listed[0].session_id, SessionId::new("session-mine"));
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+    Ok(())
+}

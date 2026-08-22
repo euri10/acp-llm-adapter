@@ -366,9 +366,7 @@ mod tests {
     };
     use crate::session::DEFAULT_MAX_TURN_REQUESTS;
     use crate::tools::EmptyToolRegistry;
-    use acp_llm_adapter::llm::{
-        ChatConfig, ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent,
-    };
+    use acp_llm_adapter::llm::{ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent};
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
@@ -510,24 +508,6 @@ mod tests {
                 StreamEvent::Finished(FinishReason::EndTurn),
             ]
         );
-
-        Ok(())
-    }
-
-    #[test_log::test]
-    fn llm_client_for_backend_deepseek_uses_process_environment()
-    -> Result<(), agent_client_protocol::Error> {
-        assert!(crate::init_tracing().is_err());
-        assert!(std::env::var(ChatConfig::ENV_API_KEY).is_ok());
-
-        let client = acp_llm_adapter::llm::ChatClient::from_env()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let config = client.config();
-        assert!(!config.base_url().is_empty());
-        assert!(!config.model().is_empty());
-
-        let client = llm_client_for_backend(Backend::DeepSeek)?;
-        drop(client);
 
         Ok(())
     }

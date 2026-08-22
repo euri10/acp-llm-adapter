@@ -377,8 +377,7 @@ async fn run_prompt_turn(
         .collect::<Vec<_>>();
 
     let mut stop_reason = StopReason::MaxTurnRequests;
-    let mut accumulated_input_tokens: u64 = 0;
-    let mut accumulated_output_tokens: u64 = 0;
+    let mut usage_totals = UsageTotals::default();
 
     for _ in 0..env.max_turn_requests.get() {
         let request_messages = request_messages_for_behavior(env.behavior, &messages);
@@ -394,8 +393,7 @@ async fn run_prompt_turn(
         .await?;
 
         if let Some(ref usage) = turn.usage {
-            accumulated_input_tokens += usage.input_tokens;
-            accumulated_output_tokens += usage.output_tokens;
+            usage_totals.add(usage);
         }
 
         if turn.stop_reason == StopReason::Cancelled {
@@ -466,14 +464,47 @@ async fn run_prompt_turn(
         }
     }
 
-    let acp_usage = (accumulated_input_tokens > 0 || accumulated_output_tokens > 0).then(|| {
-        Usage::new(
-            accumulated_input_tokens + accumulated_output_tokens,
-            accumulated_input_tokens,
-            accumulated_output_tokens,
-        )
-    });
-    Ok(PromptResponse::new(stop_reason).usage(acp_usage))
+    Ok(PromptResponse::new(stop_reason).usage(usage_totals.into_acp_usage()))
+}
+
+/// Accumulates [`UsageData`] across the sub-turns of a single prompt turn.
+#[derive(Default)]
+#[allow(clippy::struct_field_names)]
+struct UsageTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    thought_tokens: Option<u64>,
+    cached_read_tokens: Option<u64>,
+    cached_write_tokens: Option<u64>,
+}
+
+impl UsageTotals {
+    fn add(&mut self, usage: &UsageData) {
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.total_tokens += usage
+            .total_tokens
+            .unwrap_or(usage.input_tokens + usage.output_tokens);
+        if let Some(thought_tokens) = usage.thought_tokens {
+            *self.thought_tokens.get_or_insert(0) += thought_tokens;
+        }
+        if let Some(cached_read_tokens) = usage.cached_read_tokens {
+            *self.cached_read_tokens.get_or_insert(0) += cached_read_tokens;
+        }
+        if let Some(cached_write_tokens) = usage.cached_write_tokens {
+            *self.cached_write_tokens.get_or_insert(0) += cached_write_tokens;
+        }
+    }
+
+    fn into_acp_usage(self) -> Option<Usage> {
+        (self.input_tokens > 0 || self.output_tokens > 0).then(|| {
+            Usage::new(self.total_tokens, self.input_tokens, self.output_tokens)
+                .thought_tokens(self.thought_tokens)
+                .cached_read_tokens(self.cached_read_tokens)
+                .cached_write_tokens(self.cached_write_tokens)
+        })
+    }
 }
 
 fn transition_mode_from_tool_result(
@@ -660,7 +691,9 @@ pub(crate) async fn stream_model_turn(
             };
             usage_data.context_length = window;
         }
-        let used_tokens = usage_data.input_tokens + usage_data.output_tokens;
+        let used_tokens = usage_data
+            .total_tokens
+            .unwrap_or(usage_data.input_tokens + usage_data.output_tokens);
         tracing::debug!(
             used = used_tokens,
             size = usage_data.context_length,
