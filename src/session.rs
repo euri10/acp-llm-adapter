@@ -612,6 +612,7 @@ pub(crate) struct SessionRecord {
 pub(crate) struct SessionStore {
     pub(crate) state: Arc<Mutex<AdapterState>>,
     persistence: Option<FilesystemSessionStore>,
+    logging_enabled: bool,
 }
 
 /// Snapshot of session data needed to begin a prompt turn.
@@ -640,12 +641,19 @@ impl SessionStore {
         Self {
             state,
             persistence: None,
+            logging_enabled: false,
         }
     }
 
     /// Attach filesystem persistence to the session store.
     pub(crate) fn with_persistence(mut self, persistence: FilesystemSessionStore) -> Self {
         self.persistence = Some(persistence);
+        self
+    }
+
+    /// Mark structured serve logging as available for `_meta` log paths.
+    pub(crate) fn with_logging_enabled(mut self, enabled: bool) -> Self {
+        self.logging_enabled = enabled;
         self
     }
 
@@ -685,6 +693,17 @@ impl SessionStore {
             "historyJsonlPath".to_string(),
             serde_json::Value::String(path.to_string_lossy().to_string()),
         );
+        if self.logging_enabled
+            && let Some(log_path) = self
+                .persistence
+                .as_ref()
+                .and_then(|p| p.log_jsonl_path(session_id.0.as_ref()).ok())
+        {
+            meta.insert(
+                "logJsonlPath".to_string(),
+                serde_json::Value::String(log_path.to_string_lossy().to_string()),
+            );
+        }
         Some(meta)
     }
 

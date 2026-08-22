@@ -170,6 +170,8 @@ Tracing spans for prompt turns, tool dispatch, LLM requests, and session lifecyc
 
 When serve logging is enabled, those tracing events are written alongside wire records: session-scoped events go to that session's `log.jsonl`, while unscoped events stay in the connection fallback log. They continue to be emitted to stderr and remain controlled by `RUST_LOG`.
 
+Serve responses expose the absolute session log path as `_meta.logJsonlPath` on `session/new`, `session/load`, `session/resume`, and `session/list`. The field is omitted when structured logging is disabled.
+
 ## Architecture
 
 The adapter bridges two independent channels:

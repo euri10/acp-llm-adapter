@@ -150,6 +150,14 @@ impl FilesystemSessionStore {
         Ok(self.session_dir(session_id)?.join(HISTORY_FILE))
     }
 
+    /// Return the absolute path to the session's structured log file.
+    pub(crate) fn log_jsonl_path(
+        &self,
+        session_id: &str,
+    ) -> Result<PathBuf, SessionPersistenceError> {
+        Ok(self.session_dir(session_id)?.join("log.jsonl"))
+    }
+
     fn session_dir(&self, session_id: &str) -> Result<PathBuf, SessionPersistenceError> {
         validate_session_id(session_id)?;
         Ok(self.state_dir.join(SESSIONS_DIR).join(session_id))

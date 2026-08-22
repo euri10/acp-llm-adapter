@@ -49,7 +49,7 @@ mod turn;
 
 pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
-    WriteTextFileRequester, serve_with_transport,
+    WriteTextFileRequester, serve_with_transport_and_state_dir_logging,
 };
 pub(crate) use dev::{
     Backend, build_dev_agent, exercise_permission_gate_smoke, llm_client_for_backend,
@@ -503,15 +503,18 @@ async fn serve(
     }
 
     let shutdown = CancellationToken::new();
+    let logging_enabled = connection.is_some();
     let transport = stdio_transport_with_eof(shutdown.clone(), connection);
 
     let result = tokio::select! {
-        result = serve_with_transport(
+        result = serve_with_transport_and_state_dir_logging(
             transport,
             state,
             llm_client,
             tool_registry,
             max_turn_requests,
+            None,
+            logging_enabled,
         ) => {
             tracing::info!("ACP serve loop returned");
             result

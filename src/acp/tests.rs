@@ -38,6 +38,7 @@ use agent_client_protocol::schema::v1::{
     ToolKind,
 };
 use agent_client_protocol::{Channel, Client};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -50,6 +51,32 @@ fn test_store() -> SessionStore {
         "deepseek-v4-flash".to_string(),
     ]);
     SessionStore::new(Arc::new(Mutex::new(state)))
+}
+
+fn assert_log_meta(
+    meta: &serde_json::Map<String, serde_json::Value>,
+    session_id: &str,
+) -> Result<(), agent_client_protocol::Error> {
+    let path = meta
+        .get("logJsonlPath")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error()
+                .data("missing or non-string logJsonlPath in _meta")
+        })?;
+    assert!(
+        Path::new(path).is_absolute(),
+        "expected absolute log path: {path}"
+    );
+    assert!(
+        path.ends_with("/log.jsonl"),
+        "expected path to end with /log.jsonl, got: {path}"
+    );
+    assert!(
+        path.contains(session_id),
+        "expected path to contain session id, got: {path}"
+    );
+    Ok(())
 }
 
 fn select_current_value(
@@ -2811,11 +2838,25 @@ fn new_session_without_persistence_omits_meta() -> Result<(), agent_client_proto
 }
 
 #[test]
+fn persistence_without_logging_omits_log_path() -> Result<(), agent_client_protocol::Error> {
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-no-log-meta-{}", Uuid::new_v4()));
+    let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
+        .with_persistence(FilesystemSessionStore::new(&state_dir));
+    let response = handle_new_session_request(&store, &NewSessionRequest::new(&state_dir))?;
+    let meta = response
+        .meta
+        .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing _meta"))?;
+    assert!(!meta.contains_key("logJsonlPath"));
+    Ok(())
+}
+
+#[test]
 fn new_session_with_persistence_includes_history_jsonl_path_in_meta()
 -> Result<(), agent_client_protocol::Error> {
     let state_dir = std::env::temp_dir().join(format!("acp-llm-new-meta-{}", Uuid::new_v4()));
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
-        .with_persistence(FilesystemSessionStore::new(&state_dir));
+        .with_persistence(FilesystemSessionStore::new(&state_dir))
+        .with_logging_enabled(true);
     let response = handle_new_session_request(&store, &NewSessionRequest::new(&state_dir))?;
 
     let meta = response
@@ -2836,6 +2877,7 @@ fn new_session_with_persistence_includes_history_jsonl_path_in_meta()
         path.contains(&state_dir.to_string_lossy().to_string()),
         "expected path to contain state dir, got: {path}"
     );
+    assert_log_meta(&meta, response.session_id.0.as_ref())?;
     Ok(())
 }
 
@@ -2846,7 +2888,8 @@ async fn load_session_response_includes_history_jsonl_path_in_meta()
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
-        .with_persistence(persistence.clone());
+        .with_persistence(persistence.clone())
+        .with_logging_enabled(true);
     let session_id = agent_client_protocol::schema::v1::SessionId::new("session-load-meta");
     persistence
         .persist_turn(
@@ -2892,6 +2935,7 @@ async fn load_session_response_includes_history_jsonl_path_in_meta()
         path.contains(session_id.0.as_ref()),
         "expected path to contain session id, got: {path}"
     );
+    assert_log_meta(&meta, session_id.0.as_ref())?;
     Ok(())
 }
 
@@ -2902,7 +2946,8 @@ async fn resume_session_response_includes_history_jsonl_path_in_meta()
     let workspace = state_dir.join("workspace");
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
-        .with_persistence(persistence.clone());
+        .with_persistence(persistence.clone())
+        .with_logging_enabled(true);
     let session_id = agent_client_protocol::schema::v1::SessionId::new("session-resume-meta");
     persistence
         .persist_turn(
@@ -2947,6 +2992,7 @@ async fn resume_session_response_includes_history_jsonl_path_in_meta()
         path.contains(session_id.0.as_ref()),
         "expected path to contain session id, got: {path}"
     );
+    assert_log_meta(&meta, session_id.0.as_ref())?;
     Ok(())
 }
 
@@ -2956,7 +3002,8 @@ fn list_sessions_with_persistence_includes_history_jsonl_path_in_meta()
     let state_dir = std::env::temp_dir().join(format!("acp-llm-list-meta-{}", Uuid::new_v4()));
     let workspace = state_dir.join("workspace");
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
-        .with_persistence(FilesystemSessionStore::new(&state_dir));
+        .with_persistence(FilesystemSessionStore::new(&state_dir))
+        .with_logging_enabled(true);
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
 
     let response =
@@ -2982,5 +3029,6 @@ fn list_sessions_with_persistence_includes_history_jsonl_path_in_meta()
         path.contains(session.session_id.0.as_ref()),
         "expected path to contain session id, got: {path}"
     );
+    assert_log_meta(meta, session.session_id.0.as_ref())?;
     Ok(())
 }
