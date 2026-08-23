@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4](https://github.com/euri10/acp-llm-adapter/compare/v0.7.3...v0.7.4) - 2026-08-23
+
+### Fixed
+
+- *(deps)* update rust crate sse-reqwest-client to 0.4.0 ([#48](https://github.com/euri10/acp-llm-adapter/pull/48))
+- *(deps)* update rust crate tokio to ^1.53.1 ([#49](https://github.com/euri10/acp-llm-adapter/pull/49))
+- *(deps)* update rust crate serde_json to ^1.0.151 ([#46](https://github.com/euri10/acp-llm-adapter/pull/46))
+- *(deps)* update rust crate tokio-util to ^0.7.19 ([#47](https://github.com/euri10/acp-llm-adapter/pull/47))
+- *(deps)* update rust crate serde to ^1.0.229 ([#44](https://github.com/euri10/acp-llm-adapter/pull/44))
+- *(deps)* update rust crate futures-util to ^0.3.34 ([#43](https://github.com/euri10/acp-llm-adapter/pull/43))
+- *(deps)* reset renovate dependency tracking
+
+### Other
+
+- restore renovate configuration
+- re-enable renovate dashboard
+
 ## [0.7.3](https://github.com/euri10/acp-llm-adapter/compare/v0.7.2...v0.7.3) - 2026-08-22
 
 ### Added
