@@ -57,6 +57,9 @@ pub(super) async fn run_stream_attempt(
             Ok(SseEvent::Error(error)) => {
                 tracing::warn!(error = ?error, events_sent, "SSE stream dropped; reconnecting");
             }
+            Ok(SseEvent::Discarded(error)) => {
+                tracing::warn!(error = ?error, events_sent, "SSE event discarded as oversized");
+            }
             Err(error) => {
                 tracing::error!(error = ?error, events_sent, "terminal SSE stream error");
                 let _ = tx.send(Err(error.into()));

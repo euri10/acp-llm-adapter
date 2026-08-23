@@ -497,16 +497,14 @@ async fn deepseek_client_reports_stream_end_without_finish_reason() -> Result<()
 }
 
 #[test_log::test]
-fn deepseek_error_from_event_source_error_uses_transport_variant() {
-    let error = ChatError::from(sse_reqwest_client::Error::Status(
-        http::StatusCode::BAD_REQUEST,
-    ));
+fn event_source_error_uses_transport_variant() {
+    let error = ChatError::from(sse_reqwest_client::Error::UncloneableRequest);
 
     assert!(matches!(error, ChatError::Transport(_)));
     assert!(
         error
             .to_string()
-            .contains("LLM SSE transport error: unexpected HTTP status code")
+            .contains("LLM SSE transport error: request builder could not be cloned")
     );
 }
 
