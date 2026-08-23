@@ -23,7 +23,7 @@ test-log = { version = "^0.2.21", default-features = false, features = [
 agent-client-protocol = { version = "^1.3.0", features = ["unstable"] }
 blocking = "^1.6.2"
 clap = { version = "^4.6.6", features = ["derive"] }
-futures-util = { version = "^0.3.32", features = ["io", "sink"] }
+futures-util = { version = "^0.3.34", features = ["io", "sink"] }
 globset = "^0.4.20"
 grep = "^0.4.1"
 http = "^1.5.0"
