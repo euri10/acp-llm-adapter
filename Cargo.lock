@@ -2197,9 +2197,9 @@ dependencies = [
 
 [[package]]
 name = "sse-core"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08f6e072756271c661c24b82a16c5edd135c5fc1675453e30d621287cb3e6cca"
+checksum = "28f4c044039e70ba5724b7e9dacf9fb610394773d15df2bb629170ca30391c88"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2211,9 +2211,9 @@ dependencies = [
 
 [[package]]
 name = "sse-reqwest-client"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d1d76f506bf4c354fccc58e516636cb39c2505e62e9609efe2afcf5433b90d"
+checksum = "e925cdfa492d29fc607224c0424d54c577a0d63b300d6de67ac0fd55a291a01a"
 dependencies = [
  "bytes",
  "futures-core",
