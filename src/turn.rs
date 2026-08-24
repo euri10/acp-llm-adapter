@@ -8,8 +8,8 @@ use acp_llm_adapter::llm::{
     deepseek_cost_micros,
 };
 use agent_client_protocol::schema::v1::{
-    ConfigOptionUpdate, ContentChunk, Cost, Diff, MessageId, Plan, PromptRequest, PromptResponse,
-    SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
+    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, Diff, MessageId, Plan, PromptRequest,
+    PromptResponse, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
 };
@@ -302,6 +302,7 @@ pub(crate) async fn handle_prompt_request(
     max_turn_requests: NonZeroUsize,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, AdapterError> {
+    let request_title = prompt_title(&request.prompt);
     let user_text = text_from_prompt(&request.prompt)?;
     let user_message = ChatMessage::user(user_text.clone());
     let session_id = request.session_id.clone();
@@ -311,6 +312,7 @@ pub(crate) async fn handle_prompt_request(
         &request.session_id,
         cancellation_token.clone(),
         user_message,
+        request_title,
     )?;
 
     let result = async {
@@ -367,6 +369,15 @@ pub(crate) async fn handle_prompt_request(
             Err(error)
         }
     }
+}
+
+fn prompt_title(prompt: &[ContentBlock]) -> Option<&str> {
+    prompt.iter().rev().find_map(|block| {
+        let ContentBlock::Text(text) = block else {
+            return None;
+        };
+        (!text.text.trim().is_empty()).then_some(text.text.as_str())
+    })
 }
 
 async fn run_prompt_turn(

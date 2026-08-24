@@ -31,7 +31,7 @@ use agent_client_protocol::schema::v1::{
     ClientCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest,
     FileSystemCapabilities, Implementation, InitializeRequest, ListSessionsRequest,
     LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
+    RequestPermissionOutcome, RequestPermissionResponse, ResourceLink, ResumeSessionRequest,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigSelectOptions, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, ToolCallContent, ToolCallStatus,
@@ -230,6 +230,42 @@ async fn prompt_request_empty_prompt_is_invalid_params() -> Result<(), agent_cli
             .contains("prompt must include non-empty text")
     );
     assert!(!error.to_string().contains("internal error"));
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn prompt_uses_final_text_block_for_session_title() -> Result<(), agent_client_protocol::Error>
+{
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    let user_request = "Fix the session title shown in the resume picker";
+    let prompt = vec![
+        ContentBlock::from("Opaque client-provided context that is not the user request"),
+        ContentBlock::ResourceLink(ResourceLink::new("AGENTS.md", "file:///tmp/AGENTS.md")),
+        ContentBlock::from(user_request),
+    ];
+
+    handle_prompt_request(
+        &store,
+        &MockLlmClient,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(session.session_id.clone(), prompt),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+
+    let response = handle_list_sessions_request(&store, &ListSessionsRequest::new())?;
+    let listed = response
+        .sessions
+        .iter()
+        .find(|info| info.session_id == session.session_id)
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing listed session")
+        })?;
+    assert_eq!(listed.title.as_deref(), Some(user_request));
 
     Ok(())
 }

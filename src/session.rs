@@ -553,30 +553,31 @@ pub(crate) use acp_llm_adapter::timestamp::iso_timestamp_now;
 /// Returns the first user message's content truncated to 80 characters, or
 /// `"New session"` if no user message is found.
 pub(crate) fn derive_session_title(history: &[ChatMessage]) -> String {
-    const MAX_TITLE_LEN: usize = 80;
-
     history
         .iter()
         .find(|msg| msg.role() == MessageRole::User)
         .map_or_else(
             || "New session".to_string(),
-            |msg| {
-                let text: String = msg
-                    .content()
-                    .chars()
-                    .map(|c| if c == '\n' { ' ' } else { c })
-                    .collect();
-                let trimmed = text.trim();
-                if trimmed.chars().count() <= MAX_TITLE_LEN {
-                    trimmed.to_string()
-                } else {
-                    format!(
-                        "{}…",
-                        trimmed.chars().take(MAX_TITLE_LEN).collect::<String>()
-                    )
-                }
-            },
+            |msg| format_session_title(msg.content()),
         )
+}
+
+fn format_session_title(content: &str) -> String {
+    const MAX_TITLE_LEN: usize = 80;
+
+    let text: String = content
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX_TITLE_LEN {
+        trimmed.to_string()
+    } else {
+        format!(
+            "{}…",
+            trimmed.chars().take(MAX_TITLE_LEN).collect::<String>()
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -1050,6 +1051,7 @@ impl SessionStore {
         session_id: &SessionId,
         token: CancellationToken,
         user_message: ChatMessage,
+        prompt_title: Option<&str>,
     ) -> Result<TurnSetup, AdapterError> {
         let mut guard = self
             .state
@@ -1071,15 +1073,18 @@ impl SessionStore {
         // Bump the last-activity timestamp on every prompt turn.
         session.updated_at = iso_timestamp_now();
 
-        // Derive title from the first user message if not yet set.
-        // We check the history + this turn's user message together, because
-        // on the very first turn the history is empty and the current prompt
-        // is the only user message available.
+        // Derive the title once from ACP text-block structure when available,
+        // falling back to the flattened message when no text block is present.
         let title_changed = session.title.is_empty();
         if title_changed {
-            let mut candidate_messages = session.history.clone();
-            candidate_messages.push(user_message.clone());
-            session.title = derive_session_title(&candidate_messages);
+            session.title = prompt_title.map_or_else(
+                || {
+                    let mut candidate_messages = session.history.clone();
+                    candidate_messages.push(user_message.clone());
+                    derive_session_title(&candidate_messages)
+                },
+                format_session_title,
+            );
         }
 
         let mut messages = session.history.clone();
