@@ -23,6 +23,9 @@ last-touched
 # Schema-migration vacuum sidecars
 .beads.db.schema-migration-*.vacuum-*
 
+# SQLite migration state (local-only)
+beads.db.fsqlite-migration-state
+
 # Sync state (local-only, per-machine)
 .sync.lock
 sync_base.jsonl
