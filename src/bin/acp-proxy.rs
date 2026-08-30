@@ -28,7 +28,6 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use acp_llm_adapter::paths::default_proxy_log_root;
 use acp_llm_adapter::proxy::{DEFAULT_QUEUE_CAPACITY, ProxyConfig, run};
@@ -61,38 +60,56 @@ struct Cli {
     command: Vec<OsString>,
 }
 
+// This deliberately never returns: see `exit` below for why.
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() -> ! {
     let cli = Cli::parse();
 
     let Some((program, args)) = cli.command.split_first() else {
         eprintln!("acp-proxy: no agent command given");
-        return ExitCode::from(2);
+        exit(2);
     };
 
     let Some(log_root) = cli.log_root.or_else(default_proxy_log_root) else {
         eprintln!("acp-proxy: neither XDG_STATE_HOME nor HOME is set; pass --log-root");
-        return ExitCode::from(2);
+        exit(2);
     };
 
     let mut config = ProxyConfig::new(program.clone(), args.to_vec(), log_root);
     config.queue_capacity = cli.queue_capacity;
 
     match run(config).await {
-        Ok(code) => exit_code(code),
+        Ok(code) => exit(narrow_exit_code(code)),
         Err(error) => {
             eprintln!("acp-proxy: {error}");
-            ExitCode::from(1)
+            exit(1)
         }
     }
 }
 
 /// Narrow an agent's exit code onto the range a process can actually report.
-fn exit_code(code: i32) -> ExitCode {
+fn narrow_exit_code(code: i32) -> i32 {
     match u8::try_from(code) {
-        Ok(code) => ExitCode::from(code),
+        Ok(code) => i32::from(code),
         // A code outside 0..=255 cannot be reported faithfully; anything
         // non-zero still has to read as failure.
-        Err(_) => ExitCode::from(1),
+        Err(_) => 1,
     }
+}
+
+/// Terminate the process immediately, without waiting on the async runtime.
+///
+/// Returning an `ExitCode` from `main` instead would drop the tokio
+/// `Runtime`, which blocks until every outstanding blocking-pool task
+/// finishes. The stdin-forwarding task can be stuck in a blocking read on
+/// this process's own stdin (e.g. a client holding a pipe open) with no way
+/// to cancel it, so that drop would hang forever even after the wrapped
+/// agent has exited. `std::process::exit` skips destructors entirely and
+/// ends the process outright.
+// The workspace denies `clippy::exit` because calling it from library code
+// terminates the host process out from under the caller. This is the `main`
+// of a standalone binary, the one place that call is the point.
+#[allow(clippy::exit)]
+fn exit(code: i32) -> ! {
+    std::process::exit(code)
 }

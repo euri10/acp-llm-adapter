@@ -31,6 +31,8 @@ const FIXTURE_ENV: &str = "ACP_LLM_ADAPTER_RUN_PROXY_FIXTURE";
 const FIXTURE_EXIT_ENV: &str = "ACP_LLM_ADAPTER_PROXY_FIXTURE_EXIT";
 /// Session id the fake agent should report from `session/new`.
 const FIXTURE_SESSION_ENV: &str = "ACP_LLM_ADAPTER_PROXY_FIXTURE_SESSION";
+/// Set to make the fake agent exit before ever reading stdin.
+const FIXTURE_EXIT_IMMEDIATELY_ENV: &str = "ACP_LLM_ADAPTER_PROXY_FIXTURE_EXIT_IMMEDIATELY";
 
 /// A `session/new` exchange, as a client would send it.
 const SESSION_NEW: &str =
@@ -420,6 +422,62 @@ fn a_hostile_session_id_cannot_choose_where_we_write() {
     assert!(
         !connection_records(root.path()).is_empty(),
         "the frames are still logged, just not where the agent asked"
+    );
+}
+
+// ── wrapped agent dying before the handshake ────────────────
+
+#[test]
+fn proxy_exits_when_the_wrapped_agent_dies_before_the_handshake() {
+    // Regression test for daa-yrsj: the proxy hung forever once the wrapped
+    // agent exited without ever speaking ACP, as long as the proxy's own
+    // stdin stayed open — exactly what a real client connecting over a pipe
+    // does. Closing the test's stdin handle immediately would not have
+    // reproduced the hang, so it is deliberately kept open here.
+    let root = TempRoot::new("dies-before-handshake");
+    let proxy = proxy_binary();
+    let fixture = fixture_binary();
+
+    let mut child = match Command::new(&proxy)
+        .arg("--log-root")
+        .arg(root.path())
+        .arg("--")
+        .arg(&fixture)
+        .env(FIXTURE_ENV, "1")
+        .env(FIXTURE_EXIT_ENV, "1")
+        .env(FIXTURE_EXIT_IMMEDIATELY_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => unreachable!("failed to spawn {}: {error}", proxy.display()),
+    };
+
+    // Held for the whole test, never written to or dropped: this is what
+    // keeps the proxy's stdin open the way a live client connection would.
+    let _stdin = child.stdin.take();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "acp-proxy did not exit within 10s of its wrapped agent dying"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => unreachable!("failed to wait for proxy: {error}"),
+        }
+    };
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the wrapped agent's own exit status must reach the client"
     );
 }
 

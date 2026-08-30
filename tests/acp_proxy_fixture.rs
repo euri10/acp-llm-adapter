@@ -27,6 +27,11 @@ const RUN_FIXTURE_ENV: &str = "ACP_LLM_ADAPTER_RUN_PROXY_FIXTURE";
 const FIXTURE_EXIT_ENV: &str = "ACP_LLM_ADAPTER_PROXY_FIXTURE_EXIT";
 /// Session id the fixture reports from `session/new`.
 const FIXTURE_SESSION_ENV: &str = "ACP_LLM_ADAPTER_PROXY_FIXTURE_SESSION";
+/// Set to make the fixture exit immediately, before reading any stdin.
+///
+/// Simulates a wrapped agent that dies before ever speaking ACP, such as an
+/// npm-installed CLI whose postinstall step never ran.
+const FIXTURE_EXIT_IMMEDIATELY_ENV: &str = "ACP_LLM_ADAPTER_PROXY_FIXTURE_EXIT_IMMEDIATELY";
 
 /// Default session id, shaped like the ones real agents return.
 const DEFAULT_SESSION_ID: &str = "session-fixture-0001";
@@ -61,6 +66,12 @@ fn main() {
     let _ = writeln!(stderr, "fixture: started");
     let _ = stderr.flush();
 
+    if std::env::var_os(FIXTURE_EXIT_IMMEDIATELY_ENV).is_some() {
+        let _ = writeln!(stderr, "fixture: exiting before reading any stdin");
+        let _ = stderr.flush();
+        std::process::exit(exit_code());
+    }
+
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -93,9 +104,13 @@ fn main() {
         let _ = stderr.flush();
     }
 
-    let code = std::env::var(FIXTURE_EXIT_ENV)
+    std::process::exit(exit_code());
+}
+
+/// Exit code this run should terminate with.
+fn exit_code() -> i32 {
+    std::env::var(FIXTURE_EXIT_ENV)
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(0);
-    std::process::exit(code);
+        .unwrap_or(0)
 }
