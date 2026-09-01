@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::{
     ConnectionLog, Direction, ENV_UNREDACTED, KIND_FRAME, KIND_SESSION_BOUND, LogRecord, LogSink,
-    LogSinkError, LogWriter, RetentionPolicy, redaction_enabled_fn,
+    LogSinkError, LogWriter, Override, RetentionPolicy, parse_override, redaction_enabled_fn,
 };
 
 /// A temp root that removes itself, so tests do not litter the state directory.
@@ -403,8 +403,8 @@ fn retention_bounds_apply_on_startup_and_preserve_session_artifacts() {
     }
 
     let policy = RetentionPolicy {
-        max_bytes: u64::MAX,
-        max_age: Duration::ZERO,
+        max_bytes: Some(u64::MAX),
+        max_age: Some(Duration::ZERO),
     };
     let (sink, writer) = LogSink::channel_with_policy(root.path(), 4, policy);
     drain_writer(sink, writer);
@@ -425,8 +425,8 @@ fn retention_bounds_apply_on_startup_and_preserve_session_artifacts() {
 fn size_bound_is_rechecked_after_a_restart() {
     let root = TempRoot::new("size-restart");
     let policy = RetentionPolicy {
-        max_bytes: 1,
-        max_age: Duration::from_hours(30 * 24),
+        max_bytes: Some(1),
+        max_age: Some(Duration::from_hours(30 * 24)),
     };
     let (sink, writer) = LogSink::channel_with_policy(root.path(), 4, policy);
     let connection = open(&sink, "conn-size");
@@ -444,7 +444,74 @@ fn size_bound_is_rechecked_after_a_restart() {
         .iter()
         .map(|directory| directory_size(&root.path().join(directory)))
         .sum::<u64>();
-    assert!(total <= policy.max_bytes);
+    assert!(Some(total) <= policy.max_bytes);
+}
+
+#[test]
+fn an_unlimited_size_bound_keeps_every_log() {
+    let root = TempRoot::new("size-unlimited");
+    let policy = RetentionPolicy {
+        max_bytes: None,
+        max_age: Some(Duration::from_hours(30 * 24)),
+    };
+    let (sink, writer) = LogSink::channel_with_policy(root.path(), 4, policy);
+    let connection = open(&sink, "conn-unbounded");
+    for _ in 0..16 {
+        connection.log(LogRecord::text(
+            Direction::Internal,
+            "large-record",
+            "a record far larger than any byte bound would allow",
+        ));
+    }
+    drain(sink, connection, writer);
+
+    let total = ["connections", "sessions"]
+        .iter()
+        .map(|directory| directory_size(&root.path().join(directory)))
+        .sum::<u64>();
+    assert!(
+        total > 0,
+        "an unlimited size bound must not remove the log it just wrote"
+    );
+    assert!(
+        root.path()
+            .join("connections/conn-unbounded.jsonl")
+            .exists(),
+        "no log may be evicted when the size bound is unlimited"
+    );
+}
+
+#[test]
+fn an_unlimited_age_bound_keeps_an_ancient_log() {
+    let root = TempRoot::new("age-unlimited");
+    let ancient = root.path().join("connections/ancient.jsonl");
+    if let Some(parent) = ancient.parent() {
+        fs::create_dir_all(parent).unwrap_or_default();
+    }
+    fs::write(&ancient, "seed").unwrap_or_default();
+
+    let policy = RetentionPolicy {
+        max_bytes: Some(u64::MAX),
+        max_age: None,
+    };
+    let (sink, writer) = LogSink::channel_with_policy(root.path(), 4, policy);
+    drain_writer(sink, writer);
+
+    assert!(
+        ancient.exists(),
+        "no log may be evicted when the age bound is unlimited"
+    );
+}
+
+#[test]
+fn retention_overrides_parse_unlimited_values_and_positive_bounds() {
+    assert_eq!(parse_override("unlimited"), Override::Unlimited);
+    assert_eq!(parse_override("UNLIMITED"), Override::Unlimited);
+    assert_eq!(parse_override(" unlimited "), Override::Unlimited);
+    assert_eq!(parse_override("1024"), Override::Value(1024));
+    assert_eq!(parse_override("0"), Override::Invalid);
+    assert_eq!(parse_override("banana"), Override::Invalid);
+    assert_eq!(parse_override(""), Override::Invalid);
 }
 
 fn directory_size(path: &Path) -> u64 {

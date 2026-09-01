@@ -75,20 +75,58 @@ pub const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 
 /// Retention bounds applied to log files only.
+///
+/// `None` on either field means that bound is unlimited and the corresponding
+/// eviction pass is skipped entirely. Both unlimited means no log is ever
+/// removed, which is the correct setting when the logs are primary evidence
+/// for filed defects rather than incidental debugging output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
-    /// Maximum combined size of all connection and session log files.
-    pub max_bytes: u64,
-    /// Maximum age of a log file before it is removed.
-    pub max_age: Duration,
+    /// Maximum combined size of all connection and session log files, or
+    /// `None` for no size bound.
+    pub max_bytes: Option<u64>,
+    /// Maximum age of a log file before it is removed, or `None` for no age
+    /// bound.
+    pub max_age: Option<Duration>,
 }
 
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            max_bytes: DEFAULT_MAX_BYTES,
-            max_age: DEFAULT_MAX_AGE,
+            max_bytes: Some(DEFAULT_MAX_BYTES),
+            max_age: Some(DEFAULT_MAX_AGE),
         }
+    }
+}
+
+/// How one retention override string was interpreted.
+///
+/// Kept separate from environment access so the parsing rules are testable
+/// without mutating process state, which would race across parallel tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Override {
+    /// The bound is disabled; nothing is evicted on this axis.
+    Unlimited,
+    /// The bound is set to this positive value.
+    Value(u64),
+    /// The value could not be used, so the documented default applies.
+    Invalid,
+}
+
+/// Interpret one retention override value.
+///
+/// `unlimited` (any case, surrounding whitespace ignored) disables the bound.
+/// A positive integer sets it. Everything else -- including `0`, which reads as
+/// "keep nothing" as easily as "keep everything" -- is rejected so an operator
+/// never silently gets a bound they did not intend.
+pub(crate) fn parse_override(raw: &str) -> Override {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("unlimited") {
+        return Override::Unlimited;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(value) if value > 0 => Override::Value(value),
+        _ => Override::Invalid,
     }
 }
 
@@ -98,19 +136,23 @@ impl RetentionPolicy {
     #[must_use]
     pub fn from_env() -> Self {
         let defaults = Self::default();
-        let max_bytes = std::env::var(ENV_MAX_BYTES)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(defaults.max_bytes);
-        let max_age_days = std::env::var(ENV_MAX_AGE_DAYS)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value: &u64| *value > 0)
-            .unwrap_or(defaults.max_age.as_secs() / (24 * 60 * 60));
-        let max_age = max_age_days
-            .checked_mul(24 * 60 * 60)
-            .map_or(defaults.max_age, Duration::from_secs);
+        let max_bytes = match std::env::var(ENV_MAX_BYTES).as_deref().map(parse_override) {
+            Ok(Override::Unlimited) => None,
+            Ok(Override::Value(value)) => Some(value),
+            Ok(Override::Invalid) | Err(_) => defaults.max_bytes,
+        };
+        let max_age = match std::env::var(ENV_MAX_AGE_DAYS)
+            .as_deref()
+            .map(parse_override)
+        {
+            Ok(Override::Unlimited) => None,
+            // A day count large enough to overflow seconds is unusable as a
+            // bound; fall back rather than silently wrapping to a short one.
+            Ok(Override::Value(days)) => days
+                .checked_mul(24 * 60 * 60)
+                .map_or(defaults.max_age, |secs| Some(Duration::from_secs(secs))),
+            Ok(Override::Invalid) | Err(_) => defaults.max_age,
+        };
 
         Self { max_bytes, max_age }
     }
@@ -500,19 +542,22 @@ impl LogWriter {
     }
 
     fn prune(&mut self) -> Result<(), LogSinkError> {
-        let now = SystemTime::now();
-        let cutoff = now.checked_sub(self.policy.max_age).unwrap_or(UNIX_EPOCH);
-        let mut files = self.log_files()?;
-
-        for file in files.iter().filter(|file| file.modified < cutoff) {
-            self.remove_log_file(&file.path)?;
+        if let Some(max_age) = self.policy.max_age {
+            let now = SystemTime::now();
+            let cutoff = now.checked_sub(max_age).unwrap_or(UNIX_EPOCH);
+            for file in self.log_files()?.iter().filter(|f| f.modified < cutoff) {
+                self.remove_log_file(&file.path)?;
+            }
         }
 
-        files = self.log_files()?;
+        let Some(max_bytes) = self.policy.max_bytes else {
+            return Ok(());
+        };
+        let mut files = self.log_files()?;
         let mut total = files.iter().map(|file| file.size).sum::<u64>();
         files.sort_by_key(|file| file.modified);
         for file in files {
-            if total <= self.policy.max_bytes {
+            if total <= max_bytes {
                 break;
             }
             total = total.saturating_sub(file.size);
