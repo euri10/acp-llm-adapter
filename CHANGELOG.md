@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5](https://github.com/euri10/acp-llm-adapter/compare/v0.7.4...v0.7.5) - 2026-09-03
+
+### Added
+
+- *(logsink)* allow retention bounds to be disabled
+
+### Fixed
+
+- *(beads)* untrack fsqlite namespace sidecars that gate every DB open
+- acp-proxy hangs when its stdin stays open past the wrapped agent's exit (daa-yrsj)
+- derive title from final text (daa-eobg)
+- *(deps)* update rust crate uuid to ^1.26.0 ([#54](https://github.com/euri10/acp-llm-adapter/pull/54))
+- *(deps)* update rust crate blocking to ^1.7.0 ([#52](https://github.com/euri10/acp-llm-adapter/pull/52))
+
+### Other
+
+- *(beads)* close daa-86y9, moved to louiselm-l9w7
+- *(beads)* record AGENTS design question
+
 ## [0.7.4](https://github.com/euri10/acp-llm-adapter/compare/v0.7.3...v0.7.4) - 2026-08-23
 
 ### Fixed
