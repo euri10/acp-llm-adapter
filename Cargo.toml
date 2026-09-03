@@ -1,6 +1,6 @@
 [package]
 name = "acp-llm-adapter"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
 rust-version = "1.95"
 description = "ACP adapter server that exposes LLM providers (DeepSeek, GLM) as agents to ACP-capable editors"
