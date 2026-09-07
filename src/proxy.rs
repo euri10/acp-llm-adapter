@@ -32,6 +32,8 @@ use uuid::Uuid;
 
 use crate::logsink::{ConnectionLog, Direction, KIND_FRAME, LogRecord, LogSink, LogSinkError};
 
+mod lifecycle;
+
 /// Record kind for a line the wrapped agent wrote to stderr.
 pub const KIND_STDERR: &str = "stderr";
 /// Record kind emitted once the wrapped agent has exited.
@@ -115,12 +117,18 @@ impl ProxyConfig {
 /// The proxy exits with the wrapped agent's own status: its exit code, or
 /// `128 + signal` when it was killed by a signal.
 ///
+/// Run only in a dedicated proxy process that owns no unrelated children. On
+/// Linux this installs parent-death notification and makes the process a child
+/// subreaper so detached Agent descendants can be terminated and reaped.
+///
 /// # Errors
 ///
 /// Returns [`ProxyError::Spawn`] if the agent cannot be started,
 /// [`ProxyError::MissingStream`] if it exposes no stdio, and
-/// [`ProxyError::LogSink`] if logging cannot be set up.
+/// [`ProxyError::LogSink`] if logging cannot be set up. [`ProxyError::Io`]
+/// reports lifecycle setup, forwarding, or cleanup failures.
 pub async fn run(config: ProxyConfig) -> Result<i32, ProxyError> {
+    let mut lifetime = lifecycle::Lifetime::new()?;
     let sink = LogSink::spawn(&config.log_root, config.queue_capacity)?;
     let connection = sink.connection(config.connection_id.clone())?;
 
@@ -137,18 +145,23 @@ pub async fn run(config: ProxyConfig) -> Result<i32, ProxyError> {
         }),
     ));
 
-    let result = pump_child(&config, &connection).await;
+    let result = pump_child(&config, &connection, &mut lifetime).await;
     sink.flush();
     result
 }
 
 /// Spawn the agent, forward its streams, and wait for it to exit.
-async fn pump_child(config: &ProxyConfig, connection: &ConnectionLog) -> Result<i32, ProxyError> {
+async fn pump_child(
+    config: &ProxyConfig,
+    connection: &ConnectionLog,
+    lifetime: &mut lifecycle::Lifetime,
+) -> Result<i32, ProxyError> {
     let mut child = Command::new(&config.program)
         .args(&config.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|source| ProxyError::Spawn {
             program: config.program.to_string_lossy().into_owned(),
@@ -175,7 +188,7 @@ async fn pump_child(config: &ProxyConfig, connection: &ConnectionLog) -> Result<
 
     // Client to agent. This one may never finish on its own — a client can hold
     // stdin open for the life of the session — so it is not awaited below.
-    let upstream = tokio::spawn({
+    let mut upstream = tokio::spawn({
         let tracker = tracker.clone();
         pump(
             tokio::io::stdin(),
@@ -185,9 +198,8 @@ async fn pump_child(config: &ProxyConfig, connection: &ConnectionLog) -> Result<
         )
     });
 
-    // Agent to client, and the agent's diagnostics. Both end at EOF, which the
-    // agent's exit guarantees.
-    let downstream = tokio::spawn({
+    // Descendants can inherit these pipes; reclaim them before draining EOF.
+    let mut downstream = tokio::spawn({
         let tracker = tracker.clone();
         pump(
             child_stdout,
@@ -196,54 +208,45 @@ async fn pump_child(config: &ProxyConfig, connection: &ConnectionLog) -> Result<
             move |line| tracker.record_for_frame(Direction::AgentToClient, line),
         )
     });
-    let diagnostics = tokio::spawn(pump(
+    let mut diagnostics = tokio::spawn(pump(
         child_stderr,
         tokio::io::stderr(),
         connection.clone(),
         |line| record_for(Direction::Internal, KIND_STDERR, line),
     ));
 
-    let status = wait_for_child(&mut child).await?;
+    let status = lifetime.wait(&mut child, &mut upstream).await;
+    // Even a forwarding or wait error must pass through descendant cleanup.
+    let stopped = if status.is_err() {
+        child.kill().await
+    } else {
+        Ok(())
+    };
+    let reclaimed = lifetime.reclaim().await;
 
-    // Drain what the agent wrote before exiting, then stop forwarding stdin.
-    let _ = downstream.await;
-    let _ = diagnostics.await;
+    // A disconnected client may no longer drain stdout. Do not let that keep
+    // the proxy alive after its entire Agent tree has been reclaimed.
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        (&mut downstream).await.map_err(std::io::Error::other)??;
+        (&mut diagnostics).await.map_err(std::io::Error::other)??;
+        Ok::<_, std::io::Error>(())
+    })
+    .await;
     upstream.abort();
+    downstream.abort();
+    diagnostics.abort();
 
-    let code = exit_code(status);
+    stopped?;
+    reclaimed?;
+    let code = exit_code(status?);
     connection.log(LogRecord::new(
         Direction::Internal,
         KIND_EXIT,
         serde_json::json!({ "code": code }),
     ));
 
+    drained.map_err(std::io::Error::other)??;
     Ok(code)
-}
-
-/// Wait for the agent, terminating it if this process is asked to stop.
-#[cfg(unix)]
-async fn wait_for_child(child: &mut tokio::process::Child) -> Result<ExitStatus, ProxyError> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-
-    loop {
-        tokio::select! {
-            status = child.wait() => return Ok(status?),
-            // Without a libc dependency the original signal cannot be relayed,
-            // so a termination request escalates to a kill. The agent's status
-            // still reaches the client, which is the property that matters.
-            _ = interrupt.recv() => { let _ = child.start_kill(); }
-            _ = terminate.recv() => { let _ = child.start_kill(); }
-        }
-    }
-}
-
-/// Wait for the agent.
-#[cfg(not(unix))]
-async fn wait_for_child(child: &mut tokio::process::Child) -> Result<ExitStatus, ProxyError> {
-    Ok(child.wait().await?)
 }
 
 /// Forward every byte from `reader` to `writer`, logging a copy as lines.

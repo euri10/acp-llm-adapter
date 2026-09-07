@@ -55,6 +55,15 @@ fn session_new_id(line: &str) -> Option<String> {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("ACP_PROXY_TREE_ROLE").is_some() {
+        if let Err(error) = tree_fixture() {
+            eprintln!("tree fixture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if std::env::var_os(RUN_FIXTURE_ENV).is_none() {
         return;
     }
@@ -113,4 +122,70 @@ fn exit_code() -> i32 {
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(0)
+}
+
+/// Deliberately uncooperative descendants, including a new Unix session.
+#[cfg(target_os = "linux")]
+fn tree_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::{Command, Stdio};
+
+    let role = std::env::var("ACP_PROXY_TREE_ROLE")?;
+    let record = |name: &str, pid: u32| -> std::io::Result<()> {
+        let path = std::env::var_os("ACP_PROXY_TREE_PIDS")
+            .ok_or_else(|| std::io::Error::other("missing pid path"))?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+            .write_all(format!("{name} {pid}\n").as_bytes())
+    };
+    record(&role, std::process::id())?;
+    if role == "client" {
+        let proxy = std::env::args_os().nth(1).ok_or("missing proxy")?;
+        let mut child = Command::new(proxy)
+            .args(["--log-root"])
+            .arg(std::env::var_os("ACP_PROXY_TREE_LOGS").ok_or("missing log path")?)
+            .arg("--")
+            .arg(std::env::current_exe()?)
+            .env("ACP_PROXY_TREE_ROLE", "agent")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        record("proxy", child.id())?;
+        let mut stdin = child.stdin.take();
+        let mut holder = if std::env::var_os("ACP_PROXY_TREE_HOLD_STDIN").is_some() {
+            let process = Command::new("sleep")
+                .arg("120")
+                .stdin(stdin.take().ok_or("missing proxy stdin")?)
+                .spawn()?;
+            record("holder", process.id())?;
+            Some(process)
+        } else {
+            None
+        };
+        // The test kills this client while its pipe remains open.
+        child.wait()?;
+        if let Some(process) = holder.as_mut() {
+            process.kill()?;
+            process.wait()?;
+        }
+    } else if role == "agent" {
+        let mut child = Command::new("setsid")
+            .arg(std::env::current_exe()?)
+            .env("ACP_PROXY_TREE_ROLE", "worker")
+            .spawn()?;
+        child.wait()?;
+    } else if role == "worker" {
+        let mut child = Command::new(std::env::current_exe()?)
+            .env("ACP_PROXY_TREE_ROLE", "leaf")
+            .spawn()?;
+        child.wait()?;
+    } else {
+        // Never read stdin: EOF alone cannot dispose this process tree.
+        loop {
+            std::thread::park();
+        }
+    }
+    Ok(())
 }

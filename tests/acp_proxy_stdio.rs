@@ -493,3 +493,6 @@ fn malformed_frames_do_not_stop_the_sniffer() {
         "a session created after a malformed line is still detected"
     );
 }
+
+#[cfg(target_os = "linux")]
+mod lifecycle;

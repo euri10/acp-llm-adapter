@@ -17,6 +17,7 @@ dependencies = [
  "ignore",
  "reqwest",
  "rmcp",
+ "rustix",
  "serde",
  "serde_json",
  "sse-reqwest-client",

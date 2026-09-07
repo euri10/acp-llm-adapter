@@ -162,6 +162,14 @@ The two binaries provide adapter-owned logging without a shell wrapper:
 - `acp-llm-adapter serve --backend <backend>` writes both ACP wire records and internal tracing events for the adapter. Set `ACP_LOG=1` to enable structured logging. Session records are written to `$XDG_STATE_HOME/acp-llm-adapter/sessions/<session-id>/log.jsonl` (or `~/.local/state/acp-llm-adapter/sessions/<session-id>/log.jsonl` when `XDG_STATE_HOME` is unset); records before a session exists use `connections/<connection-id>.jsonl`.
 - `acp-proxy -- <agent> [args...]` records both directions of a foreign ACP agent's traffic and its stderr. Proxy logs use the separate `.../acp-llm-adapter/proxy/` root, with the same `connections/` and `sessions/` layout. This keeps foreign sessions out of the adapter's session store.
 
+On Linux, the proxy watches its parent's death and adopts orphaned Agent
+descendants. Client exit, proxy SIGTERM/SIGINT, or Agent exit terminates and reaps
+the remaining tree, including descendants that create their own Unix sessions.
+Client stdin EOF allows one second for graceful Agent exit before forced cleanup;
+output draining is also bounded. This requires readable `/proc/self/task`.
+It does not protect against SIGKILL of the proxy itself or provide hostile-process
+containment. Other platforms retain direct-child cleanup only.
+
 > [!IMPORTANT]
 > The `--` before the agent command is mandatory: everything after it is
 > forwarded verbatim, while anything before it is parsed as an `acp-proxy`
