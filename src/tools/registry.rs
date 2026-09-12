@@ -172,6 +172,7 @@ impl ToolRegistry for AdapterToolRegistry {
                         context,
                         connection.map(|requester| requester as &dyn crate::PermissionRequester),
                         connection.map(|requester| requester as &dyn crate::TerminalRequester),
+                        connection.map(|requester| requester as &dyn crate::ToolProgressReporter),
                         &cancellation_token,
                     )
                     .await
@@ -320,6 +321,18 @@ mod tests {
                     )),
                 ))
             })
+        }
+    }
+
+    impl crate::ToolProgressReporter for RecordingToolCallRequester {
+        fn report_in_progress(
+            &self,
+            _session_id: &agent_client_protocol::schema::v1::SessionId,
+            _tool_call_id: &str,
+        ) {
+            // Progress is a notification with no reply, so there is nothing for
+            // these tests to observe. tests/serve_tool_calls.rs asserts it over
+            // the wire, where a client can actually see it.
         }
     }
 

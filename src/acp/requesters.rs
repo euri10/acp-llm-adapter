@@ -6,8 +6,9 @@
 use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionRequest, RequestPermissionResponse, TerminalOutputRequest,
-    TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
+    SessionUpdate, TerminalOutputRequest, TerminalOutputResponse, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
     WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, Client};
@@ -99,8 +100,41 @@ impl TerminalRequester for agent_client_protocol::ConnectionTo<Client> {
     }
 }
 
+/// Reports that a tool call has stopped waiting and started working.
+///
+/// Unlike its sibling traits this sends a notification rather than asking the
+/// client for anything, because the fact it conveys is one only the tool knows:
+/// a call announced as `Pending` sits that way through the permission
+/// round-trip, and the moment it stops waiting is inside the tool, after the
+/// user has approved it. Reporting progress from the turn loop instead would
+/// claim the work had started while the adapter was still blocked on the
+/// approval dialog (daa-reep).
+pub(crate) trait ToolProgressReporter: Send + Sync {
+    /// Tell the client that `tool_call_id` is running now.
+    fn report_in_progress(&self, session_id: &SessionId, tool_call_id: &str);
+}
+
+impl ToolProgressReporter for agent_client_protocol::ConnectionTo<Client> {
+    fn report_in_progress(&self, session_id: &SessionId, tool_call_id: &str) {
+        // Best effort. A client that has gone away will fail the tool call's
+        // own notifications too, and the turn reports that; failing the command
+        // because a progress hint did not land would be the wrong trade.
+        let _ = self.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                tool_call_id.to_string(),
+                ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+            )),
+        ));
+    }
+}
+
 pub(crate) trait ToolCallRequester:
-    ReadTextFileRequester + WriteTextFileRequester + PermissionRequester + TerminalRequester
+    ReadTextFileRequester
+    + WriteTextFileRequester
+    + PermissionRequester
+    + TerminalRequester
+    + ToolProgressReporter
 {
 }
 
@@ -109,6 +143,7 @@ impl<T> ToolCallRequester for T where
         + WriteTextFileRequester
         + PermissionRequester
         + TerminalRequester
+        + ToolProgressReporter
         + ?Sized
 {
 }

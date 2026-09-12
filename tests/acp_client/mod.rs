@@ -35,11 +35,13 @@ pub(crate) struct Serve {
     stdin: Option<ChildStdin>,
     lines: Lines<BufReader<ChildStdout>>,
     session_id: String,
-    /// Every `session/update` notification seen so far, in arrival order.
+    /// Every inbound message, in arrival order.
     ///
-    /// Recorded rather than discarded because these are what an editor renders;
-    /// a test asserting on the user-visible behaviour of a turn asserts on these.
-    pub(crate) notifications: Vec<Value>,
+    /// Requests are kept alongside notifications because order between them is
+    /// itself a contract: whether a tool reports itself running before or after
+    /// it asks permission is the difference between a status that informs and
+    /// one that lies (daa-reep).
+    pub(crate) received: Vec<Value>,
     next_id: u64,
 }
 
@@ -69,7 +71,7 @@ impl Serve {
             stdin: Some(stdin),
             lines: BufReader::new(stdout).lines(),
             session_id: String::new(),
-            notifications: Vec::new(),
+            received: Vec::new(),
             next_id: 1,
         };
 
@@ -190,8 +192,10 @@ impl Serve {
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            if message.get("method").is_some() {
+                self.received.push(message.clone());
+            }
             if message.get("method").and_then(Value::as_str) == Some("session/update") {
-                self.notifications.push(message);
                 continue;
             }
             if let Some(reply) = permission_grant(&message) {
@@ -211,11 +215,28 @@ impl Serve {
     /// Selecting by kind rather than by position keeps tests from breaking when
     /// the adapter adds an unrelated update, which it is free to do.
     pub(crate) fn updates(&self, kind: &str) -> Vec<&Value> {
-        self.notifications
+        self.received
             .iter()
             .filter_map(|notification| notification.pointer("/params/update"))
             .filter(|update| update.get("sessionUpdate").and_then(Value::as_str) == Some(kind))
             .collect()
+    }
+
+    /// Index of the first inbound message whose method is `method`.
+    pub(crate) fn position_of_method(&self, method: &str) -> Option<usize> {
+        self.received
+            .iter()
+            .position(|message| message.get("method").and_then(Value::as_str) == Some(method))
+    }
+
+    /// Index of the first `session/update` carrying `status`.
+    pub(crate) fn position_of_status(&self, status: &str) -> Option<usize> {
+        self.received.iter().position(|message| {
+            message
+                .pointer("/params/update/status")
+                .and_then(Value::as_str)
+                == Some(status)
+        })
     }
 
     /// Close stdin, as an editor does when it exits.

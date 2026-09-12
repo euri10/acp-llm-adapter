@@ -659,6 +659,7 @@ async fn run_command_tool_executes_in_session_cwd_after_permission()
         &context,
         Some(&requester),
         None,
+        None,
         &CancellationToken::new(),
     )
     .await;
@@ -915,6 +916,7 @@ async fn run_command_rejects_empty_command() {
         &store,
         &call,
         &context,
+        None,
         None,
         None,
         &CancellationToken::new(),
@@ -1358,9 +1360,11 @@ async fn run_command_via_terminal_success_path() {
 
     let result = run_command_via_terminal(
         &session_id,
+        "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
         Some(&fake as &dyn crate::acp::TerminalRequester),
+        None,
         &CancellationToken::new(),
     )
     .await;
@@ -1374,8 +1378,10 @@ async fn run_command_via_terminal_no_connection() {
     let session_id = agent_client_protocol::schema::v1::SessionId::new("terminal-no-conn");
     let result = run_command_via_terminal(
         &session_id,
+        "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
+        None,
         None,
         &CancellationToken::new(),
     )
@@ -1401,9 +1407,11 @@ async fn run_command_via_terminal_create_error() {
 
     let result = run_command_via_terminal(
         &session_id,
+        "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
         Some(&fake as &dyn crate::acp::TerminalRequester),
+        None,
         &CancellationToken::new(),
     )
     .await;
@@ -1428,9 +1436,11 @@ async fn run_command_via_terminal_wait_error() {
 
     let result = run_command_via_terminal(
         &session_id,
+        "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
         Some(&fake as &dyn crate::acp::TerminalRequester),
+        None,
         &CancellationToken::new(),
     )
     .await;
@@ -1455,9 +1465,11 @@ async fn run_command_via_terminal_output_error() {
 
     let result = run_command_via_terminal(
         &session_id,
+        "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
         Some(&fake as &dyn crate::acp::TerminalRequester),
+        None,
         &CancellationToken::new(),
     )
     .await;
@@ -1482,9 +1494,11 @@ async fn run_command_via_terminal_release_error() {
 
     let result = run_command_via_terminal(
         &session_id,
+        "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
         Some(&fake as &dyn crate::acp::TerminalRequester),
+        None,
         &CancellationToken::new(),
     )
     .await;
@@ -1502,9 +1516,11 @@ async fn run_command_via_terminal_kills_on_cancellation() {
     let session_id = agent_client_protocol::schema::v1::SessionId::new("terminal-cancel");
     let result = run_command_via_terminal(
         &session_id,
+        "terminal-call",
         std::path::Path::new("/tmp"),
         "sleep 100",
         Some(&tracker as &dyn crate::acp::TerminalRequester),
+        None,
         &token,
     )
     .await;
@@ -1656,6 +1672,7 @@ async fn run_command_rejects_invalid_arguments() -> Result<(), agent_client_prot
         &store,
         &call,
         &context,
+        None,
         None,
         None,
         &CancellationToken::new(),
@@ -1821,6 +1838,7 @@ async fn run_command_tool_uses_terminal_when_capability_present()
         &context,
         Some(&permission),
         Some(&terminal as &dyn crate::acp::TerminalRequester),
+        None,
         &CancellationToken::new(),
     )
     .await;
@@ -1853,6 +1871,7 @@ async fn run_command_tool_execution_spawn_error_path() {
         &call,
         &context,
         Some(&permission),
+        None,
         None,
         &CancellationToken::new(),
     )
@@ -1903,7 +1922,15 @@ async fn run_command_without_terminal_support_honours_an_already_cancelled_turn(
     // still fails loudly rather than hanging the suite.
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        run_command_tool_execution(&store, &call, &context, Some(&permission), None, &token),
+        run_command_tool_execution(
+            &store,
+            &call,
+            &context,
+            Some(&permission),
+            None,
+            None,
+            &token,
+        ),
     )
     .await;
 
@@ -1938,7 +1965,15 @@ async fn run_command_without_terminal_support_stops_a_command_cancelled_mid_flig
 
     let started = std::time::Instant::now();
     let (result, ()) = tokio::join!(
-        run_command_tool_execution(&store, &call, &context, Some(&permission), None, &token),
+        run_command_tool_execution(
+            &store,
+            &call,
+            &context,
+            Some(&permission),
+            None,
+            None,
+            &token
+        ),
         async {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             token.cancel();
@@ -2005,7 +2040,15 @@ async fn run_command_cancellation_stops_backgrounded_descendants()
     let token = CancellationToken::new();
 
     let (result, ()) = tokio::join!(
-        run_command_tool_execution(&store, &call, &context, Some(&permission), None, &token),
+        run_command_tool_execution(
+            &store,
+            &call,
+            &context,
+            Some(&permission),
+            None,
+            None,
+            &token
+        ),
         async {
             // Cancel only once the descendant exists, so the test exercises the
             // signal rather than a race against process startup.

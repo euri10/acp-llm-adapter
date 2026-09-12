@@ -288,7 +288,7 @@ Select a provider with `--backend deepseek|glm|mock`. On both `serve` and `dev`,
 - `edit_file`
 - `run_command`
 
-Tool calls are permission-gated and surfaced through ACP so the editor can show native diffs and command output.
+Tool calls are permission-gated and surfaced through ACP so the editor can show native diffs and command output. A tool call is reported in progress only once its work actually starts — after you approve it — so a command waiting on a permission prompt stays visibly pending rather than appearing to run.
 
 For sessions that advertise `additionalDirectories`, relative file paths resolve against the
 session `cwd` first and then each additional directory in order. Absolute paths are passed

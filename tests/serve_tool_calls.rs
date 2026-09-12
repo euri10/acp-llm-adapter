@@ -82,15 +82,13 @@ async fn a_tool_call_and_its_output_reach_the_client() -> Result<(), Box<dyn Err
         .and_then(Value::as_str)
         .ok_or("tool_call carried no toolCallId")?;
 
-    // Resolved afterwards, against the same id, carrying the output.
+    // Resolved afterwards, against the same id, carrying the output. Takes the
+    // terminal update rather than requiring a single one: the adapter is free
+    // to report progress in between, and does.
     let updates = serve.updates("tool_call_update");
-    let [update] = updates.as_slice() else {
-        return Err(format!(
-            "expected exactly one tool_call_update, got {}",
-            updates.len()
-        )
-        .into());
-    };
+    let update = updates
+        .last()
+        .ok_or("no tool_call_update reached the client")?;
     assert_eq!(
         update.get("toolCallId").and_then(Value::as_str),
         Some(call_id),
@@ -103,6 +101,58 @@ async fn a_tool_call_and_its_output_reach_the_client() -> Result<(), Box<dyn Err
     assert!(
         update.to_string().contains("hello"),
         "the command's output never reached the client: {update}"
+    );
+    Ok(())
+}
+
+/// A running command must be distinguishable from one awaiting approval.
+///
+/// Announced as pending, the call stays that way across the permission
+/// round-trip, so the editor cannot tell "waiting for you" from "working". The
+/// `in_progress` update must arrive only once the command is actually running,
+/// which is why it is reported from inside the tool rather than from the turn
+/// loop (daa-reep).
+///
+/// # Errors
+///
+/// Returns an error if the turn does not complete in time.
+///
+/// # Panics
+///
+/// Panics if the client is never told the command started, or is told in the
+/// wrong order relative to the result.
+#[test_log::test(tokio::test)]
+async fn a_running_command_is_reported_in_progress_before_it_finishes() -> Result<(), Box<dyn Error>>
+{
+    let mut serve = Serve::start().await?;
+    run_prompt(&mut serve, "!tool run_command echo hello").await?;
+
+    let statuses: Vec<&str> = serve
+        .updates("tool_call_update")
+        .into_iter()
+        .filter_map(|update| update.get("status").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        statuses,
+        vec!["in_progress", "completed"],
+        "the client could not tell a running command from a queued one"
+    );
+
+    // Order is the point, not just presence. Reporting progress from the turn
+    // loop would put in_progress before the permission request, claiming the
+    // command was running while the adapter sat waiting for the user to approve
+    // it — which is the failure this whole change exists to avoid.
+    let asked = serve
+        .position_of_method("session/request_permission")
+        .ok_or("the client was never asked for permission")?;
+    let running = serve
+        .position_of_status("in_progress")
+        .ok_or("the client was never told the command started")?;
+    assert!(
+        asked < running,
+        "in_progress arrived before the permission prompt, so it reported work \
+         that had not started"
     );
     Ok(())
 }
@@ -122,13 +172,9 @@ async fn a_failing_command_is_reported_as_failed() -> Result<(), Box<dyn Error>>
     run_prompt(&mut serve, "!tool run_command exit 3").await?;
 
     let updates = serve.updates("tool_call_update");
-    let [update] = updates.as_slice() else {
-        return Err(format!(
-            "expected exactly one tool_call_update, got {}",
-            updates.len()
-        )
-        .into());
-    };
+    let update = updates
+        .last()
+        .ok_or("no tool_call_update reached the client")?;
     assert_eq!(
         update.get("status").and_then(Value::as_str),
         Some("failed"),

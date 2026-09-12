@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use super::registry::{ToolContext, ToolEdit, ToolExecution};
 use crate::{
     PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionBehavior, SessionStore,
-    TerminalRequester, WriteTextFileRequester, request_tool_permission,
+    TerminalRequester, ToolProgressReporter, WriteTextFileRequester, request_tool_permission,
 };
 
 const TOOL_OUTPUT_LIMIT: usize = 200;
@@ -641,6 +641,7 @@ pub(crate) async fn run_command_tool_execution(
     context: &ToolContext,
     permission_requester: Option<&dyn PermissionRequester>,
     terminal_connection: Option<&dyn TerminalRequester>,
+    progress: Option<&dyn ToolProgressReporter>,
     cancellation_token: &CancellationToken,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<RunCommandArguments>(call.arguments()) {
@@ -673,9 +674,11 @@ pub(crate) async fn run_command_tool_execution(
     {
         return run_command_via_terminal(
             &context.session_id,
+            call.id(),
             &context.cwd,
             &parsed_arguments.command,
             terminal_connection,
+            progress,
             cancellation_token,
         )
         .await;
@@ -705,6 +708,10 @@ pub(crate) async fn run_command_tool_execution(
         Ok(child) => child,
         Err(error) => return ToolExecution::failed(format!("failed to run command: {error}")),
     };
+
+    if let Some(progress) = progress {
+        progress.report_in_progress(&context.session_id, call.id());
+    }
 
     // Read before the wait future takes ownership of the child. That future
     // holds the child unreaped until it is dropped, so the kernel cannot
@@ -752,9 +759,11 @@ pub(crate) async fn run_command_tool_execution(
 
 pub(crate) async fn run_command_via_terminal(
     session_id: &SessionId,
+    tool_call_id: &str,
     cwd: &Path,
     command: &str,
     connection: Option<&dyn TerminalRequester>,
+    progress: Option<&dyn ToolProgressReporter>,
     cancellation_token: &CancellationToken,
 ) -> ToolExecution {
     let Some(terminal_requester) = connection else {
@@ -771,6 +780,12 @@ pub(crate) async fn run_command_via_terminal(
         }
     };
     let terminal_id = create_response.terminal_id;
+
+    // The client has the command running now; before this the call was queued
+    // behind the permission prompt above.
+    if let Some(progress) = progress {
+        progress.report_in_progress(session_id, tool_call_id);
+    }
 
     let wait_request = WaitForTerminalExitRequest::new(session_id.clone(), terminal_id.clone());
     let wait_response = tokio::select! {

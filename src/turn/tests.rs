@@ -182,6 +182,15 @@ impl WriteTextFileRequester for TransitionRequester {
     }
 }
 
+impl crate::ToolProgressReporter for TransitionRequester {
+    fn report_in_progress(
+        &self,
+        _session_id: &agent_client_protocol::schema::v1::SessionId,
+        _tool_call_id: &str,
+    ) {
+    }
+}
+
 impl TerminalRequester for TransitionRequester {
     fn create_terminal(
         &self,

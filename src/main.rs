@@ -49,7 +49,7 @@ mod turn;
 
 pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
-    WriteTextFileRequester, serve_with_transport_and_state_dir_logging,
+    ToolProgressReporter, WriteTextFileRequester, serve_with_transport_and_state_dir_logging,
 };
 pub(crate) use dev::{
     Backend, build_dev_agent, exercise_permission_gate_smoke, llm_client_for_backend,
