@@ -105,6 +105,45 @@ blanket-add either crate to existing tests; adopt them as new tests are written.
 - Benchmarks (`criterion`) live in `benches/`.
 - Coverage uses `cargo llvm-cov`. Do not use `cargo tarpaulin`.
 
+## Assert the property, not its surroundings
+
+Four separate failures in one session — three of them pre-existing, two written
+by an agent that had already fixed the other two — turned out to be the same
+mistake. In each, an assertion reached past the property under test into
+something incidental that the machine was free to vary:
+
+| Assertion reached for | Incidental thing it caught | Issue |
+| --- | --- | --- |
+| First `acp_proxy_fixture-*` in `deps/` | Directory order, and every stale hash cargo ever wrote | daa-30py |
+| `/proc/<pid>` exists | Whether anyone had reaped the exit status | daa-vh77 |
+| Redaction applied | Whatever `ACP_LOG_UNREDACTED` was set to in the shell | daa-oh9o |
+| Two `LogRecord`s equal | Whether both were built in the same millisecond | daa-fji9 |
+
+None of them were product defects. Every one of them cost more than the bug it
+pretended to be, because a suite that reports failures belonging to the
+developer's machine cannot be used to tell whether the code broke.
+
+Before asserting, ask what the assertion can observe that the property does not
+depend on:
+
+- **Whole-struct equality** catches every field, including timestamps, ids, and
+  anything else stamped at construction. Compare the field you mean.
+- **Filesystem existence** is not liveness, identity, or freshness. `/proc/<pid>`
+  outlives the process; a build artefact outlives the build that wrote it.
+- **Ambient configuration** — environment variables, user config, `$PATH` — is an
+  input. A test that reads one it did not set is testing the machine. Inject the
+  value, or set it explicitly; `redaction_enabled_fn` exists for exactly this.
+- **Iteration order** of a directory, map, or set is not a sequence.
+- **Wall-clock coincidence** is not synchronisation.
+
+Two practical consequences. A test whose outcome depends on the environment
+passes in CI and fails locally, or the reverse, and both directions waste a
+person's afternoon — so when a test fails on one machine and passes on another,
+suspect the assertion before the code. And a new test that touches time,
+processes, or the filesystem earns a stress run before it is pushed: a single
+green run is what let daa-fji9 through, and it went red on an unrelated commit
+two pushes later.
+
 ## What coverage must not lose
 
 Preserve protocol, security, lifecycle, async, and public-behaviour coverage.
