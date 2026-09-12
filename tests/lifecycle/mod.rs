@@ -106,8 +106,26 @@ fn signal(pid: u32, name: &str) -> io::Result<()> {
     }
 }
 
+/// Whether `pid` names a process that has not yet exited.
+///
+/// The kernel keeps `/proc/<pid>` until someone reaps the exit status, so
+/// testing that directory for existence reports an exited-but-unreaped process
+/// as alive. Two of these tests kill the proxy's parent, which leaves nobody to
+/// reap the proxy: it is then reparented to the nearest subreaper, and stays a
+/// zombie for as long as that subreaper declines to collect it. Under an
+/// ancestry that reaps promptly — a container whose PID 1 is the reaper — the
+/// zombie window is too short to see, which is why this passed in CI and failed
+/// on a developer machine (daa-vh77). Read the state field instead.
 fn alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The comm field is parenthesised and may itself contain spaces and
+    // parentheses, so the state is the first token after the final ')'.
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    !matches!(rest.split_whitespace().next(), None | Some("Z"))
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
