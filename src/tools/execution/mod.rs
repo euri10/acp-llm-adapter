@@ -570,6 +570,34 @@ pub(crate) async fn edit_file_tool_execution(
     }
 }
 
+/// Owns the command's process group and kills it on drop.
+///
+/// The kill belongs on the drop path rather than on the cancellation branch
+/// alone. A turn also stops when the client disconnects and the serve loop is
+/// dropped wholesale, and on that path nothing was cancelled: `kill_on_drop`
+/// reaped the shell while everything it had backgrounded kept running after the
+/// adapter itself had exited.
+///
+/// Released when the command exits on its own — whatever it deliberately left
+/// behind is then its business, not ours. This guard is only for the case where
+/// we stopped waiting first.
+#[cfg(unix)]
+struct CommandGroup(Option<u32>);
+
+#[cfg(unix)]
+impl CommandGroup {
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CommandGroup {
+    fn drop(&mut self) {
+        kill_command_group(self.0);
+    }
+}
+
 /// Signal the process group `run_command` put its shell in, so anything the
 /// command backgrounded dies with it.
 ///
@@ -682,14 +710,13 @@ pub(crate) async fn run_command_tool_execution(
     // holds the child unreaped until it is dropped, so the kernel cannot
     // recycle this pid onto an unrelated process between here and the signal.
     #[cfg(unix)]
-    let process_group = child.id();
+    let mut group = CommandGroup(child.id());
 
     let output = tokio::select! {
         // Same contract as the terminal branch: kill the command and report the
-        // turn as cancelled rather than returning partial output.
+        // turn as cancelled rather than returning partial output. Dropping
+        // `group` on the way out takes the command's descendants with it.
         () = cancellation_token.cancelled() => {
-            #[cfg(unix)]
-            kill_command_group(process_group);
             return ToolExecution::failed("run_command cancelled");
         }
         result = child.wait_with_output() => match result {
@@ -699,6 +726,10 @@ pub(crate) async fn run_command_tool_execution(
             }
         },
     };
+
+    // The command ran to completion, so it keeps whatever it chose to leave.
+    #[cfg(unix)]
+    group.release();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

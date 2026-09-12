@@ -12,7 +12,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use acp_llm_adapter::llm::{
-    ChatClient, ChatConfig, ChatError, ChatRequest, FinishReason, LlmClient, StreamEvent,
+    ChatClient, ChatConfig, ChatError, ChatRequest, FinishReason, LlmClient, MessageRole,
+    StreamEvent, ToolCallDelta,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -257,16 +258,78 @@ pub(crate) struct DevSmokeResult {
 #[derive(Debug, Default)]
 pub(crate) struct MockLlmClient;
 
+/// Prompt prefix that asks the mock to answer with a `run_command` tool call.
+///
+/// The mock is a real backend, selected with `--backend mock`, so this is a
+/// documented affordance of it rather than a hook only tests can reach. It is
+/// the sole way to drive the tool-call path — permission prompting, tool-call
+/// status updates, cancellation part-way through a command — without a provider
+/// and an API key, whether from an integration test or from an editor session.
+///
+/// Everything after the prefix is the shell command to run:
+///
+/// ```text
+/// !tool run_command sleep 300
+/// ```
+pub(crate) const MOCK_TOOL_DIRECTIVE: &str = "!tool run_command ";
+
+/// Tool-call id the mock reports, fixed so tests can match on it.
+const MOCK_TOOL_CALL_ID: &str = "mock-tool-call-0";
+
 impl LlmClient for MockLlmClient {
     fn stream_chat(
         &self,
         request: ChatRequest,
         _cancellation_token: CancellationToken,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ChatError>>, ChatError> {
-        let prompt = request.messages().last().map_or_else(
+        let last = request.messages().last();
+
+        // A tool result means the harness already ran what the previous turn
+        // asked for. Close the turn instead of requesting the same tool again,
+        // which would leave the agent loop running forever.
+        if last.is_some_and(|message| message.role() == MessageRole::Tool) {
+            let events = vec![
+                Ok(StreamEvent::Message(
+                    "mock observed the tool result".to_owned(),
+                )),
+                Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+            ];
+            return Ok(Box::pin(stream::iter(events)));
+        }
+
+        let prompt = last.map_or_else(
             || "mock prompt".to_owned(),
             |message| message.content().to_owned(),
         );
+
+        if let Some(command) = prompt
+            .split_once(MOCK_TOOL_DIRECTIVE)
+            .map(|(_, command)| command.trim())
+            .filter(|command| !command.is_empty())
+        {
+            // Split across deltas the way a provider streams one: metadata
+            // first, arguments after, then a ToolCalls finish reason. A caller
+            // that only works against a single combined delta would pass here
+            // and fail against the real thing.
+            let arguments = serde_json::json!({ "command": command }).to_string();
+            let events = vec![
+                Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                    0,
+                    Some(MOCK_TOOL_CALL_ID.to_owned()),
+                    Some("run_command".to_owned()),
+                    None,
+                ))),
+                Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                    0,
+                    None,
+                    None,
+                    Some(arguments),
+                ))),
+                Ok(StreamEvent::Finished(FinishReason::ToolCalls)),
+            ];
+            return Ok(Box::pin(stream::iter(events)));
+        }
+
         let response_text = format!("mock response to: {prompt}");
 
         let events = vec![
@@ -361,6 +424,7 @@ mod tests {
         exercise_permission_gate_smoke, llm_client_for_backend, print_dev_smoke_result,
         run_smoke_flow,
     };
+    use super::{MOCK_TOOL_CALL_ID, MOCK_TOOL_DIRECTIVE};
     use crate::acp::{
         PermissionRequester, build_initialize_response, serve_with_transport_and_state_dir,
     };
@@ -528,6 +592,99 @@ mod tests {
             return Err(agent_client_protocol::Error::internal_error().data("expected message"));
         };
         assert!(text.contains("mock prompt"));
+        Ok(())
+    }
+
+    async fn drain(
+        client: &MockLlmClient,
+        request: ChatRequest,
+    ) -> Result<Vec<StreamEvent>, agent_client_protocol::Error> {
+        let mut stream = client
+            .stream_chat(request, CancellationToken::new())
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.map_err(agent_client_protocol::Error::into_internal_error)?);
+        }
+        Ok(events)
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_client_turns_the_tool_directive_into_a_run_command_call()
+    -> Result<(), agent_client_protocol::Error> {
+        let events = drain(
+            &MockLlmClient,
+            ChatRequest::new(vec![ChatMessage::user(format!(
+                "{MOCK_TOOL_DIRECTIVE}echo hello"
+            ))]),
+        )
+        .await?;
+
+        // Metadata and arguments arrive as separate deltas, as a provider
+        // streams them, and the turn finishes for tool calls rather than text.
+        let [
+            StreamEvent::ToolCallDelta(metadata),
+            StreamEvent::ToolCallDelta(arguments),
+            StreamEvent::Finished(FinishReason::ToolCalls),
+        ] = events.as_slice()
+        else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data(format!("unexpected mock events: {events:?}")));
+        };
+        assert_eq!(metadata.name(), Some("run_command"));
+        assert_eq!(metadata.id(), Some(MOCK_TOOL_CALL_ID));
+        assert_eq!(metadata.arguments(), None);
+        assert_eq!(arguments.index(), metadata.index());
+        assert_eq!(arguments.arguments(), Some(r#"{"command":"echo hello"}"#));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_client_closes_the_turn_once_a_tool_result_comes_back()
+    -> Result<(), agent_client_protocol::Error> {
+        // Without this the agent loop would re-issue the same tool call every
+        // time its result came back, and the turn would never end.
+        let events = drain(
+            &MockLlmClient,
+            ChatRequest::new(vec![
+                ChatMessage::user(format!("{MOCK_TOOL_DIRECTIVE}echo hello")),
+                ChatMessage::tool_result(MOCK_TOOL_CALL_ID, "hello\n"),
+            ]),
+        )
+        .await?;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallDelta(_))),
+            "mock asked for another tool call after a result: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Finished(FinishReason::EndTurn))
+        ));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_client_without_the_directive_still_answers_with_text()
+    -> Result<(), agent_client_protocol::Error> {
+        let events = drain(
+            &MockLlmClient,
+            ChatRequest::new(vec![ChatMessage::user("just talk to me")]),
+        )
+        .await?;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallDelta(_))),
+            "an ordinary prompt produced a tool call: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Finished(FinishReason::EndTurn))
+        ));
         Ok(())
     }
 
