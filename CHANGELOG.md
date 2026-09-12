@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6](https://github.com/euri10/acp-llm-adapter/compare/v0.7.5...v0.7.6) - 2026-09-12
+
+### Added
+
+- *(acp)* report a tool call in progress when its work actually starts
+- *(mock)* emit tool calls, and stop leaking commands on disconnect
+
+### Fixed
+
+- *(deps)* patch out the audit's unsound and yanked findings
+- *(tools)* kill the command's process group on cancellation
+- *(tests)* compare payloads, not timestamps, in the redaction wiring test
+- *(tools)* honour cancellation when running a command in-process
+- *(ci)* run the same cargo test command the docs prescribe
+- *(tests)* do not count an unreaped process as alive
+- *(tests)* name fixture binaries exactly instead of scanning deps/
+- *(proxy)* reap Agents when the client dies
+
+### Other
+
+- *(serve)* cover what an editor sees during a tool call
+- *(beads)* record the correct issue id for 6cd2d4e
+- *(audit)* notify on advisories on a schedule, don't block on them
+- *(beads)* file the two serve-level coverage gaps
+- *(testing)* name the assertion mistake behind four failures
+- *(logsink)* pin the redaction policy instead of reading the shell
+- *(agents)* restructure AGENTS.md as a routing contract
+- *(beads)* ignore dot-joined vacuum migration-state sidecar
+
 ## [0.7.5](https://github.com/euri10/acp-llm-adapter/compare/v0.7.4...v0.7.5) - 2026-09-12
 
 ### Added
