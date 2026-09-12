@@ -6,6 +6,7 @@
 #   • cargo test
 #   • cargo doc --no-deps
 #   • cargo audit (dependency vulnerabilities)
+#   • scripts/check-agent-instructions (AGENTS.md size limit)
 #
 # MSRV: 1.95  (stable toolchain, edition 2024)
 
@@ -45,19 +46,19 @@ jobs:
           cache-on-failure: true
 
       # ------------------------------------------------------------------
-      # 1. Formatting  (AGENTS.md §1.2)
+      # 1. Formatting  (AGENTS.md -> docs/agent-rust.md)
       # ------------------------------------------------------------------
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       # ------------------------------------------------------------------
-      # 2. Linting    (AGENTS.md §1.3)
+      # 2. Linting    (AGENTS.md -> docs/agent-rust.md)
       # ------------------------------------------------------------------
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       # ------------------------------------------------------------------
-      # 3. Testing    (AGENTS.md §1.5)
+      # 3. Testing    (AGENTS.md -> docs/agent-testing.md)
       # ------------------------------------------------------------------
       - name: cargo test
         run: cargo test --all-targets --all-features
@@ -69,7 +70,7 @@ jobs:
         run: cargo test --doc --all-features
 
       # ------------------------------------------------------------------
-      # 4. Documentation  (AGENTS.md §4)
+      # 4. Documentation  (AGENTS.md -> docs/agent-rust.md)
       # ------------------------------------------------------------------
       - name: cargo doc --no-deps
         run: cargo doc --no-deps --all-features
@@ -83,10 +84,18 @@ jobs:
         run: cargo build --release --all-features
 
       # ------------------------------------------------------------------
-      # 6. Security audit  (AGENTS.md §6)
+      # 6. Security audit  (AGENTS.md -> Security)
       # ------------------------------------------------------------------
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: cargo audit
         run: cargo audit
+
+      # ------------------------------------------------------------------
+      # 7. Agent instructions  (AGENTS.md -> Required references)
+      #    Keeps the always-loaded contract small enough that detail stays in
+      #    docs/agent-*.md instead of drifting back into the root file.
+      # ------------------------------------------------------------------
+      - name: AGENTS.md size limit
+        run: ./scripts/check-agent-instructions

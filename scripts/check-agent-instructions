@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")/.."
+bytes=$(wc -c < AGENTS.md)
+# Leave room below Codex's 32-KiB cap for parent instructions and future edits.
+limit=12000
+if [ "$bytes" -gt "$limit" ]; then
+  printf 'AGENTS.md is %s bytes (limit %s); move task-specific detail to its required reference.\n' "$bytes" "$limit" >&2
+  exit 1
+fi
+printf 'AGENTS.md: %s/%s bytes\n' "$bytes" "$limit"

@@ -323,7 +323,7 @@ struct EofGuard {
 }
 
 // A plain RAII cancellation signal: `Drop` only flips a `CancellationToken`. This
-// is not the "manual Drop manipulation" AGENTS.md §5.2 warns about (no `unsafe`,
+// is not the "manual Drop manipulation" docs/agent-rust.md warns about (no `unsafe`,
 // no resource juggling) — it is the idiomatic way to fire a signal when a value
 // goes out of scope.
 impl Drop for EofGuard {
