@@ -23,8 +23,11 @@ last-touched
 # Schema-migration vacuum sidecars
 .beads.db.schema-migration-*.vacuum-*
 
-# SQLite migration state (local-only)
+# SQLite migration state (local-only). The vacuum sidecar variant joins the
+# suffix with a dot (`.vacuum.fsqlite-migration-state`), so the dash-joined
+# `.vacuum-*` glob above does not catch it.
 beads.db.fsqlite-migration-state
+.beads.db.schema-migration-*.vacuum.fsqlite-migration-state
 
 # Sync state (local-only, per-machine)
 .sync.lock
