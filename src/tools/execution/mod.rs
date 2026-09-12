@@ -570,6 +570,43 @@ pub(crate) async fn edit_file_tool_execution(
     }
 }
 
+/// Signal the process group `run_command` put its shell in, so anything the
+/// command backgrounded dies with it.
+///
+/// Best effort by nature: if the command exited between the cancellation and
+/// this call the group is already gone, and the resulting error is the expected
+/// outcome rather than something to report.
+#[cfg(unix)]
+fn kill_command_group(process_group: Option<u32>) {
+    let Some(raw) = process_group.and_then(|pid| i32::try_from(pid).ok()) else {
+        return;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return;
+    };
+    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+}
+
+/// Run a shell command for the model, delegating to the client's terminal when
+/// it advertises one.
+///
+/// # Cancellation
+///
+/// Both branches promise the same thing to the caller: a cancelled turn kills
+/// the command and returns a failed [`ToolExecution`] reading `run_command
+/// cancelled`, never partial output.
+///
+/// What they can promise about the command's own descendants differs, and the
+/// difference is not ours to remove:
+///
+/// - Terminal branch: the client owns the process, so cancellation issues
+///   `terminal/kill` and whatever that client does about descendants applies.
+/// - In-process branch on unix: the shell gets its own process group and
+///   cancellation signals the group, so work the command backgrounded dies with
+///   it (daa-0yi0).
+/// - In-process branch elsewhere: no process groups, so only the shell itself is
+///   killed and backgrounded descendants survive the turn. Stated rather than
+///   silently tolerated; revisit if a non-unix target ever matters.
 pub(crate) async fn run_command_tool_execution(
     store: &SessionStore,
     call: &ChatToolCall,
@@ -619,7 +656,8 @@ pub(crate) async fn run_command_tool_execution(
     // tokio's Command rather than a blocking one: a blocking task cannot be
     // cancelled, so `std::process::Command::output()` would hold the turn — and
     // the runtime shutdown behind it — until the command chose to exit.
-    let child = match tokio::process::Command::new("sh")
+    let mut command = tokio::process::Command::new("sh");
+    command
         .arg("-lc")
         .arg(&parsed_arguments.command)
         .current_dir(&context.cwd)
@@ -628,17 +666,30 @@ pub(crate) async fn run_command_tool_execution(
         .stderr(Stdio::piped())
         // Cancelling below drops the wait future, which drops the child; this
         // turns that drop into a kill instead of leaving it running unattended.
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    // Own the whole command rather than just the shell. `sh -lc` can background
+    // work that a signal to the shell alone would leave running with no owner;
+    // its own process group makes that subtree addressable with one signal.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return ToolExecution::failed(format!("failed to run command: {error}")),
     };
+
+    // Read before the wait future takes ownership of the child. That future
+    // holds the child unreaped until it is dropped, so the kernel cannot
+    // recycle this pid onto an unrelated process between here and the signal.
+    #[cfg(unix)]
+    let process_group = child.id();
 
     let output = tokio::select! {
         // Same contract as the terminal branch: kill the command and report the
         // turn as cancelled rather than returning partial output.
         () = cancellation_token.cancelled() => {
+            #[cfg(unix)]
+            kill_command_group(process_group);
             return ToolExecution::failed("run_command cancelled");
         }
         result = child.wait_with_output() => match result {

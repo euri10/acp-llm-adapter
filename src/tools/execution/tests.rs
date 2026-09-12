@@ -1959,6 +1959,92 @@ async fn run_command_without_terminal_support_stops_a_command_cancelled_mid_flig
     Ok(())
 }
 
+/// Whether `pid` names a process that has not exited.
+///
+/// Reads the state field rather than testing `/proc/<pid>` for existence: the
+/// descendant is orphaned when its shell dies, so nothing is guaranteed to reap
+/// it and an exited process keeps its directory indefinitely (daa-vh77).
+#[cfg(target_os = "linux")]
+fn descendant_alive(pid: &str) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    !matches!(rest.split_whitespace().next(), None | Some("Z"))
+}
+
+/// Cancelling must dispose of work the command backgrounded, not just the shell.
+///
+/// Linux-only because it inspects `/proc` for the descendant's state; the fix it
+/// guards applies to every unix.
+#[cfg(target_os = "linux")]
+#[test_log::test(tokio::test)]
+async fn run_command_cancellation_stops_backgrounded_descendants()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let context = cancellation_context(&store)?;
+    let permission = allow_once();
+
+    let pid_file = std::env::temp_dir().join(format!(
+        "acp-run-command-descendant-{}.pid",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&pid_file);
+    // A shell that backgrounds work and waits on it. Signalling only the shell
+    // leaves the sleep running with no owner.
+    let call = ChatToolCall::new(
+        "cancel-tree",
+        "run_command",
+        serde_json::json!({
+            "command": format!("sleep 300 & echo $! > {}; wait", pid_file.display())
+        })
+        .to_string(),
+    );
+    let token = CancellationToken::new();
+
+    let (result, ()) = tokio::join!(
+        run_command_tool_execution(&store, &call, &context, Some(&permission), None, &token),
+        async {
+            // Cancel only once the descendant exists, so the test exercises the
+            // signal rather than a race against process startup.
+            for _ in 0..100u32 {
+                if pid_file.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            token.cancel();
+        }
+    );
+
+    assert!(!result.success);
+    let recorded = std::fs::read_to_string(&pid_file)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let _ = std::fs::remove_file(&pid_file);
+    assert!(
+        !recorded.is_empty(),
+        "the command never recorded a descendant"
+    );
+
+    let mut survived = true;
+    for _ in 0..100u32 {
+        if !descendant_alive(&recorded) {
+            survived = false;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !survived,
+        "backgrounded descendant {recorded} outlived the cancelled turn"
+    );
+    Ok(())
+}
+
 #[test]
 fn update_plan_tool_definition_exposes_structured_entries() {
     let definition = update_plan_tool_definition();

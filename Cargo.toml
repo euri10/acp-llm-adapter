@@ -58,8 +58,9 @@ tracing = "^0.1.44"
 tracing-subscriber = { version = "^0.3.23", features = ["env-filter"] }
 uuid = { version = "^1.26.1", features = ["v4", "v5", "serde"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Own the proxy's descendant lifecycle without local unsafe syscall wrappers.
+[target.'cfg(unix)'.dependencies]
+# Own descendant lifecycles - the proxy's Agents, and the shell run_command
+# spawns - without local unsafe syscall wrappers.
 rustix = { version = "1.1.4", features = ["process"] }
 
 [dev-dependencies]
