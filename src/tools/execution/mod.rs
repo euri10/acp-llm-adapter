@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
@@ -615,20 +616,37 @@ pub(crate) async fn run_command_tool_execution(
         .await;
     }
 
-    let cwd = context.cwd.clone();
-    let command = parsed_arguments.command;
-    let output = match tokio::task::spawn_blocking(move || {
-        std::process::Command::new("sh")
-            .arg("-lc")
-            .arg(&command)
-            .current_dir(cwd)
-            .output()
-    })
-    .await
+    // tokio's Command rather than a blocking one: a blocking task cannot be
+    // cancelled, so `std::process::Command::output()` would hold the turn — and
+    // the runtime shutdown behind it — until the command chose to exit.
+    let child = match tokio::process::Command::new("sh")
+        .arg("-lc")
+        .arg(&parsed_arguments.command)
+        .current_dir(&context.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Cancelling below drops the wait future, which drops the child; this
+        // turns that drop into a kill instead of leaving it running unattended.
+        .kill_on_drop(true)
+        .spawn()
     {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return ToolExecution::failed(format!("failed to run command: {error}")),
-        Err(error) => return ToolExecution::failed(format!("run_command task failed: {error}")),
+        Ok(child) => child,
+        Err(error) => return ToolExecution::failed(format!("failed to run command: {error}")),
+    };
+
+    let output = tokio::select! {
+        // Same contract as the terminal branch: kill the command and report the
+        // turn as cancelled rather than returning partial output.
+        () = cancellation_token.cancelled() => {
+            return ToolExecution::failed("run_command cancelled");
+        }
+        result = child.wait_with_output() => match result {
+            Ok(output) => output,
+            Err(error) => {
+                return ToolExecution::failed(format!("failed to run command: {error}"));
+            }
+        },
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -1862,6 +1862,103 @@ async fn run_command_tool_execution_spawn_error_path() {
     assert!(!result.success);
 }
 
+/// A context for a real registered session, so the permission gate resolves and
+/// execution actually reaches the command.
+fn cancellation_context(store: &SessionStore) -> Result<ToolContext, agent_client_protocol::Error> {
+    let session = handle_new_session_request(store, &NewSessionRequest::new("/tmp"))?;
+    Ok(ToolContext {
+        session_id: session.session_id.clone(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        additional_directories: Vec::new(),
+        // No terminal capability: this is the branch that runs the command
+        // in-process rather than delegating to the client.
+        client_capabilities: None,
+    })
+}
+
+fn allow_once() -> FakePermissionRequester {
+    FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            PERMISSION_ALLOW_ONCE_OPTION_ID,
+        )),
+    )])
+}
+
+#[test_log::test(tokio::test)]
+async fn run_command_without_terminal_support_honours_an_already_cancelled_turn()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let context = cancellation_context(&store)?;
+    let permission = allow_once();
+    let call = ChatToolCall::new(
+        "cancel-before",
+        "run_command",
+        serde_json::json!({"command": "sleep 30"}).to_string(),
+    );
+    let token = CancellationToken::new();
+    token.cancel();
+
+    // The bound is what the test is really about: without cancellation support
+    // this call blocks for the command's full 30s, so a generous 5s ceiling
+    // still fails loudly rather than hanging the suite.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_command_tool_execution(&store, &call, &context, Some(&permission), None, &token),
+    )
+    .await;
+
+    assert!(
+        outcome.is_ok(),
+        "run_command ignored the cancelled token and waited for the command"
+    );
+    let Ok(result) = outcome else {
+        return Ok(());
+    };
+    assert!(!result.success);
+    assert!(
+        result.content.contains("cancelled"),
+        "expected a cancellation result, got: {}",
+        result.content
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn run_command_without_terminal_support_stops_a_command_cancelled_mid_flight()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let context = cancellation_context(&store)?;
+    let permission = allow_once();
+    let call = ChatToolCall::new(
+        "cancel-during",
+        "run_command",
+        serde_json::json!({"command": "sleep 30"}).to_string(),
+    );
+    let token = CancellationToken::new();
+
+    let started = std::time::Instant::now();
+    let (result, ()) = tokio::join!(
+        run_command_tool_execution(&store, &call, &context, Some(&permission), None, &token),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            token.cancel();
+        }
+    );
+    let elapsed = started.elapsed();
+
+    assert!(!result.success);
+    assert!(
+        result.content.contains("cancelled"),
+        "expected a cancellation result, got: {}",
+        result.content
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "cancellation took {elapsed:?}; the command ran to completion instead of being killed"
+    );
+    Ok(())
+}
+
 #[test]
 fn update_plan_tool_definition_exposes_structured_entries() {
     let definition = update_plan_tool_definition();
