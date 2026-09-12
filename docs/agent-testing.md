@@ -74,6 +74,17 @@ writes where, which invocation produces what — give each invocation its own
 fresh `CARGO_TARGET_DIR`. Reusing one directory lets an artifact from an
 earlier command survive into the next and prove the opposite of the truth.
 
+Two workflows run `cargo audit`, at different strictness on purpose. CI runs it
+plain, which exits 0 for the warning classes — `unsound`, `yanked`,
+`unmaintained` — and fails only on outright vulnerabilities. `.github/workflows/audit.yml`
+runs `--deny warnings` on a daily schedule. The split is deliberate: those
+warnings come from other people's crates on their schedule, so denying them at
+the push gate would let a stranger's yank block work that did not cause it,
+while denying them nowhere is how two findings aged quietly into daa-pb93. A red
+scheduled run is a notification; triage it into Beads and fix it on your own
+schedule. Verify any change to that gate by restoring a known-bad version and
+watching it fail, not by watching a clean tree pass.
+
 A test must never depend on a live provider endpoint. Use the mock `LlmClient`
 or a local fixture server; if a test cannot be written without the network, it
 is the wrong test.
