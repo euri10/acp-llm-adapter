@@ -148,8 +148,13 @@ fn new_applies_whichever_redaction_setting_the_environment_selects() {
         redaction_enabled(),
     );
 
-    // Asserts the wiring, not the outcome, so it holds whatever the ambient
-    // setting is. What the variable should mean is covered by the
+    // Compare payloads, not whole records: `timestamp` is stamped at
+    // construction with millisecond precision, so asserting on the whole record
+    // compares two instants and passes only when both land in the same
+    // millisecond. It did locally and did not in CI.
+    //
+    // This asserts the wiring, not the outcome, so it holds whatever the
+    // ambient setting is. What the variable should mean is covered by the
     // redaction_enabled_fn tests, and what each setting does to a payload by
     // the two tests either side of this one.
     //
@@ -157,7 +162,7 @@ fn new_applies_whichever_redaction_setting_the_environment_selects() {
     // a hardcoded `true` only fails this test on a machine that has opted out,
     // because with the default setting the two constructions agree. It catches
     // that mutation exactly where the environment made it invisible before.
-    assert_eq!(record, expected);
+    assert_eq!(record.payload, expected.payload);
 }
 
 #[test]
