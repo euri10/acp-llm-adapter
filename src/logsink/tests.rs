@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use super::{
     ConnectionLog, Direction, ENV_UNREDACTED, KIND_FRAME, KIND_SESSION_BOUND, LogRecord, LogSink,
-    LogSinkError, LogWriter, Override, RetentionPolicy, parse_override, redaction_enabled_fn,
+    LogSinkError, LogWriter, Override, RetentionPolicy, parse_override, redaction_enabled,
+    redaction_enabled_fn,
 };
 
 /// A temp root that removes itself, so tests do not litter the state directory.
@@ -111,8 +112,13 @@ fn structured_payloads_share_one_redaction_policy() {
         }
     });
 
-    let frame = LogRecord::new(Direction::ClientToAgent, KIND_FRAME, payload.clone());
-    let event = LogRecord::new(Direction::Internal, "trace-event", payload);
+    // Pin the policy explicitly. Going through `LogRecord::new` would consult
+    // the real environment, so a developer with ACP_LOG_UNREDACTED exported
+    // saw this security assertion fail for a reason that has nothing to do
+    // with the policy under test (daa-oh9o).
+    let frame =
+        LogRecord::new_with_redaction(Direction::ClientToAgent, KIND_FRAME, payload.clone(), true);
+    let event = LogRecord::new_with_redaction(Direction::Internal, "trace-event", payload, true);
 
     assert!(!frame.payload.to_string().contains(secret));
     assert!(!event.payload.to_string().contains(secret));
@@ -125,6 +131,33 @@ fn structured_payloads_share_one_redaction_policy() {
         params.and_then(|params| params.get("prompt")),
         Some(&json!("[REDACTED]"))
     );
+}
+
+#[test]
+fn new_applies_whichever_redaction_setting_the_environment_selects() {
+    let payload = json!({
+        "method": "session/prompt",
+        "params": {"arguments": "prompt and tool secret"}
+    });
+
+    let record = LogRecord::new(Direction::ClientToAgent, KIND_FRAME, payload.clone());
+    let expected = LogRecord::new_with_redaction(
+        Direction::ClientToAgent,
+        KIND_FRAME,
+        payload,
+        redaction_enabled(),
+    );
+
+    // Asserts the wiring, not the outcome, so it holds whatever the ambient
+    // setting is. What the variable should mean is covered by the
+    // redaction_enabled_fn tests, and what each setting does to a payload by
+    // the two tests either side of this one.
+    //
+    // Note the limit: replacing `redaction_enabled()` in `LogRecord::new` with
+    // a hardcoded `true` only fails this test on a machine that has opted out,
+    // because with the default setting the two constructions agree. It catches
+    // that mutation exactly where the environment made it invisible before.
+    assert_eq!(record, expected);
 }
 
 #[test]
