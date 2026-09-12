@@ -11,7 +11,14 @@
     clippy::unimplemented
 )]
 
-//! Harnessless stdio MCP server fixture for child-process tests.
+//! Stdio MCP server fixture for child-process tests.
+//!
+//! This is an example target, not a test target: cargo uplifts example
+//! artifacts to `<profile>/examples/<name>` under a stable hash-free name, so
+//! `mcp_stdio_fixture_path` names the current build exactly instead of scanning
+//! `deps/` and picking a stale hash (daa-30py). It also needs rmcp's server
+//! features, which live in dev-dependencies and are therefore unavailable to a
+//! binary target. `cargo test` builds it without running it.
 
 use std::error::Error;
 

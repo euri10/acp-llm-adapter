@@ -11,13 +11,19 @@
     clippy::unimplemented
 )]
 
-//! Harnessless fake ACP agent for proxy child-process tests.
+//! Fake ACP agent for proxy child-process tests.
 //!
 //! Reads NDJSON request lines from stdin, answers one line each on stdout,
-//! narrates on stderr, and exits with a configurable status. Runs without a
-//! test harness so it is a single-threaded process with sole ownership of its
-//! stdio — a harnessed binary would run every test concurrently and race on
-//! the very streams under test.
+//! narrates on stderr, and exits with a configurable status. It is a
+//! single-threaded process with sole ownership of its stdio — a test harness
+//! would run every test concurrently and race on the very streams under test.
+//!
+//! This is an example target, not a test target, for two reasons: cargo uplifts
+//! example artifacts to `<profile>/examples/<name>` under a stable hash-free
+//! name, so the test spawning it names the current build exactly instead of
+//! scanning `deps/` and picking a stale hash (daa-30py); and examples may use
+//! dev-dependencies, which binaries may not. `cargo test` builds it without
+//! running it.
 
 use std::io::{BufRead, Write};
 

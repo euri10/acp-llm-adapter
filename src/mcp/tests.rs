@@ -28,7 +28,6 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{ServerHandler, ServiceExt};
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -140,35 +139,23 @@ async fn spawn_http_echo_mcp_server()
     Ok((format!("http://{address}/mcp"), cancellation))
 }
 
-fn mcp_stdio_fixture_path() -> Result<PathBuf, agent_client_protocol::Error> {
-    let current_exe =
-        std::env::current_exe().map_err(agent_client_protocol::Error::into_internal_error)?;
-    let Some(deps_dir) = current_exe.parent() else {
-        return Err(agent_client_protocol::Error::internal_error()
-            .data("test executable has no parent directory"));
+/// Absolute path to the compiled `mcp_stdio_fixture` example binary.
+///
+/// Cargo uplifts example artifacts to `<profile>/examples/<name>` under a
+/// stable, hash-free name, so this always names the current build. Scanning
+/// `deps/` for `mcp_stdio_fixture-<hash>` instead returned whichever stale
+/// hash `read_dir` happened to yield first (daa-30py).
+fn mcp_stdio_fixture_path() -> PathBuf {
+    let mut path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => unreachable!("cannot locate the test binary: {error}"),
     };
-    let entries =
-        std::fs::read_dir(deps_dir).map_err(agent_client_protocol::Error::into_internal_error)?;
-
-    for entry in entries {
-        let path = entry
-            .map_err(agent_client_protocol::Error::into_internal_error)?
-            .path();
-        let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        let is_dep_info = path.extension().is_some_and(|extension| extension == "d");
-        if file_name.starts_with("mcp_stdio_fixture-")
-            && !is_dep_info
-            && file_name.ends_with(std::env::consts::EXE_SUFFIX)
-            && path.is_file()
-        {
-            return Ok(path);
-        }
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
     }
-
-    Err(agent_client_protocol::Error::internal_error()
-        .data("failed to find mcp_stdio_fixture test executable"))
+    path.join("examples")
+        .join(format!("mcp_stdio_fixture{}", std::env::consts::EXE_SUFFIX))
 }
 
 struct FakePermissionRequester {
@@ -563,7 +550,7 @@ async fn mcp_stdio_session_rejects_relative_command() {
 #[test_log::test(tokio::test)]
 async fn connect_mcp_sessions_connects_stdio_fixture_server()
 -> Result<(), agent_client_protocol::Error> {
-    let stdio = McpServerStdio::new("fixture", mcp_stdio_fixture_path()?)
+    let stdio = McpServerStdio::new("fixture", mcp_stdio_fixture_path())
         .args(vec!["branch-arg".to_string()])
         .env(vec![
             EnvVariable::new(RUN_STDIO_FIXTURE_ENV, "1"),
@@ -589,7 +576,7 @@ async fn connect_mcp_sessions_connects_stdio_fixture_server()
 #[test_log::test(tokio::test)]
 async fn mcp_stdio_session_reports_initialization_failure()
 -> Result<(), agent_client_protocol::Error> {
-    let stdio = McpServerStdio::new("silent", mcp_stdio_fixture_path()?);
+    let stdio = McpServerStdio::new("silent", mcp_stdio_fixture_path());
 
     let Err(error) = connect_mcp_stdio_session(&stdio).await else {
         return Err(agent_client_protocol::Error::internal_error()
@@ -607,7 +594,7 @@ async fn mcp_stdio_session_reports_initialization_failure()
 #[test_log::test(tokio::test)]
 async fn mcp_stdio_session_reports_list_tools_failure() -> Result<(), agent_client_protocol::Error>
 {
-    let stdio = McpServerStdio::new("list-fails", mcp_stdio_fixture_path()?).env(vec![
+    let stdio = McpServerStdio::new("list-fails", mcp_stdio_fixture_path()).env(vec![
         EnvVariable::new(RUN_STDIO_FIXTURE_ENV, "1"),
         EnvVariable::new("MCP_FIXTURE_MODE", "list_error"),
     ]);
@@ -626,7 +613,7 @@ async fn mcp_stdio_session_reports_list_tools_failure() -> Result<(), agent_clie
 #[test_log::test(tokio::test)]
 async fn mcp_stdio_session_discovers_and_executes_fixture_server()
 -> Result<(), agent_client_protocol::Error> {
-    let stdio = McpServerStdio::new("fixture", mcp_stdio_fixture_path()?)
+    let stdio = McpServerStdio::new("fixture", mcp_stdio_fixture_path())
         .args(vec!["launch-arg".to_string()])
         .env(vec![
             EnvVariable::new(RUN_STDIO_FIXTURE_ENV, "1"),

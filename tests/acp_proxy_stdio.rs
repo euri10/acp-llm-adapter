@@ -17,7 +17,6 @@
 //! the same way the MCP stdio fixture is. Keeping it a separate process with
 //! sole ownership of its stdio is what makes these assertions meaningful.
 
-use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -153,32 +152,21 @@ fn proxy_binary() -> PathBuf {
     path.join("acp-proxy")
 }
 
-/// Locate the harnessless fixture binary among the compiled test targets.
+/// Absolute path to the compiled `acp_proxy_fixture` example binary.
+///
+/// Cargo uplifts example artifacts to `<profile>/examples/<name>` under a
+/// stable, hash-free name, so this always names the current build. Scanning
+/// `deps/` for `acp_proxy_fixture-<hash>` instead returned whichever stale
+/// hash `read_dir` happened to yield first, which silently ran a fixture from
+/// an older checkout (daa-30py).
 fn fixture_binary() -> PathBuf {
-    let current = current_binary();
-    let Some(deps_dir) = current.parent() else {
-        unreachable!("test executable has no parent directory")
-    };
-    let Ok(entries) = std::fs::read_dir(deps_dir) else {
-        unreachable!("cannot read {}", deps_dir.display())
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        let is_dep_info = path.extension().is_some_and(|extension| extension == "d");
-        if file_name.starts_with("acp_proxy_fixture-")
-            && !is_dep_info
-            && file_name.ends_with(std::env::consts::EXE_SUFFIX)
-            && path.is_file()
-        {
-            return path;
-        }
+    let mut path = current_binary();
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
     }
-
-    unreachable!("failed to find the acp_proxy_fixture test executable")
+    path.join("examples")
+        .join(format!("acp_proxy_fixture{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn current_binary() -> PathBuf {
