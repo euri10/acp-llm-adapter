@@ -60,8 +60,15 @@ jobs:
       # ------------------------------------------------------------------
       # 3. Testing    (AGENTS.md -> docs/agent-testing.md)
       # ------------------------------------------------------------------
+      # Plain `cargo test`, deliberately not `--all-targets`: the fixture
+      # binaries in examples/ are located through the artifact cargo uplifts to
+      # <profile>/examples/<name>, and --all-targets compiles examples only as
+      # test targets, leaving that hash-free path absent (daa-bq9y). It is also
+      # the command docs/agent-testing.md prescribes, so a green local run and a
+      # green CI run now mean the same thing. Nothing is lost: there are no
+      # benches, and the examples contain no #[test] to run.
       - name: cargo test
-        run: cargo test --all-targets --all-features
+        run: cargo test --all-features
         env:
           # Prevent accidental network calls in tests that would hang in CI.
           LLM_API_KEY: "skip-ci-no-key"

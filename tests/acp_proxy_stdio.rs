@@ -165,8 +165,17 @@ fn fixture_binary() -> PathBuf {
     if path.ends_with("deps") {
         path.pop();
     }
-    path.join("examples")
-        .join(format!("acp_proxy_fixture{}", std::env::consts::EXE_SUFFIX))
+    let path = path
+        .join("examples")
+        .join(format!("acp_proxy_fixture{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        path.is_file(),
+        "missing {}: cargo uplifts example artifacts for `cargo test` and \
+         `cargo build --examples`, but not for `cargo test --all-targets`, \
+         which compiles examples only as test targets (daa-bq9y)",
+        path.display()
+    );
+    path
 }
 
 fn current_binary() -> PathBuf {

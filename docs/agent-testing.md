@@ -45,17 +45,34 @@ baseline must be fixed before the task closes. Never stash the maintainer's
 uncommitted work without saying so — if `git status --short` shows changes you
 did not make, take the baseline from CI or a clean worktree instead.
 
-The two harness-less integration fixtures (`mcp_stdio_fixture`,
+The tests that drive the `examples/` fixtures (`mcp_stdio_fixture`,
 `acp_proxy_fixture`) spawn real processes. They must pass too; a hang there is a
 lifecycle defect, not a flake to retry.
 
 ## Gates
 
-CI (`.github/workflows/ci.yml`) enforces fmt, clippy, `cargo test --all-targets
---all-features`, doc-tests, `cargo doc` with `-D warnings`, a release build,
-`cargo audit`, and the AGENTS.md size check. Tests run with
+CI (`.github/workflows/ci.yml`) enforces fmt, clippy `--all-targets`,
+`cargo test --all-features`, doc-tests, `cargo doc` with `-D warnings`, a
+release build, `cargo audit`, and the AGENTS.md size check. Tests run with
 `LLM_API_KEY=skip-ci-no-key` so an accidental network call fails fast rather
 than hanging.
+
+CI runs the same `cargo test` invocation prescribed above, without
+`--all-targets`, and that is deliberate. The child-process fixtures live in
+`examples/` and are located through the artifact cargo uplifts to
+`<profile>/examples/<name>`. Cargo only writes that hash-free path for
+`cargo test` and `cargo build --examples`; under `--all-targets` it compiles
+examples solely as test targets and the path never appears, so the fixture
+tests fail with the artifact missing (daa-bq9y). Nothing is lost by dropping
+the flag — there are no benches, and the examples contain no `#[test]`. Keep
+the two commands identical: when CI and the local procedure differ, "green
+locally" and "green in CI" stop meaning the same thing, which is exactly how a
+broken fixture path reached main.
+
+If you do reach for a build-artifact experiment — which target kind cargo
+writes where, which invocation produces what — give each invocation its own
+fresh `CARGO_TARGET_DIR`. Reusing one directory lets an artifact from an
+earlier command survive into the next and prove the opposite of the truth.
 
 A test must never depend on a live provider endpoint. Use the mock `LlmClient`
 or a local fixture server; if a test cannot be written without the network, it
