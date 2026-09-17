@@ -61,7 +61,7 @@ uuid = { version = "^1.26.1", features = ["v4", "v5", "serde"] }
 [target.'cfg(unix)'.dependencies]
 # Own descendant lifecycles - the proxy's Agents, and the shell run_command
 # spawns - without local unsafe syscall wrappers.
-rustix = { version = "1.1.4", features = ["process"] }
+rustix = { version = "1.1.5", features = ["process"] }
 
 [dev-dependencies]
 axum = { version = "^0.8.9", default-features = false, features = [
