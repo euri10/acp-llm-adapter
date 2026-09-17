@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.7](https://github.com/euri10/acp-llm-adapter/compare/v0.7.6...v0.7.7) - 2026-09-17
+
+### Fixed
+
+- *(deps)* update rust crate rustix to 1.1.5 ([#60](https://github.com/euri10/acp-llm-adapter/pull/60))
+- *(deps)* update rust crate clap to ^4.6.7 ([#58](https://github.com/euri10/acp-llm-adapter/pull/58))
+- *(deps)* bump rustls to 0.23.45 to fix RUSTSEC-2026-0285
+
 ## [0.7.6](https://github.com/euri10/acp-llm-adapter/compare/v0.7.5...v0.7.6) - 2026-09-12
 
 ### Added
