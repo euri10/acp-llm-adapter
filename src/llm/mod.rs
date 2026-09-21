@@ -11,7 +11,7 @@ mod types;
 pub use client::{ChatClient, LlmClient, fetch_available_models};
 pub use config::ChatConfig;
 pub use error::ChatError;
-pub use models::context_window_for_model;
+pub use models::{ModelCatalog, context_window_for_model};
 pub use pricing::model_cost_micros;
 pub use types::{
     ChatMessage, ChatRequest, FinishReason, MessageRole, StreamEvent, ToolCall, ToolCallDelta,

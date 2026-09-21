@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::stream::run_stream_attempt;
 use super::types::{ChatRequest, WireMessage, WireToolDefinition};
-use super::{ChatConfig, ChatError, StreamEvent};
+use super::{ChatConfig, ChatError, ModelCatalog, StreamEvent};
 
 /// An OpenAI-compatible chat-completions client.
 ///
@@ -73,7 +73,7 @@ impl ChatClient {
     /// Fetch the list of available model IDs from the provider's `/models` endpoint.
     ///
     /// Delegates to the free function [`fetch_available_models`].
-    pub async fn fetch_available_models(&self, preferred_default: &str) -> Vec<String> {
+    pub async fn fetch_available_models(&self, preferred_default: &str) -> ModelCatalog {
         fetch_available_models(
             self.config.base_url(),
             self.config.api_key(),
@@ -83,17 +83,21 @@ impl ChatClient {
     }
 }
 
-/// Fetch model IDs from an OpenAI-compatible `GET /models` endpoint.
+/// Fetch model IDs and positive `context_window` metadata from `GET /models`.
 ///
 /// `preferred_default` is placed first in the returned list. On any failure
 /// (transport, auth, parse) the function logs a warning and returns
-/// `vec![preferred_default.to_string()]` so callers can always proceed.
+/// a catalog containing only the default ID so callers can always proceed.
 #[tracing::instrument(name = "model_list_fetch", skip_all, fields(session_id = "none"))]
 pub async fn fetch_available_models(
     base_url: &str,
     api_key: &str,
     preferred_default: &str,
-) -> Vec<String> {
+) -> ModelCatalog {
+    let mut catalog = ModelCatalog {
+        ids: vec![preferred_default.to_string()],
+        ..ModelCatalog::default()
+    };
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let http = HttpClient::new();
 
@@ -105,7 +109,7 @@ pub async fn fetch_available_models(
                 %url,
                 "failed to fetch /models; falling back to default model list"
             );
-            return vec![preferred_default.to_string()];
+            return catalog;
         }
     };
 
@@ -117,7 +121,7 @@ pub async fn fetch_available_models(
                 %url,
                 "failed to parse /models response; falling back to default model list"
             );
-            return vec![preferred_default.to_string()];
+            return catalog;
         }
     };
 
@@ -126,15 +130,24 @@ pub async fn fetch_available_models(
         .and_then(|data| data.as_array())
         .into_iter()
         .flatten()
-        .filter_map(|entry| entry.get("id")?.as_str().map(String::from))
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?;
+            if let Some(window) = entry
+                .get("context_window")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|size| *size > 0)
+            {
+                catalog.context_windows.insert(id.to_string(), window);
+            }
+            Some(id.to_string())
+        })
         .collect();
 
     // Ensure the preferred default is present and first.
     models.retain(|id| id != preferred_default);
     models.sort();
-    let mut result = vec![preferred_default.to_string()];
-    result.append(&mut models);
-    result
+    catalog.ids.append(&mut models);
+    catalog
 }
 
 /// A client abstraction for streaming chat-completions turns.

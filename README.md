@@ -198,6 +198,15 @@ When serve logging is enabled, those tracing events are written alongside wire r
 
 Serve responses expose the absolute session log path as `_meta.logJsonlPath` on `session/new`, `session/load`, `session/resume`, and `session/list`. The field is omitted when structured logging is disabled.
 
+## Context-window reporting
+
+The context gauge uses the streamed usage `context_length` when present.
+Otherwise it uses the selected model's positive integer `context_window` from
+the startup `GET /models` response, then the built-in model table as a fallback.
+Discovery metadata is retained in memory and refreshed on adapter startup;
+no extra request is made per turn. Missing or invalid sizes leave the fallback
+intact. If all sources are unknown, no `usage_update` is emitted.
+
 ## Architecture
 
 The adapter bridges two independent channels:

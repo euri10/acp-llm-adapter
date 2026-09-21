@@ -1,4 +1,26 @@
-//! Static metadata for provider model IDs known to the adapter.
+//! Discovered model metadata and static context-window fallbacks.
+
+use std::collections::HashMap;
+
+/// Model selection IDs and optional metadata returned by the provider.
+#[derive(Debug, Default, Clone)]
+pub struct ModelCatalog {
+    /// Available model IDs, with the configured default first.
+    pub ids: Vec<String>,
+    /// Context windows reported by discovery, keyed by model ID.
+    pub context_windows: HashMap<String, u64>,
+}
+
+impl ModelCatalog {
+    /// Return a positive provider-reported context window, if available.
+    #[must_use]
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.context_windows
+            .get(model)
+            .copied()
+            .filter(|size| *size > 0)
+    }
+}
 
 /// Known context-window sizes in tokens, keyed by model ID.
 ///

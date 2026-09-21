@@ -852,16 +852,59 @@ async fn fetch_available_models_parses_openai_model_list() -> Result<(), ChatErr
     let base_url = spawn_http_json_server("HTTP/1.1 200 OK".to_string(), json_body).await?;
     let client = ChatClient::new(ChatConfig::new("test-key", base_url, "glm-4.6"));
 
-    let models = client.fetch_available_models("glm-4.6").await;
+    let catalog = client.fetch_available_models("glm-4.6").await;
 
     assert_eq!(
-        models,
+        catalog.ids,
         vec![
             "glm-4.6",
             "abc-alpha",
             "deepseek-v4-flash",
             "deepseek-v4-pro",
         ]
+    );
+    Ok(())
+}
+
+/// Providers that report `context_window` per model make the static table
+/// unnecessary for them; capture it instead of discarding it (daa-models-context-window-9cr3).
+#[test_log::test(tokio::test)]
+async fn fetch_available_models_captures_reported_context_windows() -> Result<(), ChatError> {
+    let json_body = serde_json::json!({
+        "object": "list",
+        "data": [
+            {"id": "openai/gpt-oss-120b", "context_window": 131_072},
+            {"id": "qwen/qwen3.8-27b", "context_window": 131_042},
+            {"id": "model-without-a-window"},
+            {"id": "zero", "context_window": 0},
+            {"id": "negative", "context_window": -1},
+            {"id": "string", "context_window": "123"},
+            {"id": "fraction", "context_window": 1.5},
+            {"id": "overflow", "context_window": 1e30},
+            {"context_window": 123}
+        ]
+    })
+    .to_string();
+
+    let base_url = spawn_http_json_server("HTTP/1.1 200 OK".to_string(), json_body).await?;
+    let client = ChatClient::new(ChatConfig::new("test-key", base_url, "openai/gpt-oss-120b"));
+
+    let catalog = client.fetch_available_models("openai/gpt-oss-120b").await;
+
+    assert_eq!(
+        catalog.context_window("openai/gpt-oss-120b"),
+        Some(131_072),
+        "the provider's own figure must be captured verbatim"
+    );
+    assert_eq!(catalog.context_window("qwen/qwen3.8-27b"), Some(131_042));
+    for model in ["zero", "negative", "string", "fraction", "overflow"] {
+        assert!(catalog.ids.iter().any(|id| id == model));
+        assert_eq!(catalog.context_window(model), None);
+    }
+    assert_eq!(
+        catalog.context_window("model-without-a-window"),
+        None,
+        "a model the provider reported no window for stays unknown"
     );
     Ok(())
 }
@@ -876,8 +919,13 @@ async fn fetch_available_models_falls_back_on_http_error() -> Result<(), ChatErr
     .await?;
     let client = ChatClient::new(ChatConfig::new("test-key", base_url, "my-model"));
 
-    let models = client.fetch_available_models("my-model").await;
+    let catalog = client.fetch_available_models("my-model").await;
 
-    assert_eq!(models, vec!["my-model"]);
+    assert_eq!(catalog.ids, vec!["my-model"]);
+    assert_eq!(
+        catalog.context_window("my-model"),
+        None,
+        "a failed fetch reports no window, leaving the static table to answer"
+    );
     Ok(())
 }

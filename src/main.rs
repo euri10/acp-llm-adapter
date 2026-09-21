@@ -499,7 +499,7 @@ async fn serve(
             &default_model,
         )
         .await;
-        if let Err(e) = state.lock().map(|mut g| g.set_available_models(models)) {
+        if let Err(e) = state.lock().map(|mut g| g.model_catalog = models) {
             tracing::warn!(%e, "failed to store fetched model list");
         }
     }

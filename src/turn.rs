@@ -696,9 +696,16 @@ pub(crate) async fn stream_model_turn(
 
     // Send usage update if available
     if let Some(mut usage_data) = usage {
-        // Fill in context_length from the model table when the API omits it.
+        // Prefer discovery metadata over the static fallback when usage omits it.
         if usage_data.context_length == 0 {
-            let Some(window) = context_window_for_model(model_settings.model) else {
+            let discovered = context
+                .store
+                .map(|store| store.model_context_window(model_settings.model))
+                .transpose()?
+                .flatten();
+            let Some(window) =
+                discovered.or_else(|| context_window_for_model(model_settings.model))
+            else {
                 tracing::warn!(
                     model = model_settings.model,
                     "skipping usage_update: API reported no context_length and model has no known context window"

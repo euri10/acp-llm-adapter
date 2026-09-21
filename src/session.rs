@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use acp_llm_adapter::llm::MessageRole;
 use acp_llm_adapter::llm::{
-    ChatConfig, ChatMessage, ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition,
+    ChatConfig, ChatMessage, ModelCatalog, ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition,
 };
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, McpServer, PermissionOption, PermissionOptionKind,
@@ -510,7 +510,7 @@ pub(crate) struct AdapterState {
     /// Model IDs available for selection. Set at startup via
     /// `ChatClient::fetch_available_models` or initialised to
     /// `[default_model]` as a fallback.
-    pub(crate) available_models: Vec<String>,
+    pub(crate) model_catalog: ModelCatalog,
     pub(crate) client_capabilities: Option<ClientCapabilities>,
     pub(crate) sessions: HashMap<SessionId, SessionRecord>,
 }
@@ -521,7 +521,10 @@ impl AdapterState {
         let available_models = vec![model.clone()];
         Self {
             default_model: model,
-            available_models,
+            model_catalog: ModelCatalog {
+                ids: available_models,
+                ..ModelCatalog::default()
+            },
             client_capabilities: None,
             sessions: HashMap::new(),
         }
@@ -533,7 +536,10 @@ impl AdapterState {
     /// selector defaults correctly.
     #[allow(dead_code)] // wired in Phase 5 (model fetch at startup)
     pub(crate) fn set_available_models(&mut self, models: Vec<String>) {
-        self.available_models = models;
+        self.model_catalog = ModelCatalog {
+            ids: models,
+            ..ModelCatalog::default()
+        };
     }
 }
 
@@ -857,18 +863,27 @@ impl SessionStore {
             .state
             .lock()
             .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        Ok(guard.available_models.clone())
+        Ok(guard.model_catalog.ids.clone())
     }
 
-    /// Replace the known model list (called once at startup).
-    #[allow(dead_code)] // wired in Phase 5 (model fetch at startup)
-    pub(crate) fn set_available_models(&self, models: Vec<String>) -> Result<(), AdapterError> {
+    /// Install discovery metadata in test stores; production sets it at startup.
+    #[cfg(test)]
+    pub(crate) fn set_model_catalog(&self, models: ModelCatalog) -> Result<(), AdapterError> {
         let mut guard = self
             .state
             .lock()
             .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        guard.set_available_models(models);
+        guard.model_catalog = models;
         Ok(())
+    }
+
+    /// Look up context metadata for the model selected for this request.
+    pub(crate) fn model_context_window(&self, model: &str) -> Result<Option<u64>, AdapterError> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
+        Ok(guard.model_catalog.context_window(model))
     }
 
     /// Look up a session and return a read-only reference via a callback.

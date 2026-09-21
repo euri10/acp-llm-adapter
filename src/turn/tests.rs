@@ -1549,6 +1549,67 @@ fn usage_totals_preserve_provider_total_and_sum_optional_fields() {
 }
 
 #[test_log::test(tokio::test)]
+async fn discovered_windows_follow_selected_model_and_usage_precedence()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    store.set_model_catalog(acp_llm_adapter::llm::ModelCatalog {
+        ids: vec!["new-model".into(), "deepseek-v4-pro".into()],
+        context_windows: [
+            ("new-model".into(), 123_456),
+            ("deepseek-v4-pro".into(), 654_321),
+        ]
+        .into(),
+    })?;
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+    )?;
+    for (model, streamed_window, expected) in [
+        ("new-model", 0, 123_456),
+        ("deepseek-v4-pro", 0, 654_321),
+        ("new-model", 999, 999),
+    ] {
+        let client = FakeLlmClient::new(vec![
+            Ok(StreamEvent::Usage(UsageData {
+                input_tokens: 3,
+                output_tokens: 4,
+                context_length: streamed_window,
+                total_tokens: None,
+                thought_tokens: None,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
+            })),
+            Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+        ]);
+        let mut sizes = Vec::new();
+        stream_model_turn(
+            StreamContext {
+                llm_client: &client,
+                store: Some(&store),
+                messages: &[],
+                tool_definitions: &[],
+            },
+            ModelRequestSettings {
+                model,
+                reasoning_effort: None,
+                max_tokens: None,
+            },
+            CancellationToken::new(),
+            &session.session_id,
+            &mut |notification| {
+                if let SessionUpdate::UsageUpdate(update) = notification.update {
+                    sizes.push(update.size);
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        assert_eq!(sizes, vec![expected], "model: {model}");
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn stream_model_turn_skips_usage_update_for_unknown_model()
 -> Result<(), agent_client_protocol::Error> {
     let client = FakeLlmClient::new(vec![

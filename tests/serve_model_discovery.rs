@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router;
 use axum::extract::State;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -31,10 +31,14 @@ async fn spawn_provider_fixture()
                 hit.store(true, Ordering::SeqCst);
                 (
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    r#"{"data":[{"id":"sentinel-model"}]}"#,
+                    r#"{"data":[{"id":"sentinel-model","context_window":123456}]}"#,
                 )
             }),
         )
+        .route("/chat/completions", post(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\ndata: [DONE]\n\n")
+        }))
         .with_state(Arc::clone(&hit));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -57,7 +61,7 @@ async fn initialize_once(base_url: &str) -> Result<(), Box<dyn Error>> {
         .args(["serve", "--backend", "groq"])
         .env("LLM_API_KEY", "fixture-key")
         .env("LLM_BASE_URL", base_url)
-        .env_remove("LLM_MODEL")
+        .env("LLM_MODEL", "sentinel-model")
         .env_remove("ACP_LOG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -93,7 +97,52 @@ async fn initialize_once(base_url: &str) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Exercise startup discovery -> session state -> real usage notification.
+    let request = json!({"jsonrpc":"2.0", "id":2, "method":"session/new",
+        "params":{"cwd":"/tmp", "mcpServers":[]}});
+    stdin.write_all(format!("{request}\n").as_bytes()).await?;
+    let session_id = loop {
+        let line = lines.next_line().await?.ok_or("serve closed stdout")?;
+        let message: serde_json::Value = serde_json::from_str(&line)?;
+        if message.get("id").and_then(serde_json::Value::as_u64) == Some(2) {
+            break message
+                .pointer("/result/sessionId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing session id")?
+                .to_string();
+        }
+    };
+    let request = json!({"jsonrpc":"2.0", "id":3, "method":"session/prompt",
+        "params":{"sessionId":session_id,"prompt":[{"type":"text","text":"hello"}]}});
+    stdin.write_all(format!("{request}\n").as_bytes()).await?;
+    let mut sizes = Vec::new();
+    loop {
+        let line = lines.next_line().await?.ok_or("serve closed stdout")?;
+        let message: serde_json::Value = serde_json::from_str(&line)?;
+        if message
+            .pointer("/params/update/sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            == Some("usage_update")
+        {
+            sizes.push(
+                message
+                    .pointer("/params/update/size")
+                    .and_then(serde_json::Value::as_u64),
+            );
+        }
+        if message.get("id").and_then(serde_json::Value::as_u64) == Some(3) {
+            assert_eq!(
+                message
+                    .pointer("/result/stopReason")
+                    .and_then(serde_json::Value::as_str),
+                Some("end_turn")
+            );
+            break;
+        }
+    }
+
     child.kill().await?;
+    assert_eq!(sizes, vec![Some(123_456)]);
     Ok(())
 }
 
@@ -101,10 +150,15 @@ async fn initialize_once(base_url: &str) -> Result<(), Box<dyn Error>> {
 async fn startup_model_fetch_targets_the_configured_base_url() -> Result<(), Box<dyn Error>> {
     let (base_url, hit, cancellation) = spawn_provider_fixture().await?;
 
-    initialize_once(&base_url).await?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        initialize_once(&base_url),
+    )
+    .await;
     let reached_override = hit.load(Ordering::SeqCst);
 
     cancellation.cancel();
+    result??;
 
     assert!(
         reached_override,
