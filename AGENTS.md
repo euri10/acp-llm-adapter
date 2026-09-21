@@ -181,6 +181,11 @@ ask.
   shortlisting with `rg -l` and matching with `ast-grep`.
 - Look up a third-party crate's current documentation rather than guessing at
   method signatures or feature flags.
+- Provider constants — prices, context windows, model ids — are fetched from
+  the provider's page or API when written, never recalled, and cite that source
+  in a comment beside them. A wrong method signature fails to compile; a wrong
+  price is a plausible number that a test written from the same memory will
+  happily confirm (daa-groq-backend-jbm5).
 - Run the applicable focused checks and the complete affected suite before
   handoff, following [testing](docs/agent-testing.md). Report unavailable gates
   and pre-existing failures in unrelated in-flight files; do not fix another
