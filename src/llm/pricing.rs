@@ -48,16 +48,18 @@ fn pricing_for(model: &str) -> Option<Pricing> {
             cache_miss: 435_000,
             output: 870_000,
         },
-        // Groq bills a single input rate with no cached-prompt discount, so
-        // `cache_hit` deliberately matches `cache_miss`.
-        // <https://groq.com/pricing>
+        // Groq does have a prompt-cache tier, at half the uncached input rate.
+        // <https://console.groq.com/docs/model/openai/gpt-oss-120b>
+        // <https://console.groq.com/docs/model/openai/gpt-oss-20b>
+        // The 20b page rounds its cached rate to $0.037; the exact value is
+        // half of $0.075, matching the ratio the 120b page states in full.
         "openai/gpt-oss-120b" => Pricing {
-            cache_hit: 150_000,
+            cache_hit: 75_000,
             cache_miss: 150_000,
-            output: 750_000,
+            output: 600_000,
         },
         "openai/gpt-oss-20b" => Pricing {
-            cache_hit: 75_000,
+            cache_hit: 37_500,
             cache_miss: 75_000,
             output: 300_000,
         },
@@ -141,12 +143,12 @@ mod tests {
         assert_eq!(model_cost_micros("glm-5", &usage), None);
     }
 
-    /// Groq bills every input token at one rate: it has no cached-prompt tier,
-    /// so a usage report that splits cache hits from misses must still price
-    /// out at the flat rate rather than silently discounting the hits.
+    /// Groq's prompt cache bills reads at half the uncached input rate, so a
+    /// usage report that splits cache hits from misses must come out strictly
+    /// cheaper than the same token count billed entirely uncached.
     #[test]
-    fn groq_prices_cached_and_uncached_input_identically() {
-        let flat = UsageData {
+    fn groq_discounts_cached_input_tokens() {
+        let uncached = UsageData {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
             context_length: 131_072,
@@ -155,20 +157,22 @@ mod tests {
             cached_read_tokens: None,
             cached_write_tokens: None,
         };
-        let split = UsageData {
-            cached_read_tokens: Some(400_000),
-            cached_write_tokens: Some(600_000),
-            ..flat
+        let half_cached = UsageData {
+            cached_read_tokens: Some(500_000),
+            cached_write_tokens: Some(500_000),
+            ..uncached
         };
 
-        // 1M in at $0.15/M + 1M out at $0.75/M = $0.90.
+        // 1M in at $0.15/M + 1M out at $0.60/M = $0.75.
         assert_eq!(
-            model_cost_micros("openai/gpt-oss-120b", &flat),
-            Some(900_000)
+            model_cost_micros("openai/gpt-oss-120b", &uncached),
+            Some(750_000)
         );
+        // Half the input cached at $0.075/M: 0.5 * 0.15 + 0.5 * 0.075 + 0.60
+        // = $0.7125.
         assert_eq!(
-            model_cost_micros("openai/gpt-oss-120b", &split),
-            Some(900_000)
+            model_cost_micros("openai/gpt-oss-120b", &half_cached),
+            Some(712_500)
         );
     }
 
@@ -187,6 +191,10 @@ mod tests {
         assert_eq!(
             model_cost_micros("openai/gpt-oss-20b", &usage),
             Some(375_000)
+        );
+        assert!(
+            model_cost_micros("openai/gpt-oss-20b", &usage)
+                < model_cost_micros("openai/gpt-oss-120b", &usage)
         );
     }
 }
