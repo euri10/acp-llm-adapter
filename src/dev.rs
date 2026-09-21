@@ -45,6 +45,9 @@ pub(crate) enum Backend {
     /// Connect to the `Z.ai` GLM API (`api.z.ai`).
     #[value(name = "glm")]
     Glm,
+    /// Connect to the Groq API (`api.groq.com`).
+    #[value(name = "groq")]
+    Groq,
     /// Use a mock LLM client that returns canned responses.
     #[value(name = "mock")]
     Mock,
@@ -56,6 +59,7 @@ impl Backend {
         match self {
             Self::DeepSeek => "deepseek",
             Self::Glm => "glm",
+            Self::Groq => "groq",
             Self::Mock => "mock",
         }
     }
@@ -65,6 +69,7 @@ impl Backend {
         match self {
             Self::DeepSeek => ChatConfig::DEFAULT_BASE_URL,
             Self::Glm => "https://api.z.ai/api/paas/v4",
+            Self::Groq => "https://api.groq.com/openai/v1",
             Self::Mock => "http://localhost:0",
         }
     }
@@ -74,6 +79,7 @@ impl Backend {
         match self {
             Self::DeepSeek => ChatConfig::DEFAULT_MODEL,
             Self::Glm => "glm-4.6",
+            Self::Groq => "openai/gpt-oss-120b",
             Self::Mock => "mock-model",
         }
     }
@@ -89,37 +95,32 @@ pub(crate) fn llm_client_for_backend(
     backend: Backend,
 ) -> Result<Arc<dyn LlmClient>, agent_client_protocol::Error> {
     match backend {
-        Backend::DeepSeek => Ok(Arc::new(
-            ChatClient::from_env().map_err(agent_client_protocol::Error::into_internal_error)?,
-        )),
-        Backend::Glm => {
-            // GLM uses a different base URL and default model. The API key
-            // is read from the same `LLM_API_KEY` env var as every backend.
-            let api_key = std::env::var(ChatConfig::ENV_API_KEY)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| {
-                    agent_client_protocol::Error::internal_error().data("LLM_API_KEY is not set")
-                })?;
-
-            let base_url = std::env::var(ChatConfig::ENV_BASE_URL)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
+        Backend::Mock => Ok(Arc::new(MockLlmClient)),
+        // Every live provider is an OpenAI-compatible endpoint reached the same
+        // way: `LLM_API_KEY`, `LLM_BASE_URL` and `LLM_MODEL` are read for all of
+        // them, and the backend only decides what the latter two fall back to.
+        Backend::DeepSeek | Backend::Glm | Backend::Groq => {
+            let api_key = trimmed_env(ChatConfig::ENV_API_KEY).ok_or_else(|| {
+                agent_client_protocol::Error::internal_error().data("LLM_API_KEY is not set")
+            })?;
+            let base_url = trimmed_env(ChatConfig::ENV_BASE_URL)
                 .unwrap_or_else(|| backend.default_base_url().to_string());
-
-            let model = std::env::var(ChatConfig::ENV_MODEL)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
+            let model = trimmed_env(ChatConfig::ENV_MODEL)
                 .unwrap_or_else(|| backend.default_model().to_string());
 
-            let config = ChatConfig::new(api_key, base_url, model);
-            Ok(Arc::new(ChatClient::new(config)))
+            Ok(Arc::new(ChatClient::new(ChatConfig::new(
+                api_key, base_url, model,
+            ))))
         }
-        Backend::Mock => Ok(Arc::new(MockLlmClient)),
     }
+}
+
+/// Read an environment variable, treating blank and whitespace-only as unset.
+fn trimmed_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Build a dev agent pointing back at this adapter executable.
@@ -525,7 +526,41 @@ mod tests {
     fn backend_as_str_covers_all_variants() {
         assert_eq!(Backend::DeepSeek.as_str(), "deepseek");
         assert_eq!(Backend::Glm.as_str(), "glm");
+        assert_eq!(Backend::Groq.as_str(), "groq");
         assert_eq!(Backend::Mock.as_str(), "mock");
+    }
+
+    #[test_log::test]
+    fn groq_defaults_target_the_openai_compatible_endpoint() {
+        assert_eq!(
+            Backend::Groq.default_base_url(),
+            "https://api.groq.com/openai/v1"
+        );
+        assert_eq!(Backend::Groq.default_model(), "openai/gpt-oss-120b");
+    }
+
+    /// The live backends share one client-construction path and differ only in
+    /// these defaults, so a mix-up there would silently point one provider's
+    /// key at another provider's endpoint. Pin each pair.
+    #[test_log::test]
+    fn each_live_backend_keeps_its_own_defaults() {
+        let defaults = [
+            Backend::DeepSeek,
+            Backend::Glm,
+            Backend::Groq,
+            Backend::Mock,
+        ]
+        .map(|backend| (backend.default_base_url(), backend.default_model()));
+
+        assert_eq!(
+            defaults,
+            [
+                ("https://api.deepseek.com", "deepseek-v4-pro"),
+                ("https://api.z.ai/api/paas/v4", "glm-4.6"),
+                ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
+                ("http://localhost:0", "mock-model"),
+            ]
+        );
     }
 
     #[test_log::test]

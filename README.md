@@ -1,6 +1,6 @@
 # ACP LLM Adapter
 
-`acp-llm-adapter` is a headless ACP server that exposes LLM providers (DeepSeek, GLM) as agents to ACP-capable editors.
+`acp-llm-adapter` is a headless ACP server that exposes LLM providers (DeepSeek, GLM, Groq) as agents to ACP-capable editors.
 
 > [!WARNING]
 > This is alpha software. Expect breaking changes, incomplete ACP coverage, and rough edges while the adapter is still being shaped.
@@ -188,7 +188,9 @@ containment. Other platforms retain direct-child cleanup only.
 
 Both binaries use the same retention and redaction policy. Log files are limited to 100 MiB total and 30 days by default; override those bounds with `ACP_LOG_MAX_BYTES` and `ACP_LOG_MAX_AGE_DAYS`. Set either to `unlimited` to disable that bound entirely, which skips the corresponding eviction pass so no log is ever removed on that axis — the right setting when logs are primary evidence for filed defects rather than incidental debugging output. Only a positive integer or `unlimited` is accepted; anything else, including `0`, falls back to the default rather than guessing whether it meant keep-nothing or keep-everything. Note the size bound is aggregate across every connection and session log and evicts oldest-first, so two long sessions can evict every other session's log well before the age bound applies. Prompt, message, content, text, input, and tool-argument fields are replaced with `[REDACTED]` before structured records are written. Set `ACP_LOG_UNREDACTED=1` to write those fields in the clear instead — useful when developing against the adapter itself, but the resulting log holds full prompts and tool arguments (file contents, shell commands, anything pasted into chat), so treat it like any other file with that content and don't leave it on outside active debugging. Retention only removes `connections/*.jsonl` and session `log.jsonl` files, never session metadata or history. Set `RUST_LOG` (for example `acp_llm_adapter::llm=trace`) to control tracing output; LLM request bodies are not written at trace, only their serialized byte size.
 
-DeepSeek `usage_update` notifications include cumulative session cost for `deepseek-v4-flash` and `deepseek-v4-pro`, calculated from cache-hit, cache-miss, and output tokens. The default prices follow [DeepSeek's pricing table](https://api-docs.deepseek.com/quick_start/pricing/). For local testing or a provider price change, `DEEPSEEK_PRICING` accepts JSON such as `{"deepseek-v4-pro":{"cache_hit":0.003625,"cache_miss":0.435,"output":0.87}}`, with values in USD per million tokens.
+`usage_update` notifications include cumulative session cost for the models with known published rates: `deepseek-v4-flash` and `deepseek-v4-pro` ([DeepSeek's pricing table](https://api-docs.deepseek.com/quick_start/pricing/)), and `openai/gpt-oss-120b` and `openai/gpt-oss-20b` ([Groq's pricing table](https://groq.com/pricing)). Cost is calculated from cache-hit, cache-miss, and output tokens; Groq has no cached-prompt tier, so both input rates are the same. A model with no known rates reports usage without a cost rather than an invented one.
+
+For local testing or a provider price change, `LLM_PRICING` accepts JSON such as `{"deepseek-v4-pro":{"cache_hit":0.003625,"cache_miss":0.435,"output":0.87}}`, with values in USD per million tokens.
 
 Tracing spans for prompt turns, tool dispatch, LLM requests, and session lifecycle handlers carry `session_id`. Startup, model-list discovery, `initialize`, and new-session setup intentionally use `session_id="none"` because no ACP session exists at those entry points; child prompt spans replace that value once a session is established.
 
@@ -207,7 +209,7 @@ The adapter bridges two independent channels:
 │  Editor ──ACP/stdio──▶ ┌─────────────────┐  ┌─────────────────┐                        │
 │  (Zed,      JSON-RPC   │  acp.rs         │  │  llm/*          │                        │
 │   Neovim,   frames  ◀──│  ACP transport  │  │  HTTPS + SSE    │──▶ LLM Provider API    │
-│   ...)                 │  + request      │  │  client, types, │  │  (DeepSeek / GLM)    │
+│   ...)                 │  + request      │  │  client, types, │  │ (DeepSeek/GLM/Groq)  │
 │                        │  handlers       │  │  stream parser  │  │ /chat/completions    │
 │                        └─────────┬───────┘  └────────┬────────┘                        │
 │                                  │                   │                                 │
@@ -267,11 +269,19 @@ The adapter bridges two independent channels:
 ## Requirements
 
 - Rust stable
-- `LLM_API_KEY` (required for both DeepSeek and GLM backends)
+- `LLM_API_KEY` (required for the DeepSeek, GLM and Groq backends)
 - Optional: `LLM_BASE_URL` (overrides the provider's default base URL)
 - Optional: `LLM_MODEL` (overrides the provider's default model)
 
-Select a provider with `--backend deepseek|glm|mock`. On both `serve` and `dev`, `--backend` is required. The `mock` backend requires no API key and is useful for local testing.
+Select a provider with `--backend deepseek|glm|groq|mock`. On both `serve` and `dev`, `--backend` is required. The `mock` backend requires no API key and is useful for local testing.
+
+Every live backend is the same OpenAI-compatible client; the backend only chooses the defaults that `LLM_BASE_URL` and `LLM_MODEL` override:
+
+| Backend | Default base URL | Default model |
+| --- | --- | --- |
+| `deepseek` | `https://api.deepseek.com` | `deepseek-v4-pro` |
+| `glm` | `https://api.z.ai/api/paas/v4` | `glm-4.6` |
+| `groq` | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` |
 
 ## Supported Modes
 

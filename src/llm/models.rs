@@ -10,12 +10,22 @@
 /// Values are sourced from provider documentation:
 /// - `DeepSeek` V4: <https://api-docs.deepseek.com/quick_start/pricing>
 /// - `GLM`-4.6: <https://docs.z.ai/guides/llm>
+/// - Groq: the `context_window` field of its own `GET /models` payload
+///   (<https://console.groq.com/docs/models>). Groq reports a window for every
+///   model it serves, so these values are transcribed rather than estimated —
+///   note `qwen3.8-27b` is `131_042`, not a rounded `131_072`.
 const KNOWN_CONTEXT_WINDOWS: &[(&str, u64)] = &[
     ("deepseek-v4-pro", 1_000_000),
     ("deepseek-v4-flash", 1_000_000),
     ("deepseek-v4-flash-vision-exp", 1_000_000),
     ("deepseek-chat", 4_096),
     ("glm-4.6", 131_072),
+    ("openai/gpt-oss-120b", 131_072),
+    ("openai/gpt-oss-20b", 131_072),
+    ("openai/gpt-oss-safeguard-20b", 131_072),
+    ("qwen/qwen3.8-27b", 131_042),
+    ("groq/compound", 131_072),
+    ("groq/compound-mini", 131_072),
 ];
 
 /// Return the context window size in tokens for a known model ID.
@@ -54,6 +64,20 @@ mod tests {
     #[test]
     fn glm_46_reports_128k_window() {
         assert_eq!(context_window_for_model("glm-4.6"), Some(131_072));
+    }
+
+    #[test]
+    fn groq_models_report_their_published_windows() {
+        assert_eq!(
+            context_window_for_model("openai/gpt-oss-120b"),
+            Some(131_072)
+        );
+        assert_eq!(
+            context_window_for_model("openai/gpt-oss-20b"),
+            Some(131_072)
+        );
+        assert_eq!(context_window_for_model("qwen/qwen3.8-27b"), Some(131_042));
+        assert_eq!(context_window_for_model("groq/compound"), Some(131_072));
     }
 
     #[test]

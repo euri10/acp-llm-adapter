@@ -2,9 +2,13 @@ use serde_json::Value;
 
 use super::UsageData;
 
-const ENV_PRICING: &str = "DEEPSEEK_PRICING";
+const ENV_PRICING: &str = "LLM_PRICING";
 const MICROS_PER_MILLION: u64 = 1_000_000;
 
+/// Per-million-token rates in microdollars.
+///
+/// Providers without a cached-prompt tier set `cache_hit` equal to
+/// `cache_miss`, so the same arithmetic prices them at one flat input rate.
 #[derive(Debug, Clone, Copy)]
 struct Pricing {
     cache_hit: u64,
@@ -12,9 +16,12 @@ struct Pricing {
     output: u64,
 }
 
-/// Return the `DeepSeek` cost for one provider usage report in microdollars.
+/// Return the cost for one provider usage report in microdollars.
+///
+/// Returns `None` for a model with no known published rates, which leaves the
+/// `usage_update` without a cost rather than reporting an invented one.
 #[must_use]
-pub fn deepseek_cost_micros(model: &str, usage: &UsageData) -> Option<u64> {
+pub fn model_cost_micros(model: &str, usage: &UsageData) -> Option<u64> {
     let pricing = pricing_for(model)?;
     let cache_hit = usage.cached_read_tokens.unwrap_or(0);
     let cache_miss = usage
@@ -40,6 +47,19 @@ fn pricing_for(model: &str) -> Option<Pricing> {
             cache_hit: 3_625,
             cache_miss: 435_000,
             output: 870_000,
+        },
+        // Groq bills a single input rate with no cached-prompt discount, so
+        // `cache_hit` deliberately matches `cache_miss`.
+        // <https://groq.com/pricing>
+        "openai/gpt-oss-120b" => Pricing {
+            cache_hit: 150_000,
+            cache_miss: 150_000,
+            output: 750_000,
+        },
+        "openai/gpt-oss-20b" => Pricing {
+            cache_hit: 75_000,
+            cache_miss: 75_000,
+            output: 300_000,
         },
         _ => return None,
     };
@@ -102,13 +122,13 @@ mod tests {
             cached_write_tokens: Some(600_000),
         };
         assert_eq!(
-            deepseek_cost_micros("deepseek-v4-flash", &usage),
+            model_cost_micros("deepseek-v4-flash", &usage),
             Some(365_120)
         );
     }
 
     #[test]
-    fn unknown_models_have_no_deepseek_price() {
+    fn unknown_models_have_no_price() {
         let usage = UsageData {
             input_tokens: 1,
             output_tokens: 1,
@@ -118,6 +138,55 @@ mod tests {
             cached_read_tokens: None,
             cached_write_tokens: None,
         };
-        assert_eq!(deepseek_cost_micros("glm-5", &usage), None);
+        assert_eq!(model_cost_micros("glm-5", &usage), None);
+    }
+
+    /// Groq bills every input token at one rate: it has no cached-prompt tier,
+    /// so a usage report that splits cache hits from misses must still price
+    /// out at the flat rate rather than silently discounting the hits.
+    #[test]
+    fn groq_prices_cached_and_uncached_input_identically() {
+        let flat = UsageData {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            context_length: 131_072,
+            total_tokens: None,
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
+        };
+        let split = UsageData {
+            cached_read_tokens: Some(400_000),
+            cached_write_tokens: Some(600_000),
+            ..flat
+        };
+
+        // 1M in at $0.15/M + 1M out at $0.75/M = $0.90.
+        assert_eq!(
+            model_cost_micros("openai/gpt-oss-120b", &flat),
+            Some(900_000)
+        );
+        assert_eq!(
+            model_cost_micros("openai/gpt-oss-120b", &split),
+            Some(900_000)
+        );
+    }
+
+    #[test]
+    fn groq_gpt_oss_20b_is_priced_below_the_120b() {
+        let usage = UsageData {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            context_length: 131_072,
+            total_tokens: None,
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
+        };
+        // 1M in at $0.075/M + 1M out at $0.30/M = $0.375.
+        assert_eq!(
+            model_cost_micros("openai/gpt-oss-20b", &usage),
+            Some(375_000)
+        );
     }
 }

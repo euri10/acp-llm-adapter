@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use acp_llm_adapter::llm::{
     ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
     ToolCall as ChatToolCall, ToolDefinition, UsageData, context_window_for_model,
-    deepseek_cost_micros,
+    model_cost_micros,
 };
 use agent_client_protocol::schema::v1::{
     ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, Diff, MessageId, Plan, PromptRequest,
@@ -721,7 +721,7 @@ pub(crate) async fn stream_model_turn(
             size = usage_data.context_length,
             "sending usage_update notification"
         );
-        let cost = deepseek_cost_micros(model_settings.model, &usage_data)
+        let cost = model_cost_micros(model_settings.model, &usage_data)
             .zip(context.store)
             .map(|(cost_micros, store)| store.add_cost_micros(session_id, cost_micros))
             .transpose()?;
