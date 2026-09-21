@@ -239,7 +239,7 @@ The adapter bridges two independent channels:
 
 **Right side** — the adapter speaks HTTPS + Server-Sent Events to the provider's OpenAI-compatible `/chat/completions` endpoint via a thin client owned by this crate in [`src/llm/`](src/llm/). A [`LlmClient`](src/llm/client.rs) trait provides the mock seam for testing without a live API key.
 
-**Middle** — the adapter is the translator _and_ the agent harness. [`turn.rs`](src/turn.rs) orchestrates the prompt→tool-call→execute→feed-back loop. [`tools.rs`](src/tools.rs) registers built-in tools (read/write/edit files, glob, grep, shell commands) and routes execution to the right backend. [`mcp.rs`](src/mcp.rs) connects to external MCP servers and exposes their tools through the same loop. [`session_store.rs`](src/session_store.rs) provides optional filesystem persistence so sessions survive process restarts.
+**Middle** — the adapter is the translator _and_ the agent harness. [`turn.rs`](src/turn.rs) orchestrates the prompt→tool-call→execute→feed-back loop. [`tools.rs`](src/tools.rs) registers built-in tools (read/write/edit files, glob, grep, shell commands) and routes execution to the right backend. [`mcp.rs`](src/mcp.rs) connects to external MCP servers and exposes their tools through the same loop. [`session_store.rs`](src/session_store.rs) provides optional filesystem persistence so sessions survive process restarts. Accepted prompts are saved before provider work, so even a first-request failure remains discoverable and resumable; a storage failure prevents the provider request.
 
 ### Module Map
 

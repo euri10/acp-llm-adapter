@@ -2,13 +2,15 @@
 use super::{ModelRequestSettings, StreamContext, handle_prompt_request, stream_model_turn};
 use crate::acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
-    WriteTextFileRequester, handle_delete_session_request, handle_new_session_request,
+    WriteTextFileRequester, handle_delete_session_request, handle_list_sessions_request,
+    handle_load_session_request, handle_new_session_request,
     handle_set_session_config_option_request,
 };
 use crate::session::{
     DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SESSION_CONFIG_MODE_ID, SessionBehavior,
     SessionStore,
 };
+use crate::session_store::FilesystemSessionStore;
 use crate::test_store;
 use crate::test_utils::{FakePermissionRequester, select_current_value};
 use crate::tools::{
@@ -20,9 +22,10 @@ use acp_llm_adapter::llm::{
     ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition, UsageData,
 };
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, DeleteSessionRequest, PromptRequest,
-    RequestPermissionRequest, RequestPermissionResponse, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason, ToolCallContent, ToolCallStatus, ToolKind,
+    CancelNotification, ContentBlock, DeleteSessionRequest, ListSessionsRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, RequestPermissionRequest,
+    RequestPermissionResponse, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    StopReason, ToolCallContent, ToolCallStatus, ToolKind,
 };
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
@@ -965,6 +968,131 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
 }
 
 #[test_log::test(tokio::test)]
+async fn failed_first_prompt_survives_restart_and_resume() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = std::env::temp_dir().join(format!("acp-failed-prompt-{}", uuid::Uuid::new_v4()));
+    let persistence = FilesystemSessionStore::new(&root);
+    let store = test_store().with_persistence(persistence.clone());
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    // Observed in session-7801c332-5e18-4a3b-a144-da8d49082c22/log.jsonl:4:
+    // the first provider request fails before any assistant output (louiselm-xd0sn).
+    let client = FakeLlmClient::new(vec![Err(ChatError::Transport(Box::new(
+        std::io::Error::other("unexpected HTTP status code: 402 Payment Required"),
+    )))]);
+    let Err(error) = handle_prompt_request(
+        &store,
+        &client,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("original request")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await
+    else {
+        return Err("provider failure must remain an error".into());
+    };
+    assert!(error.to_string().contains("402 Payment Required"));
+    drop(store);
+
+    let restarted = test_store().with_persistence(persistence.clone());
+    let listed = handle_list_sessions_request(&restarted, &ListSessionsRequest::new())?;
+    assert_eq!(
+        listed.sessions.len(),
+        1,
+        "failed prompt must remain discoverable"
+    );
+    assert_eq!(listed.sessions[0].session_id, session.session_id);
+    let mut replay = Vec::new();
+    handle_load_session_request(
+        &restarted,
+        &LoadSessionRequest::new(session.session_id.clone(), "/tmp"),
+        |notification| {
+            replay.push(notification);
+            Ok(())
+        },
+    )
+    .await?;
+    assert!(replay.iter().any(|notification| matches!(&notification.update,
+        SessionUpdate::UserMessageChunk(chunk) if chunk.content == ContentBlock::from("original request"))));
+
+    let client = FakeLlmClient::new(vec![
+        Ok(StreamEvent::Message("recovered".to_string())),
+        Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+    ]);
+    handle_prompt_request(
+        &restarted,
+        &client,
+        &EmptyToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("continue")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+    assert_eq!(
+        persistence
+            .load_record(session.session_id.0.as_ref())?
+            .history,
+        vec![
+            ChatMessage::user("original request"),
+            ChatMessage::user("continue"),
+            ChatMessage::assistant("recovered"),
+        ]
+    );
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn prompt_persistence_failure_prevents_provider_work_and_releases_turn()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = std::env::temp_dir().join(format!("acp-prompt-disk-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&root, b"not a directory")?;
+    let store =
+        test_store().with_persistence(crate::session_store::FilesystemSessionStore::new(&root));
+    let session = handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+    )?;
+    let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+    for _ in 0..2 {
+        let Err(error) = handle_prompt_request(
+            &store,
+            &client,
+            &EmptyToolRegistry,
+            None,
+            PromptRequest::new(
+                session.session_id.clone(),
+                vec![ContentBlock::from("persist first")],
+            ),
+            DEFAULT_MAX_TURN_REQUESTS,
+            |_| Ok(()),
+        )
+        .await
+        else {
+            return Err("unwritable store must fail the prompt".into());
+        };
+        assert!(error.to_string().contains("Not a directory"), "{error}");
+        assert!(
+            client
+                .requests()
+                .lock()
+                .map_err(|e| e.to_string())?
+                .is_empty()
+        );
+    }
+    std::fs::remove_file(root)?;
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let session = handle_new_session_request(
@@ -1323,7 +1451,8 @@ async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_pr
         .get(&session_id)
         .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing session"))?;
     assert!(session.active_turn.is_none());
-    assert!(session.history.is_empty());
+    // Cancellation retains the accepted prompt, but not an incomplete assistant reply.
+    assert_eq!(session.history, vec![ChatMessage::user("cancel me")]);
 
     Ok(())
 }

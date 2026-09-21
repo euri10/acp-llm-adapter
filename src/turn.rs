@@ -316,6 +316,8 @@ pub(crate) async fn handle_prompt_request(
     )?;
 
     let result = async {
+        // A first-request failure must still leave a listable, replayable Session.
+        store.save_history(&session_id, &turn_setup.messages)?;
         notify(session_notification(session_id.clone(), {
             let mut session_info_update =
                 SessionInfoUpdate::new().updated_at(turn_setup.updated_at.clone());
