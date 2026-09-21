@@ -85,6 +85,50 @@ impl Backend {
     }
 }
 
+/// Resolve the provider connection settings for a live backend.
+///
+/// Every live provider is an OpenAI-compatible endpoint reached the same way:
+/// `LLM_API_KEY`, `LLM_BASE_URL` and `LLM_MODEL` are read for all of them, and
+/// the backend only decides what the latter two fall back to.
+///
+/// This is the single place those three are resolved. Callers that need the
+/// endpoint — the chat client and the startup model fetch — must share one
+/// result, or an override applied to one of them silently sends the configured
+/// key somewhere the operator did not name (daa-base-url-desync-sx0r).
+///
+/// # Errors
+///
+/// Returns an ACP internal error if `LLM_API_KEY` is missing or empty.
+pub(crate) fn resolved_chat_config(
+    backend: Backend,
+) -> Result<ChatConfig, agent_client_protocol::Error> {
+    resolved_chat_config_from_fn(backend, trimmed_env)
+}
+
+/// Resolve provider settings from a caller-supplied environment lookup.
+///
+/// This is the testable core of [`resolved_chat_config`]; production code uses
+/// that wrapper. Taking the lookup as an argument keeps the tests off the
+/// ambient process environment, which is an input they must not read.
+///
+/// # Errors
+///
+/// Returns an ACP internal error if the API key is missing or empty.
+fn resolved_chat_config_from_fn(
+    backend: Backend,
+    mut get_env: impl FnMut(&str) -> Option<String>,
+) -> Result<ChatConfig, agent_client_protocol::Error> {
+    let api_key = get_env(ChatConfig::ENV_API_KEY).ok_or_else(|| {
+        agent_client_protocol::Error::internal_error().data("LLM_API_KEY is not set")
+    })?;
+    let base_url =
+        get_env(ChatConfig::ENV_BASE_URL).unwrap_or_else(|| backend.default_base_url().to_string());
+    let model =
+        get_env(ChatConfig::ENV_MODEL).unwrap_or_else(|| backend.default_model().to_string());
+
+    Ok(ChatConfig::new(api_key, base_url, model))
+}
+
 /// Build the appropriate LLM client for a backend.
 ///
 /// # Errors
@@ -96,21 +140,8 @@ pub(crate) fn llm_client_for_backend(
 ) -> Result<Arc<dyn LlmClient>, agent_client_protocol::Error> {
     match backend {
         Backend::Mock => Ok(Arc::new(MockLlmClient)),
-        // Every live provider is an OpenAI-compatible endpoint reached the same
-        // way: `LLM_API_KEY`, `LLM_BASE_URL` and `LLM_MODEL` are read for all of
-        // them, and the backend only decides what the latter two fall back to.
         Backend::DeepSeek | Backend::Glm | Backend::Groq => {
-            let api_key = trimmed_env(ChatConfig::ENV_API_KEY).ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("LLM_API_KEY is not set")
-            })?;
-            let base_url = trimmed_env(ChatConfig::ENV_BASE_URL)
-                .unwrap_or_else(|| backend.default_base_url().to_string());
-            let model = trimmed_env(ChatConfig::ENV_MODEL)
-                .unwrap_or_else(|| backend.default_model().to_string());
-
-            Ok(Arc::new(ChatClient::new(ChatConfig::new(
-                api_key, base_url, model,
-            ))))
+            Ok(Arc::new(ChatClient::new(resolved_chat_config(backend)?)))
         }
     }
 }
@@ -423,7 +454,7 @@ mod tests {
     use super::{
         Backend, DevSmokeResult, MockLlmClient, MockPermissionRequester, build_dev_agent,
         exercise_permission_gate_smoke, llm_client_for_backend, print_dev_smoke_result,
-        run_smoke_flow,
+        resolved_chat_config_from_fn, run_smoke_flow,
     };
     use super::{MOCK_TOOL_CALL_ID, MOCK_TOOL_DIRECTIVE};
     use crate::acp::{
@@ -431,7 +462,9 @@ mod tests {
     };
     use crate::session::DEFAULT_MAX_TURN_REQUESTS;
     use crate::tools::EmptyToolRegistry;
-    use acp_llm_adapter::llm::{ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent};
+    use acp_llm_adapter::llm::{
+        ChatConfig, ChatMessage, ChatRequest, FinishReason, LlmClient, StreamEvent,
+    };
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
@@ -537,6 +570,44 @@ mod tests {
             "https://api.groq.com/openai/v1"
         );
         assert_eq!(Backend::Groq.default_model(), "openai/gpt-oss-120b");
+    }
+
+    /// The unset case for the optional overrides: with no `LLM_BASE_URL` or
+    /// `LLM_MODEL`, each backend must resolve to its own defaults.
+    #[test_log::test]
+    fn resolved_config_falls_back_to_backend_defaults() {
+        let lookup = |key: &str| (key == ChatConfig::ENV_API_KEY).then(|| "key".to_string());
+
+        for backend in [Backend::DeepSeek, Backend::Glm, Backend::Groq] {
+            let config = resolved_chat_config_from_fn(backend, lookup)
+                .unwrap_or_else(|_| ChatConfig::new("", "", ""));
+            assert_eq!(config.base_url(), backend.default_base_url());
+            assert_eq!(config.model(), backend.default_model());
+        }
+    }
+
+    /// The configured case: an override wins over the backend default. Both
+    /// the chat client and the startup model fetch read this one result, so
+    /// this is what keeps them on the same endpoint (daa-base-url-desync-sx0r).
+    #[test_log::test]
+    fn resolved_config_prefers_the_environment_overrides() {
+        let lookup = |key: &str| match key {
+            ChatConfig::ENV_API_KEY => Some("key".to_string()),
+            ChatConfig::ENV_BASE_URL => Some("https://example.invalid/v1".to_string()),
+            ChatConfig::ENV_MODEL => Some("some-other-model".to_string()),
+            _ => None,
+        };
+
+        let config = resolved_chat_config_from_fn(Backend::Groq, lookup)
+            .unwrap_or_else(|_| ChatConfig::new("", "", ""));
+
+        assert_eq!(config.base_url(), "https://example.invalid/v1");
+        assert_eq!(config.model(), "some-other-model");
+    }
+
+    #[test_log::test]
+    fn resolved_config_requires_an_api_key() {
+        assert!(resolved_chat_config_from_fn(Backend::Groq, |_| None).is_err());
     }
 
     /// The live backends share one client-construction path and differ only in

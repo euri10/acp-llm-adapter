@@ -25,7 +25,7 @@ use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
 
 use acp_llm_adapter::error::AdapterError;
-use acp_llm_adapter::llm::{ChatConfig, FinishReason};
+use acp_llm_adapter::llm::FinishReason;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
     SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
@@ -53,7 +53,7 @@ pub(crate) use acp::{
 };
 pub(crate) use dev::{
     Backend, build_dev_agent, exercise_permission_gate_smoke, llm_client_for_backend,
-    print_dev_smoke_result, run_smoke_flow,
+    print_dev_smoke_result, resolved_chat_config, run_smoke_flow,
 };
 pub(crate) use mcp::{
     McpSession, connect_mcp_sessions, is_mcp_tool_name, mcp_tool_execution, mcp_tool_kind,
@@ -478,27 +478,29 @@ async fn serve(
     let llm_client = llm_client_for_backend(backend)?;
     let tool_registry = Arc::new(AdapterToolRegistry);
 
-    let default_model = initial_model(backend.default_model());
+    // Resolve the provider settings once and reuse them below, so the model
+    // fetch cannot end up on a different endpoint than the chat client.
+    let chat_config = match backend {
+        Backend::Mock => None,
+        _ => Some(resolved_chat_config(backend)?),
+    };
+
+    let default_model = chat_config.as_ref().map_or_else(
+        || initial_model(backend.default_model()),
+        |config| config.model().to_string(),
+    );
     let state = Arc::new(Mutex::new(AdapterState::new(default_model.clone())));
 
-    // Fetch the live model list from the provider. Uses the backend's known
-    // base URL and the API key from the process environment so the endpoint
-    // always matches the provider (DeepSeek → api.deepseek.com, GLM → api.z.ai).
-    if backend != Backend::Mock {
-        let api_key = std::env::var(ChatConfig::ENV_API_KEY)
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-
-        if let Some(ref key) = api_key {
-            let models = acp_llm_adapter::llm::fetch_available_models(
-                backend.default_base_url(),
-                key,
-                &default_model,
-            )
-            .await;
-            if let Err(e) = state.lock().map(|mut g| g.set_available_models(models)) {
-                tracing::warn!(%e, "failed to store fetched model list");
-            }
+    // Fetch the live model list from the same endpoint the completions go to.
+    if let Some(ref config) = chat_config {
+        let models = acp_llm_adapter::llm::fetch_available_models(
+            config.base_url(),
+            config.api_key(),
+            &default_model,
+        )
+        .await;
+        if let Err(e) = state.lock().map(|mut g| g.set_available_models(models)) {
+            tracing::warn!(%e, "failed to store fetched model list");
         }
     }
 
