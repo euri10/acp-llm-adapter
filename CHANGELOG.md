@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/euri10/acp-llm-adapter/compare/v0.8.0...v0.9.0) - 2026-09-24
+
+### Fixed
+
+- *(logsink)* [**breaking**] never evict logs another writer asked to keep
+- *(session)* persist prompts before provider calls
+
+### Other
+
+- *(beads)* close shared log retention bug
+- *(beads)* file shared log retention pruning bug
+
 ## [0.8.0](https://github.com/euri10/acp-llm-adapter/compare/v0.7.6...v0.8.0) - 2026-09-21
 
 ### Added
