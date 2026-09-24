@@ -426,6 +426,24 @@ fn a_migrated_legacy_record_deserialises() {
     assert!(decoded.timestamp.ends_with('Z'));
 }
 
+const UNLIMITED: RetentionPolicy = RetentionPolicy {
+    max_bytes: None,
+    max_age: None,
+};
+
+/// Bounds that evict every log written under a bound: one byte, zero age.
+const EVICT_EVERYTHING: RetentionPolicy = RetentionPolicy {
+    max_bytes: Some(1),
+    max_age: Some(Duration::ZERO),
+};
+
+fn write_one(root: &Path, policy: RetentionPolicy, connection_id: &str, text: &str) {
+    let (sink, writer) = LogSink::channel_with_policy(root, 4, policy);
+    let connection = open(&sink, connection_id);
+    connection.log(LogRecord::text(Direction::Internal, "record", text));
+    drain(sink, connection, writer);
+}
+
 #[test]
 fn retention_bounds_apply_on_startup_and_preserve_session_artifacts() {
     let root = TempRoot::new("retention");
@@ -433,12 +451,26 @@ fn retention_bounds_apply_on_startup_and_preserve_session_artifacts() {
     let session_log = root.path().join("sessions/session-1/log.jsonl");
     let metadata = root.path().join("sessions/session-1/meta.json");
     let history = root.path().join("sessions/session-1/history.jsonl");
-    for path in [&old_log, &session_log, &metadata, &history] {
+    for path in [&metadata, &history] {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap_or_default();
         }
         fs::write(path, "seed").unwrap_or_default();
     }
+    let month = RetentionPolicy {
+        max_bytes: Some(u64::MAX),
+        max_age: Some(Duration::from_hours(30 * 24)),
+    };
+    let (sink, writer) = LogSink::channel_with_policy(root.path(), 4, month);
+    let connection = open(&sink, "old");
+    connection.log(LogRecord::text(Direction::Internal, "seed", "connection"));
+    connection
+        .log(LogRecord::text(Direction::Internal, "seed", "session").with_session("session-1"));
+    drain(sink, connection, writer);
+    assert!(
+        old_log.exists() && session_log.exists(),
+        "seed logs were written"
+    );
 
     let policy = RetentionPolicy {
         max_bytes: Some(u64::MAX),
@@ -539,6 +571,85 @@ fn an_unlimited_age_bound_keeps_an_ancient_log() {
         ancient.exists(),
         "no log may be evicted when the age bound is unlimited"
     );
+}
+
+#[test]
+fn a_bounded_writer_never_evicts_logs_written_under_unlimited_retention() {
+    let root = TempRoot::new("shared-unlimited");
+    write_one(root.path(), UNLIMITED, "conn-keeper", "evidence to keep");
+    write_one(
+        root.path(),
+        EVICT_EVERYTHING,
+        "conn-bounded",
+        "exceeds one byte",
+    );
+
+    assert!(
+        root.path().join("connections/conn-keeper.jsonl").exists(),
+        "a writer's bounds must not evict logs another writer asked to keep"
+    );
+    assert!(
+        !root.path().join("connections/conn-bounded.jsonl").exists(),
+        "a bounded writer still evicts logs written under its bounds"
+    );
+}
+
+#[test]
+fn a_bounded_writer_never_evicts_logs_of_unknown_retention() {
+    let root = TempRoot::new("shared-unknown");
+    let foreign = root.path().join("connections/foreign.jsonl");
+    let foreign_session = root.path().join("sessions/foreign-session/log.jsonl");
+    for path in [&foreign, &foreign_session] {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap_or_default();
+        }
+        fs::write(path, "written without a retention record").unwrap_or_default();
+    }
+
+    write_one(
+        root.path(),
+        EVICT_EVERYTHING,
+        "conn-bounded",
+        "exceeds one byte",
+    );
+
+    assert!(foreign.exists(), "unknown retention intent must be kept");
+    assert!(
+        foreign_session.exists(),
+        "unknown retention intent must be kept"
+    );
+}
+
+#[test]
+fn any_unlimited_writer_keeps_a_shared_log() {
+    let root = TempRoot::new("shared-upgrade");
+    let month = RetentionPolicy {
+        max_bytes: Some(u64::MAX),
+        max_age: Some(Duration::from_hours(30 * 24)),
+    };
+    write_one(root.path(), month, "conn-shared", "first writer is bounded");
+    write_one(
+        root.path(),
+        UNLIMITED,
+        "conn-shared",
+        "second writer keeps everything",
+    );
+    write_one(
+        root.path(),
+        EVICT_EVERYTHING,
+        "conn-sweeper",
+        "exceeds one byte",
+    );
+
+    assert!(
+        root.path().join("connections/conn-shared.jsonl").exists(),
+        "one unlimited writer is enough to keep a log"
+    );
+}
+
+#[test]
+fn default_retention_never_evicts() {
+    assert_eq!(RetentionPolicy::default(), UNLIMITED);
 }
 
 #[test]

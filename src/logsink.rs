@@ -26,6 +26,16 @@
 //! leaves a mapping record behind in the connection file, so the two halves of
 //! a session's story can always be stitched back together.
 //!
+//! # Retention
+//!
+//! Several processes can share one root, each with its own
+//! [`crate::logsink::RetentionPolicy`]. When a writer first opens a log file it records its
+//! bounds beside it in `<file>.retention`; a file written by several writers
+//! records the most permissive bound on each axis. A sweep only evicts a file
+//! whose record says every writer accepted a bound on that axis. A file with no
+//! record — written before records existed, or by a foreign process — is never
+//! evicted: unknown retention intent means keep.
+//!
 //! # Backpressure
 //!
 //! Writing never blocks the caller. Records go onto a bounded queue drained by
@@ -51,6 +61,7 @@ use crate::timestamp::iso_timestamp_millis_now;
 const CONNECTIONS_DIR: &str = "connections";
 const SESSIONS_DIR: &str = "sessions";
 const SESSION_LOG_FILE: &str = "log.jsonl";
+const RETENTION_SUFFIX: &str = ".retention";
 
 /// Record kind emitted when a connection learns its session id.
 pub const KIND_SESSION_BOUND: &str = "session-bound";
@@ -69,32 +80,47 @@ pub const ENV_MAX_AGE_DAYS: &str = "ACP_LOG_MAX_AGE_DAYS";
 /// any value other than empty or `0` to write those fields in the clear, for
 /// local debugging where the real content is what you're chasing.
 pub const ENV_UNREDACTED: &str = "ACP_LOG_UNREDACTED";
-/// Default aggregate size limit for structured logs.
-pub const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
-/// Default age limit for structured logs.
-pub const DEFAULT_MAX_AGE: Duration = Duration::from_hours(30 * 24);
 
 /// Retention bounds applied to log files only.
 ///
 /// `None` on either field means that bound is unlimited and the corresponding
-/// eviction pass is skipped entirely. Both unlimited means no log is ever
-/// removed, which is the correct setting when the logs are primary evidence
-/// for filed defects rather than incidental debugging output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// eviction pass is skipped entirely. Both unlimited — the default — means no
+/// log is ever removed: logs are primary evidence for filed defects, so
+/// deletion happens only when an operator asks for a bound.
+///
+/// A bound only ever evicts logs written under a bound on the same axis; see
+/// the module documentation on retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetentionPolicy {
-    /// Maximum combined size of all connection and session log files, or
-    /// `None` for no size bound.
+    /// Maximum combined size of the bounded connection and session log files,
+    /// or `None` for no size bound.
     pub max_bytes: Option<u64>,
-    /// Maximum age of a log file before it is removed, or `None` for no age
-    /// bound.
+    /// Maximum age of a bounded log file before it is removed, or `None` for no
+    /// age bound.
     pub max_age: Option<Duration>,
 }
 
-impl Default for RetentionPolicy {
-    fn default() -> Self {
+/// Bounds recorded beside a log file: the most permissive of its writers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RetentionRecord {
+    max_bytes: Option<u64>,
+    max_age_secs: Option<u64>,
+}
+
+impl RetentionRecord {
+    fn of(policy: RetentionPolicy) -> Self {
         Self {
-            max_bytes: Some(DEFAULT_MAX_BYTES),
-            max_age: Some(DEFAULT_MAX_AGE),
+            max_bytes: policy.max_bytes,
+            max_age_secs: policy.max_age.map(|age| age.as_secs()),
+        }
+    }
+
+    /// Keep the more permissive bound on each axis; unlimited always wins.
+    fn merge(self, other: Self) -> Self {
+        let wider = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a, b)| a.max(b));
+        Self {
+            max_bytes: wider(self.max_bytes, other.max_bytes),
+            max_age_secs: wider(self.max_age_secs, other.max_age_secs),
         }
     }
 }
@@ -109,7 +135,7 @@ pub(crate) enum Override {
     Unlimited,
     /// The bound is set to this positive value.
     Value(u64),
-    /// The value could not be used, so the documented default applies.
+    /// The value could not be used, so the axis stays unlimited.
     Invalid,
 }
 
@@ -131,27 +157,22 @@ pub(crate) fn parse_override(raw: &str) -> Override {
 }
 
 impl RetentionPolicy {
-    /// Read retention overrides, falling back to documented defaults when an
-    /// override is missing, zero, or malformed.
+    /// Read retention overrides. A missing, zero, or malformed override leaves
+    /// that axis unlimited, so nothing is ever evicted by accident.
     #[must_use]
     pub fn from_env() -> Self {
-        let defaults = Self::default();
         let max_bytes = match std::env::var(ENV_MAX_BYTES).as_deref().map(parse_override) {
-            Ok(Override::Unlimited) => None,
             Ok(Override::Value(value)) => Some(value),
-            Ok(Override::Invalid) | Err(_) => defaults.max_bytes,
+            Ok(Override::Unlimited | Override::Invalid) | Err(_) => None,
         };
         let max_age = match std::env::var(ENV_MAX_AGE_DAYS)
             .as_deref()
             .map(parse_override)
         {
-            Ok(Override::Unlimited) => None,
             // A day count large enough to overflow seconds is unusable as a
-            // bound; fall back rather than silently wrapping to a short one.
-            Ok(Override::Value(days)) => days
-                .checked_mul(24 * 60 * 60)
-                .map_or(defaults.max_age, |secs| Some(Duration::from_secs(secs))),
-            Ok(Override::Invalid) | Err(_) => defaults.max_age,
+            // bound; stay unlimited rather than silently wrapping to a short one.
+            Ok(Override::Value(days)) => days.checked_mul(24 * 60 * 60).map(Duration::from_secs),
+            Ok(Override::Unlimited | Override::Invalid) | Err(_) => None,
         };
 
         Self { max_bytes, max_age }
@@ -525,6 +546,9 @@ impl LogWriter {
 
         if !self.files.contains_key(destination) {
             let path = self.layout.path_for(destination);
+            // Recorded before the first line, so a concurrent sweep never sees
+            // this writer's log without its retention intent.
+            record_retention(&path, RetentionRecord::of(self.policy))?;
             let file = open_append(&path)?;
             self.files.insert(destination.clone(), file);
         }
@@ -541,11 +565,15 @@ impl LogWriter {
         Ok(())
     }
 
+    /// Evict logs past this writer's bounds, considering only logs whose
+    /// recorded retention accepts a bound on the same axis.
     fn prune(&mut self) -> Result<(), LogSinkError> {
         if let Some(max_age) = self.policy.max_age {
             let now = SystemTime::now();
             let cutoff = now.checked_sub(max_age).unwrap_or(UNIX_EPOCH);
-            for file in self.log_files()?.iter().filter(|f| f.modified < cutoff) {
+            for file in self.log_files()?.iter().filter(|file| {
+                file.retention.is_some_and(|r| r.max_age_secs.is_some()) && file.modified < cutoff
+            }) {
                 self.remove_log_file(&file.path)?;
             }
         }
@@ -554,6 +582,7 @@ impl LogWriter {
             return Ok(());
         };
         let mut files = self.log_files()?;
+        files.retain(|file| file.retention.is_some_and(|r| r.max_bytes.is_some()));
         let mut total = files.iter().map(|file| file.size).sum::<u64>();
         files.sort_by_key(|file| file.modified);
         for file in files {
@@ -583,12 +612,51 @@ impl LogWriter {
         for destination in destinations {
             self.files.remove(&destination);
         }
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        remove_if_present(path)?;
+        remove_if_present(&retention_path(path))
     }
+}
+
+fn remove_if_present(path: &Path) -> Result<(), LogSinkError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn retention_path(log: &Path) -> PathBuf {
+    let mut name = log.as_os_str().to_owned();
+    name.push(RETENTION_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Read a log's recorded retention; `None` when it has no record.
+///
+/// # Errors
+///
+/// An unreadable or malformed record is an error, which aborts the sweep and
+/// so keeps every log rather than guessing.
+fn read_retention(log: &Path) -> Result<Option<RetentionRecord>, LogSinkError> {
+    match fs::read(retention_path(log)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Merge this writer's bounds into a log's retention record.
+fn record_retention(log: &Path, own: RetentionRecord) -> Result<(), LogSinkError> {
+    let merged = match read_retention(log)? {
+        Some(existing) if existing.merge(own) == existing => return Ok(()),
+        Some(existing) => existing.merge(own),
+        None => own,
+    };
+    if let Some(parent) = log.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(retention_path(log), serde_json::to_vec(&merged)?)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -596,6 +664,7 @@ struct LogFile {
     path: PathBuf,
     size: u64,
     modified: SystemTime,
+    retention: Option<RetentionRecord>,
 }
 
 fn collect_log_files(
@@ -621,10 +690,12 @@ fn collect_log_files(
                     .is_some_and(|name| name == SESSION_LOG_FILE))
         {
             let metadata = fs::metadata(&path)?;
+            let retention = read_retention(&path)?;
             files.push(LogFile {
                 path,
                 size: metadata.len(),
                 modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                retention,
             });
         }
     }
