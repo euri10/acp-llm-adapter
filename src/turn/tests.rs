@@ -103,6 +103,238 @@ enum FakeStreamStep {
     WaitForCancel,
 }
 
+// Selected-content isolation is an opt-in creation contract, not Plan/YOLO mode.
+fn selected_request() -> NewSessionRequest {
+    NewSessionRequest::new("/tmp").meta(serde_json::Map::from_iter([(
+        "io.github.euri10.louiselm.selectedContent".to_string(),
+        serde_json::json!({"version":1,"input_bytes":1024,"output_bytes":128,
+            "max_tokens":64,"timeout_ms":1000}),
+    )]))
+}
+
+#[test_log::test(tokio::test)]
+async fn selected_content_is_one_attempt_with_unknown_usage_and_no_persisted_payload()
+-> Result<(), AdapterError> {
+    let directory = std::env::temp_dir().join(format!("selected-content-{}", uuid::Uuid::new_v4()));
+    let persistence = FilesystemSessionStore::new(&directory);
+    let store = test_store().with_persistence(persistence);
+    let session = handle_new_session_request(&store, &selected_request())?;
+    let client = FakeLlmClient::new(vec![
+        Ok(StreamEvent::Message("bounded answer".to_string())),
+        Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+    ]);
+    let response = handle_prompt_request(
+        &store,
+        &client,
+        &AdapterToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("private selected snapshot")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await?;
+    assert!(
+        response.usage.is_none(),
+        "absence of a usage event is unknown, not zero"
+    );
+    {
+        let requests = client.requests();
+        let requests = requests
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?;
+        assert_eq!(requests[0].max_tokens(), Some(64));
+    }
+    assert!(!directory.join(session.session_id.0.as_ref()).exists());
+    let repeated = handle_prompt_request(
+        &store,
+        &client,
+        &AdapterToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("again")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await;
+    assert!(
+        matches!(repeated, Err(AdapterError::InvalidRequest(ref message))
+        if message == "selected-content Sessions allow one attempt")
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn selected_content_denies_every_tool_and_never_requests_a_followup()
+-> Result<(), AdapterError> {
+    for tool in [
+        "read_file",
+        "glob",
+        "run_command",
+        "write_file",
+        "update_plan",
+        "mcp__server__tool",
+    ] {
+        let store = test_store();
+        let session = handle_new_session_request(&store, &selected_request())?;
+        store.set_mode(&session.session_id, SessionBehavior::Yolo)?;
+        let direct = AdapterToolRegistry
+            .execute(
+                &ChatToolCall::new("direct", tool, "{}"),
+                &ToolContext {
+                    session_id: session.session_id.clone(),
+                    cwd: "/tmp".into(),
+                    additional_directories: Vec::new(),
+                    client_capabilities: None,
+                },
+                &store,
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!direct.success);
+        assert_eq!(
+            direct.content,
+            "selected-content Sessions refuse all tool calls"
+        );
+        let client = FakeLlmClient::new(vec![
+            Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                0,
+                Some("call-1".to_string()),
+                Some(tool.to_string()),
+                Some("{}".to_string()),
+            ))),
+            Ok(StreamEvent::Finished(FinishReason::ToolCalls)),
+        ]);
+        let result = handle_prompt_request(
+            &store,
+            &client,
+            &AdapterToolRegistry,
+            None,
+            PromptRequest::new(
+                session.session_id.clone(),
+                vec![ContentBlock::from("selected source")],
+            ),
+            DEFAULT_MAX_TURN_REQUESTS,
+            |_| Ok(()),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AdapterError::InvalidRequest(ref message))
+            if message == "selected-content Sessions refuse all tool calls"),
+            "{result:?}"
+        );
+        let requests = client.requests();
+        let requests = requests
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools().is_empty());
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn selected_content_checks_input_and_streamed_answer_and_thought_caps()
+-> Result<(), AdapterError> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &selected_request())?;
+    let client = FakeLlmClient::new(Vec::new());
+    let oversized = handle_prompt_request(
+        &store,
+        &client,
+        &AdapterToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id,
+            vec![ContentBlock::from("x".repeat(1025))],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await;
+    assert!(
+        matches!(oversized, Err(AdapterError::InvalidParams(ref message))
+        if message == "selected-content input byte limit exceeded")
+    );
+    assert!(
+        client
+            .requests()
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?
+            .is_empty()
+    );
+
+    for event in [
+        StreamEvent::Message("x".repeat(129)),
+        StreamEvent::Thought("x".repeat(129)),
+    ] {
+        let session = handle_new_session_request(&store, &selected_request())?;
+        let client = FakeLlmClient::new(vec![Ok(event)]);
+        let mut published = 0;
+        let result = handle_prompt_request(
+            &store,
+            &client,
+            &AdapterToolRegistry,
+            None,
+            PromptRequest::new(session.session_id, vec![ContentBlock::from("selected")]),
+            DEFAULT_MAX_TURN_REQUESTS,
+            |notification| {
+                if matches!(
+                    notification.update,
+                    SessionUpdate::AgentMessageChunk(_) | SessionUpdate::AgentThoughtChunk(_)
+                ) {
+                    published += 1;
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AdapterError::InvalidRequest(ref message))
+            if message == "selected-content output byte limit exceeded")
+        );
+        assert_eq!(published, 0);
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn selected_content_deadline_ends_an_unresponsive_stream() -> Result<(), AdapterError> {
+    let store = test_store();
+    let mut request = selected_request();
+    if let Some(meta) = &mut request.meta {
+        meta[crate::selected_content::META_KEY]["timeout_ms"] = serde_json::json!(10);
+    }
+    let session = handle_new_session_request(&store, &request)?;
+    let client = FakeLlmClient::with_steps(vec![FakeStreamStep::WaitForCancel]);
+    let result = handle_prompt_request(
+        &store,
+        &client,
+        &AdapterToolRegistry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("selected")],
+        ),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |_| Ok(()),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(AdapterError::InvalidRequest(ref message))
+        if message == "selected-content deadline exceeded")
+    );
+    assert!(store.with_session(&session.session_id, |record| Ok(
+        record.active_turn.is_none()
+    ))?);
+    Ok(())
+}
+
 struct PendingLlmClient {
     started: Arc<Notify>,
 }

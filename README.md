@@ -1,5 +1,9 @@
 # ACP LLM Adapter
 
+Editors may opt into immutable, tool-less
+[selected-content Sessions](docs/selected-content.md), independent of Plan or
+YOLO mode.
+
 `acp-llm-adapter` is a headless ACP server that exposes LLM providers (DeepSeek, GLM, Groq) as agents to ACP-capable editors.
 
 > [!WARNING]

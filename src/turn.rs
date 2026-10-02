@@ -302,6 +302,17 @@ pub(crate) async fn handle_prompt_request(
     max_turn_requests: NonZeroUsize,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, AdapterError> {
+    let selected_content = store.selected_content_limits(&request.session_id)?;
+    if selected_content.is_some()
+        && request
+            .prompt
+            .iter()
+            .any(|block| !matches!(block, ContentBlock::Text(_)))
+    {
+        return Err(AdapterError::InvalidParams(
+            "selected-content prompts require text snapshots".into(),
+        ));
+    }
     let request_title = prompt_title(&request.prompt);
     let user_text = text_from_prompt(&request.prompt)?;
     let user_message = ChatMessage::user(user_text.clone());
@@ -334,7 +345,7 @@ pub(crate) async fn handle_prompt_request(
         let reasoning_effort = (turn_setup.reasoning_effort != ReasoningEffort::High)
             .then_some(turn_setup.reasoning_effort);
 
-        run_prompt_turn(
+        let turn = run_prompt_turn(
             PromptTurnEnvironment {
                 store,
                 llm_client,
@@ -344,19 +355,45 @@ pub(crate) async fn handle_prompt_request(
                 behavior: turn_setup.behavior,
                 request,
                 cancellation_token: cancellation_token.clone(),
-                max_turn_requests,
+                max_turn_requests: if selected_content.is_some() {
+                    NonZeroUsize::MIN
+                } else {
+                    max_turn_requests
+                },
             },
             turn_setup.messages,
             ModelRequestSettings {
                 model: &turn_setup.model,
                 reasoning_effort,
-                max_tokens: turn_setup.max_tokens,
+                max_tokens: turn_setup
+                    .selected_content
+                    .map_or(turn_setup.max_tokens, |limits| {
+                        Some(
+                            turn_setup
+                                .max_tokens
+                                .map_or(limits.max_tokens, |value| value.min(limits.max_tokens)),
+                        )
+                    }),
             },
             &mut notify,
-        )
-        .await
+        );
+        if let Some(limits) = selected_content {
+            match tokio::time::timeout(std::time::Duration::from_millis(limits.timeout_ms), turn)
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(AdapterError::InvalidRequest(
+                    "selected-content deadline exceeded".into(),
+                )),
+            }
+        } else {
+            turn.await
+        }
     }
     .await;
+    if selected_content.is_some() && result.is_err() {
+        cancellation_token.cancel();
+    }
     let clear_result = match store.clear_active_turn(&session_id) {
         Ok(()) => Ok(()),
         Err(AdapterError::InvalidParams(msg)) if msg.starts_with("unknown session id:") => Ok(()),
@@ -388,15 +425,22 @@ async fn run_prompt_turn(
     model_settings: ModelRequestSettings<'_>,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, AdapterError> {
-    let tool_definitions = env
-        .tool_registry
-        .definitions(&env.tool_context, env.store)?
-        .into_iter()
-        .filter(|definition| {
-            env.behavior
-                .allows_tool_kind(env.tool_registry.kind(definition.name()))
-        })
-        .collect::<Vec<_>>();
+    let tool_definitions = if env
+        .store
+        .selected_content_limits(&env.request.session_id)?
+        .is_some()
+    {
+        Vec::new()
+    } else {
+        env.tool_registry
+            .definitions(&env.tool_context, env.store)?
+            .into_iter()
+            .filter(|definition| {
+                env.behavior
+                    .allows_tool_kind(env.tool_registry.kind(definition.name()))
+            })
+            .collect::<Vec<_>>()
+    };
 
     let mut stop_reason = StopReason::MaxTurnRequests;
     let mut usage_totals = UsageTotals::default();
@@ -594,6 +638,11 @@ pub(crate) async fn stream_model_turn(
     session_id: &SessionId,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<ModelTurn, AdapterError> {
+    let selected_content = context
+        .store
+        .map(|store| store.selected_content_limits(session_id))
+        .transpose()?
+        .flatten();
     // Filter messages to respect CloudFront's ~1MB request limit.
     // Allocate a conservative 256KB budget for messages to leave ample headroom for:
     // - Tool definitions (can be 100KB+ with long descriptions)
@@ -636,6 +685,7 @@ pub(crate) async fn stream_model_turn(
     let mut usage: Option<UsageData> = None;
     let mut thought_message_id: Option<MessageId> = None;
     let mut assistant_message_id: Option<MessageId> = None;
+    let mut output_bytes = 0usize;
 
     loop {
         let event = tokio::select! {
@@ -653,7 +703,26 @@ pub(crate) async fn stream_model_turn(
             break;
         };
 
-        match event.map_err(AdapterError::from)? {
+        let event = event.map_err(AdapterError::from)?;
+        if let Some(limits) = selected_content {
+            match &event {
+                StreamEvent::Message(chunk) | StreamEvent::Thought(chunk) => {
+                    output_bytes = output_bytes.saturating_add(chunk.len());
+                    if output_bytes > limits.output_bytes {
+                        return Err(AdapterError::InvalidRequest(
+                            "selected-content output byte limit exceeded".into(),
+                        ));
+                    }
+                }
+                StreamEvent::ToolCallDelta(_) | StreamEvent::Finished(FinishReason::ToolCalls) => {
+                    return Err(AdapterError::InvalidRequest(
+                        "selected-content Sessions refuse all tool calls".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        match event {
             StreamEvent::Thought(chunk) => {
                 let message_id = thought_message_id
                     .get_or_insert_with(|| Uuid::new_v4().to_string().into())

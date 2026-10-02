@@ -693,13 +693,14 @@ async fn local_tools_list_dir_and_glob() -> Result<(), agent_client_protocol::Er
     std::fs::write(temp_root.join(".gitignore"), "ignored/\n")
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-local-tools"),
+        session_id: session.session_id,
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let store = test_store();
     let registry = AdapterToolRegistry;
 
     let list_result = registry
@@ -762,13 +763,14 @@ async fn local_tools_grep_respects_gitignore_and_truncates()
     std::fs::write(temp_root.join(".gitignore"), "ignored/\n")
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-grep"),
+        session_id: session.session_id,
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let store = test_store();
     let registry = AdapterToolRegistry;
 
     let result = registry
@@ -797,13 +799,14 @@ async fn local_tools_grep_respects_gitignore_and_truncates()
 #[test_log::test(tokio::test)]
 async fn registry_and_tool_execution_helpers_cover_error_branches()
 -> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-registry"),
+        session_id: session.session_id,
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
-    let store = test_store();
 
     let empty_result = EmptyToolRegistry
         .execute(

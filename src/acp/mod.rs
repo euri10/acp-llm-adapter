@@ -390,6 +390,7 @@ pub(crate) async fn handle_new_session_request_connected(
     request: &NewSessionRequest,
 ) -> Result<NewSessionResponse, agent_client_protocol::Error> {
     validate_session_paths(request)?;
+    crate::selected_content::Limits::from_request(request)?;
     let mcp_sessions = connect_mcp_sessions(&request.mcp_servers).await?;
     insert_session_record(store, request, mcp_sessions)
 }
@@ -473,6 +474,8 @@ async fn restore_persisted_session(
     store.insert_session(
         session_id.clone(),
         SessionRecord {
+            selected_content: None,
+            selected_content_used: false,
             cwd: persisted.meta.cwd,
             additional_directories: persisted.meta.additional_directories,
             history: history.clone(),
@@ -499,6 +502,7 @@ fn insert_session_record(
     mcp_sessions: Vec<McpSession>,
 ) -> Result<NewSessionResponse, agent_client_protocol::Error> {
     validate_session_paths(request)?;
+    let selected_content = crate::selected_content::Limits::from_request(request)?;
     let session_id = format!("session-{}", Uuid::new_v4());
     let default_model = store.default_model()?;
     let now = crate::iso_timestamp_now();
@@ -506,6 +510,8 @@ fn insert_session_record(
     store.insert_session(
         sid.clone(),
         SessionRecord {
+            selected_content,
+            selected_content_used: false,
             cwd: request.cwd.clone(),
             additional_directories: request.additional_directories.clone(),
             history: Vec::new(),
@@ -530,6 +536,13 @@ fn insert_session_record(
         .config_options(store.session_config_options(&sid)?);
     if let Some(meta) = store.session_meta(&sid) {
         response = response.meta(meta);
+    }
+    if let Some(limits) = selected_content {
+        response = response.meta(serde_json::Map::from_iter([(
+            crate::selected_content::META_KEY.to_string(),
+            serde_json::to_value(limits)
+                .map_err(agent_client_protocol::Error::into_internal_error)?,
+        )]));
     }
     Ok(response)
 }
@@ -772,7 +785,11 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
                         .resume(SessionResumeCapabilities::new())
                         .close(SessionCloseCapabilities::new()),
                 )
-                .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new())),
+                .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+                .meta(serde_json::Map::from_iter([(
+                    crate::selected_content::META_KEY.to_string(),
+                    serde_json::json!({"version":1}),
+                )])),
         )
         .agent_info(Implementation::new(ADAPTER_NAME, ADAPTER_VERSION))
 }

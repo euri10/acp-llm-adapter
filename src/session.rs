@@ -588,6 +588,8 @@ fn format_session_title(content: &str) -> String {
 
 #[derive(Debug)]
 pub(crate) struct SessionRecord {
+    pub(crate) selected_content: Option<crate::selected_content::Limits>,
+    pub(crate) selected_content_used: bool,
     pub(crate) cwd: PathBuf,
     pub(crate) additional_directories: Vec<PathBuf>,
     pub(crate) history: Vec<ChatMessage>,
@@ -628,6 +630,7 @@ pub(crate) struct SessionStore {
 /// hold the lock across model streaming.
 #[derive(Debug)]
 pub(crate) struct TurnSetup {
+    pub(crate) selected_content: Option<crate::selected_content::Limits>,
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) tool_context: ToolContext,
     pub(crate) behavior: SessionBehavior,
@@ -978,6 +981,13 @@ impl SessionStore {
         self.with_session(session_id, |session| Ok(session.mode))
     }
 
+    pub(crate) fn selected_content_limits(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<crate::selected_content::Limits>, AdapterError> {
+        self.with_session(session_id, |session| Ok(session.selected_content))
+    }
+
     /// Insert a tool name into the session's allow-always cache.
     pub(crate) fn add_always_allow(
         &self,
@@ -1083,6 +1093,19 @@ impl SessionStore {
                 session_id.0
             )));
         }
+        if let Some(limits) = session.selected_content {
+            if session.selected_content_used {
+                return Err(AdapterError::InvalidRequest(
+                    "selected-content Sessions allow one attempt".into(),
+                ));
+            }
+            if user_message.content().len() > limits.input_bytes {
+                return Err(AdapterError::InvalidParams(
+                    "selected-content input byte limit exceeded".into(),
+                ));
+            }
+            session.selected_content_used = true;
+        }
         session.active_turn = Some(token);
 
         // Bump the last-activity timestamp on every prompt turn.
@@ -1090,7 +1113,7 @@ impl SessionStore {
 
         // Derive the title once from ACP text-block structure when available,
         // falling back to the flattened message when no text block is present.
-        let title_changed = session.title.is_empty();
+        let title_changed = session.title.is_empty() && session.selected_content.is_none();
         if title_changed {
             session.title = prompt_title.map_or_else(
                 || {
@@ -1105,6 +1128,7 @@ impl SessionStore {
         let mut messages = session.history.clone();
         messages.push(user_message);
         Ok(TurnSetup {
+            selected_content: session.selected_content,
             messages,
             tool_context: ToolContext {
                 session_id: session_id.clone(),
@@ -1128,6 +1152,10 @@ impl SessionStore {
         session_id: &SessionId,
         messages: &[ChatMessage],
     ) -> Result<(), AdapterError> {
+        if self.with_session(session_id, |session| Ok(session.selected_content.is_some()))? {
+            // Helpers are ephemeral: no raw question, selected source or answer on disk.
+            return Ok(());
+        }
         let (persistence, meta, new_messages) = {
             let guard = self
                 .state

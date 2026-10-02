@@ -2041,6 +2041,8 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
     store.insert_session(
         session_id.clone(),
         SessionRecord {
+            selected_content: None,
+            selected_content_used: false,
             cwd: workspace.clone(),
             additional_directories: Vec::new(),
             history: Vec::new(),

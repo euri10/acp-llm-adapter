@@ -40,6 +40,7 @@ use uuid::Uuid;
 mod acp;
 mod dev;
 mod mcp;
+mod selected_content;
 mod session;
 mod session_store;
 #[cfg(test)]

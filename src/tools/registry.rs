@@ -93,6 +93,12 @@ impl ToolRegistry for AdapterToolRegistry {
         context: &ToolContext,
         store: &crate::SessionStore,
     ) -> Result<Vec<ToolDefinition>, AdapterError> {
+        if store
+            .selected_content_limits(&context.session_id)?
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
         let mut definitions = vec![
             read_file_tool_definition(),
             list_dir_tool_definition(),
@@ -131,6 +137,15 @@ impl ToolRegistry for AdapterToolRegistry {
         cancellation_token: CancellationToken,
     ) -> ToolExecutionFuture<'a> {
         Box::pin(async move {
+            match store.selected_content_limits(&context.session_id) {
+                Ok(Some(_)) => {
+                    return ToolExecution::failed(
+                        "selected-content Sessions refuse all tool calls",
+                    );
+                }
+                Err(error) => return ToolExecution::failed(error.to_string()),
+                Ok(None) => {}
+            }
             match call.name() {
                 "read_file" => {
                     read_file_tool_execution(
@@ -462,8 +477,10 @@ mod tests {
             .map_err(AdapterError::from)?;
 
         let registry = AdapterToolRegistry;
-        let context = registry_context(temp_root.clone());
         let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
+        let mut context = registry_context(temp_root.clone());
+        context.session_id = session.session_id;
         let call = ChatToolCall::new(
             "reg-read",
             "read_file",
@@ -708,16 +725,19 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn adapter_registry_execute_bogus_tool() {
+    async fn adapter_registry_execute_bogus_tool() -> Result<(), AdapterError> {
         let registry = AdapterToolRegistry;
-        let context = registry_context(std::path::PathBuf::from("/tmp"));
         let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        let mut context = registry_context(std::path::PathBuf::from("/tmp"));
+        context.session_id = session.session_id;
         let call = ChatToolCall::new("bogus-call", "no_such_tool", "{}");
         let result = registry
             .execute(&call, &context, &store, None, CancellationToken::new())
             .await;
         assert!(!result.success);
         assert!(result.content.contains("unknown tool: no_such_tool"));
+        Ok(())
     }
 
     #[test]
