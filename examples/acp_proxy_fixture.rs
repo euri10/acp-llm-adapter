@@ -115,7 +115,7 @@ fn main() {
             r#"{{"jsonrpc":"2.0","zebra":1,"alpha":2,"ratio":1.50,"echo":{line}}}"#
         );
         let _ = stdout.flush();
-        let _ = writeln!(stderr, "fixture: handled a request");
+        let _ = writeln!(stderr, "fixture: handled a request: {line}");
         let _ = stderr.flush();
     }
 

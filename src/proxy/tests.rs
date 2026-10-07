@@ -95,10 +95,9 @@ fn a_frame_line_becomes_structured_json() {
 fn a_stderr_line_stays_plain_text() {
     let record = record_for(Direction::Internal, KIND_STDERR, b"warning: something");
 
-    assert_eq!(
-        record.payload.as_str(),
-        Some("warning: something"),
-        "stderr is not JSON and must not be coerced into it"
+    assert!(
+        record.payload.is_string(),
+        "stderr stays a string record even when redacted"
     );
     assert_eq!(record.kind, KIND_STDERR);
 }
@@ -111,8 +110,8 @@ fn invalid_utf8_does_not_lose_the_line() {
         record
             .payload
             .as_str()
-            .is_some_and(|text| text.ends_with("ok")),
-        "undecodable bytes are replaced, not dropped"
+            .is_some_and(|text| text == "[REDACTED]" || text == "\u{fffd}\u{fffd}ok"),
+        "undecodable text is redacted or decoded with replacement characters"
     );
 }
 

@@ -22,11 +22,87 @@
 mod acp_client;
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use acp_client::{Serve, Stopped, alive, backgrounding_command};
+
+struct LogRoot(PathBuf);
+
+impl Drop for LogRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test_log::test(tokio::test)]
+async fn serve_redacts_command_content_in_every_log_but_preserves_the_editor_payload()
+-> Result<(), Box<dyn Error>> {
+    let secret = "ACP_LOG_SECRET_SENTINEL";
+    for unredacted in [None, Some("0"), Some("1")] {
+        let root = LogRoot(
+            std::env::temp_dir().join(format!("acp-serve-redaction-{}", uuid::Uuid::new_v4())),
+        );
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+        command
+            .args(["serve", "--backend", "mock"])
+            .env("XDG_STATE_HOME", &root.0)
+            .env("ACP_LOG", "1")
+            .env("RUST_LOG", "acp_llm_adapter=trace")
+            .env_remove("ACP_LOG_MAX_BYTES")
+            .env_remove("ACP_LOG_MAX_AGE_DAYS")
+            .env_remove("ACP_LOG_UNREDACTED");
+        if let Some(unredacted) = unredacted {
+            command.env("ACP_LOG_UNREDACTED", unredacted);
+        }
+        let mut serve =
+            Serve::start_with(command, json!({"cwd": "/tmp", "mcpServers": []})).await?;
+        let response =
+            run_prompt(&mut serve, &format!("!tool run_command printf {secret}")).await?;
+        assert_eq!(
+            response.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        let output = serve.updates("tool_call_update");
+        assert!(
+            output
+                .last()
+                .is_some_and(|update| update.to_string().contains(secret)),
+            "output never reached the editor"
+        );
+        let session_id = serve.session_id().to_owned();
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(10)).await?.success());
+        let log_root = root.0.join("acp-llm-adapter");
+        let session =
+            std::fs::read_to_string(log_root.join("sessions").join(session_id).join("log.jsonl"))?;
+        let mut logs = session.clone();
+        for entry in std::fs::read_dir(log_root.join("connections"))? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                logs.push_str(&std::fs::read_to_string(path)?);
+            }
+        }
+        assert_eq!(
+            logs.contains(secret),
+            unredacted == Some("1"),
+            "incorrect persisted redaction policy"
+        );
+        for method in ["session/update", "session/request_permission"] {
+            assert!(
+                session.contains(method),
+                "missing logged protocol stage {method}"
+            );
+        }
+        assert!(logs.contains("trace-event"), "tracing was not exercised");
+    }
+    Ok(())
+}
 
 /// Run one prompt to completion and return the client's view of it.
 async fn run_prompt(serve: &mut Serve, text: &str) -> Result<Value, Box<dyn Error>> {

@@ -1133,15 +1133,15 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let first_span = tracing::info_span!("session", session_id = "session-first");
             let first_guard = first_span.enter();
-            tracing::info!(message = "first-only");
+            tracing::info!(route_marker = 101);
             drop(first_guard);
 
             let second_span = tracing::info_span!("session", session_id = "session-second");
             let second_guard = second_span.enter();
-            tracing::info!(message = "second-only");
+            tracing::info!(route_marker = 202);
             drop(second_guard);
 
-            tracing::info!(message = "fallback-only");
+            tracing::info!(route_marker = 303);
         });
 
         let Ok(first_path) = sink.session_log_path("session-first") else {
@@ -1161,13 +1161,13 @@ mod tests {
         let first_log = std::fs::read_to_string(first_path).unwrap_or_default();
         let second_log = std::fs::read_to_string(second_path).unwrap_or_default();
         let fallback_log = std::fs::read_to_string(connection_path).unwrap_or_default();
-        assert!(first_log.contains("first-only"));
-        assert!(!first_log.contains("second-only"));
-        assert!(second_log.contains("second-only"));
-        assert!(!second_log.contains("first-only"));
-        assert!(fallback_log.contains("fallback-only"));
-        assert!(!fallback_log.contains("first-only"));
-        assert!(!fallback_log.contains("second-only"));
+        assert!(first_log.contains("\"route_marker\":101"));
+        assert!(!first_log.contains("\"route_marker\":202"));
+        assert!(second_log.contains("\"route_marker\":202"));
+        assert!(!second_log.contains("\"route_marker\":101"));
+        assert!(fallback_log.contains("\"route_marker\":303"));
+        assert!(!fallback_log.contains("\"route_marker\":101"));
+        assert!(!fallback_log.contains("\"route_marker\":202"));
 
         let _ = std::fs::remove_dir_all(root);
     }
