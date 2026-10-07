@@ -1,22 +1,27 @@
 //! MCP session startup, tool mapping, and invocation helpers.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
     HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio, ToolKind,
 };
 use http::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, ContentBlock as McpContent, JsonObject, Tool as McpTool};
-use rmcp::service::RunningService;
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CallToolResult, ContentBlock as McpContent, JsonObject,
+    ServerResult, Tool as McpTool,
+};
+use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{Peer, RoleClient, ServiceExt};
 use serde_json::Value;
 use tokio::process::Command as TokioCommand;
+use tokio_util::sync::CancellationToken;
 
 use crate::SessionStore;
-use crate::tools::{ToolContext, ToolExecution};
+use crate::tools::{ToolContext, ToolExecution, require_tool_permission};
 use acp_llm_adapter::error::AdapterError;
 
 /// Prefix used for model-visible MCP tool names.
@@ -64,11 +69,18 @@ pub(crate) const fn mcp_tool_kind() -> ToolKind {
 }
 
 /// Execute an MCP tool call for the given session.
+///
+/// External tools use Execute permission: Ask and `AcceptEdits` prompt, YOLO and
+/// remembered decisions follow the shared policy. Plan and selected-content
+/// sessions cannot invoke them, even through direct dispatch. Cancellation
+/// drops local work and requests remote cancellation; it cannot undo side effects.
 #[must_use]
 pub(crate) async fn mcp_tool_execution(
     store: &SessionStore,
     call: &ChatToolCall,
     context: &ToolContext,
+    requester: Option<&dyn crate::PermissionRequester>,
+    cancellation: &CancellationToken,
 ) -> ToolExecution {
     let target = match store.find_mcp_target(&context.session_id, call.name()) {
         Ok(Some(target)) => target,
@@ -81,12 +93,34 @@ pub(crate) async fn mcp_tool_execution(
         Err(error) => return ToolExecution::failed(error),
     };
 
-    let result = target
-        .peer
-        .call_tool(
-            CallToolRequestParams::new(target.original_name.clone()).with_arguments(arguments),
-        )
-        .await;
+    match store.selected_content_limits(&context.session_id) {
+        Ok(Some(_)) => {
+            return ToolExecution::failed("selected-content Sessions refuse all tool calls");
+        }
+        Err(error) => return ToolExecution::failed(error.to_string()),
+        Ok(None) => {}
+    }
+    match store.session_behavior(&context.session_id) {
+        Ok(mode) if !mode.allows_tool_kind(MCP_TOOL_KIND) => {
+            return ToolExecution::failed("plan mode refuses MCP tool calls");
+        }
+        Err(error) => return ToolExecution::failed(error.to_string()),
+        Ok(_) => {}
+    }
+    let approval = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return ToolExecution::failed("MCP tool call cancelled"),
+        result = require_tool_permission(store, context, call, MCP_TOOL_KIND, requester) => result,
+    };
+    if let Err(error) = approval {
+        return ToolExecution::failed(error);
+    }
+    // Cancellation may have arrived as the editor's approval completed.
+    if cancellation.is_cancelled() {
+        return ToolExecution::failed("MCP tool call cancelled");
+    }
+
+    let result = invoke_mcp_tool(&target, arguments, cancellation).await;
 
     match result {
         Ok(result) => {
@@ -107,6 +141,43 @@ pub(crate) async fn mcp_tool_execution(
             "MCP tool '{}' on server '{}' failed: {error}",
             target.original_name, target.server_name
         )),
+    }
+}
+
+async fn invoke_mcp_tool(
+    target: &McpToolTarget,
+    arguments: JsonObject,
+    cancellation: &CancellationToken,
+) -> Result<CallToolResult, String> {
+    let mut handle = target
+        .peer
+        .send_cancellable_request(
+            CallToolRequest::new(
+                CallToolRequestParams::new(target.original_name.clone()).with_arguments(arguments),
+            )
+            .into(),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    // No request options install progress watchers. Reading this owned handle's
+    // receiver lets cancellation retain the request id for the MCP notification.
+    let response = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            match tokio::time::timeout(Duration::from_secs(1), handle.cancel(Some("ACP turn cancelled".to_string()))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => tracing::warn!("MCP cancellation notification failed"),
+                Err(_) => tracing::warn!("MCP cancellation notification timed out"),
+            }
+            return Err("MCP tool call cancelled".to_string());
+        }
+        response = &mut handle.rx => response.map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?,
+    };
+    match response {
+        ServerResult::CallToolResult(result) => Ok(result),
+        _ => Err("unexpected MCP tool response".to_string()),
     }
 }
 

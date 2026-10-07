@@ -304,6 +304,10 @@ Every live backend is the same OpenAI-compatible client; the backend only choose
 
 `session/set_mode` switches posture live during a session. In `accept-edits`, edit actions auto-approve while shell actions still prompt. In `yolo`, mutating tools auto-approve.
 
+MCP tools are external executors and use the same Execute permission policy as shell commands: `ask` and `accept-edits` request editor approval, while `yolo` auto-approves. Explicit “allow always” and “reject always” decisions apply to that tool name for the current session; a remembered rejection takes precedence over `yolo`. Restoring a session starts with fresh permission decisions. Plan mode and selected-content sessions prohibit MCP execution even with a remembered approval.
+
+Cancelling a turn during MCP approval prevents invocation. Cancelling an in-flight MCP call stops the local wait and sends an MCP cancellation notification, with delivery bounded to one second. A remote server may ignore cancellation, and cancellation cannot undo a side effect that already occurred.
+
 ## Supported Tools
 
 - `read_file`

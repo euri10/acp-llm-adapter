@@ -1,6 +1,9 @@
 #![allow(clippy::indexing_slicing)]
 use super::{PendingToolCalls, PermissionDecision, ReasoningEffort, SessionBehavior};
-use agent_client_protocol::schema::v1::SessionModeId;
+use agent_client_protocol::schema::v1::{
+    RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome, SessionModeId,
+    ToolKind,
+};
 
 /// Return type for [`permission_mode_fixture`].
 pub(crate) type PermissionModeFixture = (
@@ -65,6 +68,32 @@ fn permission_decision_debug_impl_is_callable() {
     for decision in &decisions {
         let _ = format!("{decision:?}");
     }
+}
+
+#[test_log::test(tokio::test)]
+async fn reject_always_is_remembered_before_mode_auto_approval()
+-> Result<(), agent_client_protocol::Error> {
+    let (store, session_id, context, _, call) = permission_mode_fixture()?;
+    let requester =
+        crate::test_utils::FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                super::PERMISSION_REJECT_ALWAYS_OPTION_ID,
+            )),
+        )]);
+    assert_eq!(
+        super::request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester)
+            .await?,
+        PermissionDecision::RejectAlways
+    );
+    store.set_mode(&session_id, SessionBehavior::Yolo)?;
+    let requester = crate::test_utils::FakePermissionRequester::new(Vec::new());
+    assert_eq!(
+        super::request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester)
+            .await?,
+        PermissionDecision::RejectAlways,
+        "YOLO must not discard a remembered editor denial"
+    );
+    Ok(())
 }
 
 #[test]

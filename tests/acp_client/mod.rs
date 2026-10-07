@@ -23,6 +23,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 pub(crate) enum Stopped {
     /// The response to the awaited request arrived.
     Response(Box<Value>),
+    /// A permission request is waiting for the caller's decision.
+    Permission(Box<Value>),
     /// The caller's predicate became true.
     Predicate,
     /// The deadline passed with neither of the above.
@@ -56,8 +58,21 @@ impl Serve {
     /// Returns an error if the process cannot be spawned or the handshake does
     /// not complete.
     pub(crate) async fn start() -> Result<Self, Box<dyn Error>> {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"))
-            .args(["serve", "--backend", "mock"])
+        let mut command = Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+        command.args(["serve", "--backend", "mock"]);
+        Self::start_with(command, json!({"cwd": "/tmp", "mcpServers": []})).await
+    }
+
+    /// Start a configured adapter and open the requested session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if spawning or the ACP handshake fails.
+    pub(crate) async fn start_with(
+        mut command: Command,
+        new_session: Value,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -84,7 +99,6 @@ impl Serve {
         });
         serve.request("initialize", &initialize).await?;
 
-        let new_session = json!({"cwd": "/tmp", "mcpServers": []});
         let session = serve.request("session/new", &new_session).await?;
         session
             .pointer("/result/sessionId")
@@ -172,7 +186,23 @@ impl Serve {
         &mut self,
         limit: Duration,
         until_id: Option<u64>,
+        until: impl FnMut() -> bool,
+    ) -> Result<Stopped, Box<dyn Error>> {
+        self.pump_with_permission(limit, until_id, until, Some("allow_once"))
+            .await
+    }
+
+    /// Pump with an explicit approval choice; `None` stops at a pending request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stdout closes or a protocol write fails.
+    pub(crate) async fn pump_with_permission(
+        &mut self,
+        limit: Duration,
+        until_id: Option<u64>,
         mut until: impl FnMut() -> bool,
+        option_id: Option<&str>,
     ) -> Result<Stopped, Box<dyn Error>> {
         let deadline = tokio::time::Instant::now() + limit;
         loop {
@@ -198,8 +228,12 @@ impl Serve {
             if message.get("method").and_then(Value::as_str) == Some("session/update") {
                 continue;
             }
-            if let Some(reply) = permission_grant(&message) {
-                self.send(&reply).await?;
+            if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+                let Some(option_id) = option_id else {
+                    return Ok(Stopped::Permission(Box::new(message)));
+                };
+                self.select_permission(message.get("id").ok_or("permission has no id")?, option_id)
+                    .await?;
                 continue;
             }
             if message.get("method").is_none()
@@ -244,6 +278,23 @@ impl Serve {
         self.stdin = None;
     }
 
+    /// Reply to a pending permission request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client has disconnected or the write fails.
+    pub(crate) async fn select_permission(
+        &mut self,
+        request_id: &Value,
+        option_id: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.send(&json!({
+            "jsonrpc": "2.0", "id": request_id,
+            "result": {"outcome": {"outcome": "selected", "optionId": option_id}}
+        }))
+        .await
+    }
+
     /// Wait for the process to exit.
     ///
     /// # Errors
@@ -263,30 +314,6 @@ impl Serve {
         stdin.write_all(format!("{message}\n").as_bytes()).await?;
         Ok(())
     }
-}
-
-/// Build an allow reply if `message` is a permission request.
-fn permission_grant(message: &Value) -> Option<Value> {
-    if message.get("method").and_then(Value::as_str)? != "session/request_permission" {
-        return None;
-    }
-    let options = message.pointer("/params/options")?.as_array()?;
-    let option = options
-        .iter()
-        .find(|option| {
-            option
-                .get("optionId")
-                .and_then(Value::as_str)
-                .is_some_and(|id| id.contains("allow"))
-        })
-        .or_else(|| options.first())?;
-    Some(json!({
-        "jsonrpc": "2.0",
-        "id": message.get("id")?,
-        "result": {
-            "outcome": {"outcome": "selected", "optionId": option.get("optionId")?}
-        }
-    }))
 }
 
 /// Whether `pid` names a process that has not exited.

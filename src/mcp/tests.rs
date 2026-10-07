@@ -254,7 +254,7 @@ fn mcp_tool_mappings_prefix_and_preserve_schema() {
 }
 
 #[test_log::test(tokio::test)]
-async fn adapter_registry_exposes_and_executes_session_mcp_tools()
+async fn adapter_registry_exposes_mcp_tools_but_requires_permission_connection()
 -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
@@ -301,8 +301,8 @@ async fn adapter_registry_exposes_and_executes_session_mcp_tools()
         )
         .await;
 
-    assert!(result.success);
-    assert_eq!(result.content, "echo: hello");
+    assert!(!result.success);
+    assert!(result.content.contains("requires a client connection"));
 
     Ok(())
 }
@@ -526,7 +526,14 @@ async fn mcp_tool_execution_unknown_tool() -> Result<(), agent_client_protocol::
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-unknown", "mcp__nonexistent__tool", "{}");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("unknown MCP tool"));
     Ok(())
@@ -906,7 +913,14 @@ async fn mcp_tool_execution_bad_arguments_for_registered_tool()
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-bad-args", "mcp__echo_server__echo", "[1,2,3]");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("arguments must be a JSON object"));
     Ok(())
@@ -1006,7 +1020,19 @@ async fn mcp_tool_execution_peer_call_tool_error() -> Result<(), agent_client_pr
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-failing", "mcp__failing_server__failer", "{}");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            PERMISSION_ALLOW_ONCE_OPTION_ID,
+        )),
+    )]);
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(
         result
@@ -1109,7 +1135,19 @@ async fn mcp_tool_execution_is_error_flag() -> Result<(), agent_client_protocol:
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-errflag", "mcp__error_flag_server__error_flag", "{}");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            PERMISSION_ALLOW_ONCE_OPTION_ID,
+        )),
+    )]);
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert_eq!(result.content, "err output");
     Ok(())
@@ -1125,7 +1163,14 @@ async fn mcp_tool_execution_unknown_session() {
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-unknown-session", "mcp__server__tool", "{}");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("unknown session id"));
 }

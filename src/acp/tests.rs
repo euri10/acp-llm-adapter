@@ -2052,6 +2052,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
             reasoning_effort: ReasoningEffort::High,
             max_tokens: None,
             permission_allow_always: std::collections::HashSet::new(),
+            permission_reject_always: std::collections::HashSet::new(),
             mcp_servers: Vec::new(),
             mcp_sessions: Vec::new(),
             title: "temporary title".to_string(),

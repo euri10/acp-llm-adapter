@@ -182,6 +182,9 @@ pub(crate) async fn request_tool_permission(
     kind: ToolKind,
     requester: &dyn PermissionRequester,
 ) -> Result<PermissionDecision, AdapterError> {
+    if store.is_always_rejected(&context.session_id, call.name())? {
+        return Ok(PermissionDecision::RejectAlways);
+    }
     if store.is_always_allowed(&context.session_id, call.name())? {
         return Ok(PermissionDecision::AllowAlways);
     }
@@ -231,6 +234,8 @@ pub(crate) async fn request_tool_permission(
 
     if decision == PermissionDecision::AllowAlways {
         store.add_always_allow(&context.session_id, call.name().to_string())?;
+    } else if decision == PermissionDecision::RejectAlways {
+        store.add_always_reject(&context.session_id, call.name().to_string())?;
     }
 
     Ok(decision)
@@ -601,6 +606,7 @@ pub(crate) struct SessionRecord {
     /// the model's own default (the parameter is omitted from the request).
     pub(crate) max_tokens: Option<u32>,
     pub(crate) permission_allow_always: HashSet<String>,
+    pub(crate) permission_reject_always: HashSet<String>,
     pub(crate) mcp_servers: Vec<McpServer>,
     pub(crate) mcp_sessions: Vec<McpSession>,
     /// Human-readable session title, derived from the first user message.
@@ -973,6 +979,21 @@ impl SessionStore {
         })
     }
 
+    /// Check whether the editor rejected a tool for the remainder of this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is unknown or the state lock is poisoned.
+    pub(crate) fn is_always_rejected(
+        &self,
+        session_id: &SessionId,
+        tool_name: &str,
+    ) -> Result<bool, AdapterError> {
+        self.with_session(session_id, |session| {
+            Ok(session.permission_reject_always.contains(tool_name))
+        })
+    }
+
     /// Return the current session behavior (mode) for a session.
     pub(crate) fn session_behavior(
         &self,
@@ -996,6 +1017,22 @@ impl SessionStore {
     ) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
             session.permission_allow_always.insert(tool_name);
+            Ok(())
+        })
+    }
+
+    /// Remember an explicit editor denial independently of the mutable mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is unknown or the state lock is poisoned.
+    pub(crate) fn add_always_reject(
+        &self,
+        session_id: &SessionId,
+        tool_name: String,
+    ) -> Result<(), AdapterError> {
+        self.with_session_mut(session_id, |session| {
+            session.permission_reject_always.insert(tool_name);
             Ok(())
         })
     }
