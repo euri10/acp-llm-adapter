@@ -667,6 +667,9 @@ pub(crate) async fn stream_model_turn(
     let mut chat_request = ChatRequest::new(filtered_messages)
         .with_tools(context.tool_definitions.to_vec())
         .with_model(model_settings.model);
+    if selected_content.is_some() {
+        chat_request = chat_request.without_retries();
+    }
     if let Some(effort) = model_settings.reasoning_effort {
         chat_request = chat_request.with_reasoning_effort(effort.id());
     }

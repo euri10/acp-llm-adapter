@@ -274,6 +274,13 @@ The adapter bridges two independent channels:
 | [`llm/config.rs`](src/llm/config.rs) | Environment-driven config (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`)         |
 | [`llm/error.rs`](src/llm/error.rs)   | Typed error enum (config, HTTP, SSE, JSON, transport)                          |
 
+Completion transport recovery is limited to three retries on fresh connections
+before any text, thought, tool delta or other completion event has been emitted.
+After output, a dropped stream fails without replaying the generation.
+[Selected-content Sessions](docs/selected-content.md) permit exactly one
+completion POST. Cancelling or dropping a stream releases its HTTP response and
+transport task. Completion POSTs do not follow redirects.
+
 ### Design Principles
 
 - **Translation boundary**: ACP and HTTP types stay at their respective edges. Business logic in the adapter core (`turn`, `tools`, `session_store`) depends only on the adapter's own types — not on `agent-client-protocol` schema types or raw HTTP types.

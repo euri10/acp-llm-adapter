@@ -3,7 +3,8 @@ use futures_util::{
     stream::{self, BoxStream},
 };
 use reqwest::Client as HttpClient;
-use sse_reqwest_client::RequestBuilderExt as _;
+use sse_reqwest_client::{RequestBuilderExt as _, SseRetryConfig};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +32,6 @@ use super::{ChatConfig, ChatError, ModelCatalog, StreamEvent};
 /// ```
 #[derive(Debug, Clone)]
 pub struct ChatClient {
-    http: HttpClient,
     config: ChatConfig,
 }
 
@@ -39,10 +39,7 @@ impl ChatClient {
     /// Build a client from explicit configuration.
     #[must_use]
     pub fn new(config: ChatConfig) -> Self {
-        Self {
-            http: HttpClient::new(),
-            config,
-        }
+        Self { config }
     }
 
     /// Build a client from process environment.
@@ -154,7 +151,9 @@ pub async fn fetch_available_models(
 pub trait LlmClient: Send + Sync {
     /// Stream a turn and yield normalized reasoning, text, and terminal events.
     ///
-    /// The stream should stop promptly when `cancellation_token` is cancelled.
+    /// The stream should stop promptly when dropped or when `cancellation_token`
+    /// is cancelled. Respect [`ChatRequest::without_retries`]; otherwise recovery
+    /// may resend only before any completion event has been emitted.
     ///
     /// # Errors
     ///
@@ -197,6 +196,7 @@ impl LlmClient for ChatClient {
             return Err(ChatError::MissingApiKey);
         }
 
+        let retries_allowed = request.retries_allowed();
         let (messages, tools, model_opt, reasoning_effort, max_tokens) = request.into_parts();
         let model = model_opt.unwrap_or_else(|| self.config.model().to_string());
         let wire_messages: Vec<WireMessage> = messages
@@ -223,7 +223,24 @@ impl LlmClient for ChatClient {
         }
         let body = serde_json::Value::Object(fields);
 
-        let http = self.http.clone();
+        // The SSE policy owns every resend. Hidden HTTP retries or redirects
+        // would bypass it; a retry must also use a fresh connection (daa-9se).
+        let http = HttpClient::builder()
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(0)
+            .build()?;
+        let retry_config = if retries_allowed {
+            SseRetryConfig {
+                max_retries: 3,
+                min_sleep_ms: 100,
+                max_backoff_ms: 400,
+                jitter: false,
+                ..SseRetryConfig::new()
+            }
+        } else {
+            SseRetryConfig::disabled()
+        };
         let url = format!(
             "{}/chat/completions",
             self.config.base_url().trim_end_matches('/')
@@ -232,12 +249,18 @@ impl LlmClient for ChatClient {
 
         let (tx, rx) = mpsc::unbounded_channel::<Result<StreamEvent, ChatError>>();
 
-        tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
             let event_source = http
                 .post(&url)
                 .bearer_auth(&api_key)
                 .json(&body)
-                .into_event_source();
+                .into_event_source_builder()
+                .retry_config(retry_config)
+                .initial_reconnection_time(Duration::from_millis(100))
+                // A long connection without output must not reset the budget.
+                .successful_connection_threshold(Duration::MAX)
+                .build();
 
             tracing::debug!(
                 url = %url,
@@ -264,8 +287,10 @@ impl LlmClient for ChatClient {
             run_stream_attempt(event_source, &tx, &cancellation_token).await;
         });
 
-        Ok(stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+        // Dropping the stream aborts its owned transport task, including a
+        // request or reconnect delay that has not produced any events yet.
+        Ok(stream::unfold((rx, tasks), |(mut rx, tasks)| async move {
+            rx.recv().await.map(|item| (item, (rx, tasks)))
         })
         .boxed())
     }

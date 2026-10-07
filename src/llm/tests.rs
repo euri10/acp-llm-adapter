@@ -2,13 +2,14 @@
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
+use sse_reqwest_client::{RequestBuilderExt as _, SseErrorEvent, SseEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use super::client::{ChatClient, LlmClient};
 use super::config::ChatConfig;
-use super::stream::parse_chat_completion_chunk;
+use super::stream::{parse_chat_completion_chunk, run_stream_attempt};
 use super::{
     ChatError, ChatMessage, ChatRequest, FinishReason, MessageRole, StreamEvent, ToolCall,
     ToolCallDelta, ToolDefinition,
@@ -582,6 +583,40 @@ async fn retries_stream_on_connection_drop_before_events() -> Result<(), ChatErr
     Ok(())
 }
 
+#[test_log::test(tokio::test)]
+async fn cancellation_or_consumer_drop_stops_a_pending_reconnect()
+-> Result<(), Box<dyn std::error::Error>> {
+    for cancel in [false, true] {
+        let (url, server) =
+            spawn_sse_server("retry: 30000\n\n".into(), Arc::new(Mutex::new(None))).await?;
+        let mut source = reqwest::Client::new()
+            .post(url)
+            .json(&serde_json::json!({"messages":[]}))
+            .into_event_source();
+        // Poll the source into backoff explicitly, rather than guessing at its
+        // state from elapsed time or the server's request counter.
+        assert!(matches!(source.next().await, Some(Ok(SseEvent::Open))));
+        assert!(matches!(
+            source.next().await,
+            Some(Ok(SseEvent::Error(SseErrorEvent::Eof)))
+        ));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        if cancel {
+            token.cancel();
+        } else {
+            drop(rx);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_stream_attempt(source, &tx, &token),
+        )
+        .await?;
+        server.await??;
+    }
+    Ok(())
+}
+
 #[test_log::test]
 fn deepseek_config_rejects_blank_api_key_from_environment() {
     assert!(matches!(
@@ -772,6 +807,8 @@ fn chat_request_empty_by_default() {
     assert!(request.tools().is_empty());
     assert_eq!(request.model(), None);
     assert_eq!(request.reasoning_effort(), None);
+    assert!(request.retries_allowed());
+    assert!(!request.without_retries().retries_allowed());
 }
 
 #[test_log::test]

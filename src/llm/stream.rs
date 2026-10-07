@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ChatError, FinishReason, StreamEvent, ToolCallDelta, UsageData};
 
-/// Run a single SSE stream attempt, forwarding events into `tx`.
+/// Forward an SSE completion into `tx`, recovering only before any event.
 ///
 /// Returns when the stream completes, the cancellation token fires, or a
 /// terminal error occurs. Errors are sent into `tx`; the caller does not
@@ -17,11 +17,13 @@ pub(super) async fn run_stream_attempt(
     cancellation_token: &CancellationToken,
 ) {
     let mut saw_finish = false;
-    let mut events_sent: u32 = 0;
+    let mut emitted_event = false;
 
     loop {
         let event = tokio::select! {
+            biased;
             () = cancellation_token.cancelled() => return,
+            () = tx.closed() => return,
             event = event_source.next() => event,
         };
 
@@ -42,7 +44,7 @@ pub(super) async fn run_stream_attempt(
                             if matches!(update, StreamEvent::Finished(_)) {
                                 saw_finish = true;
                             }
-                            events_sent += 1;
+                            emitted_event = true;
                             if tx.send(Ok(update)).is_err() {
                                 return;
                             }
@@ -55,13 +57,27 @@ pub(super) async fn run_stream_attempt(
                 }
             }
             Ok(SseEvent::Error(error)) => {
-                tracing::warn!(error = ?error, events_sent, "SSE stream dropped; reconnecting");
+                if saw_finish {
+                    // The terminal finish reason completes the generation;
+                    // providers may close without a separate [DONE] marker.
+                    return;
+                }
+                if emitted_event {
+                    let _ = tx.send(Err(ChatError::Transport(Box::new(error))));
+                    return;
+                }
+                tracing::warn!(error = ?error, "SSE stream dropped before output; reconnecting");
             }
             Ok(SseEvent::Discarded(error)) => {
-                tracing::warn!(error = ?error, events_sent, "SSE event discarded as oversized");
+                tracing::warn!(error = ?error, "SSE event discarded as oversized");
             }
             Err(error) => {
-                tracing::error!(error = ?error, events_sent, "terminal SSE stream error");
+                if saw_finish {
+                    // Retry-disabled streams report EOF as a terminal error,
+                    // even when the completion already had its finish reason.
+                    return;
+                }
+                tracing::error!(error = ?error, emitted_event, "terminal SSE stream error");
                 let _ = tx.send(Err(error.into()));
                 return;
             }

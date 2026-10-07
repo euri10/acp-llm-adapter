@@ -146,6 +146,7 @@ async fn selected_content_is_one_attempt_with_unknown_usage_and_no_persisted_pay
             .lock()
             .map_err(|error| AdapterError::Internal(error.to_string()))?;
         assert_eq!(requests[0].max_tokens(), Some(64));
+        assert!(!requests[0].retries_allowed());
     }
     assert!(!directory.join(session.session_id.0.as_ref()).exists());
     let repeated = handle_prompt_request(

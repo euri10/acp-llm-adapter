@@ -375,6 +375,7 @@ pub struct ChatRequest {
     model: Option<String>,
     reasoning_effort: Option<String>,
     max_tokens: Option<u32>,
+    retries_allowed: bool,
 }
 
 impl ChatRequest {
@@ -387,6 +388,7 @@ impl ChatRequest {
             model: None,
             reasoning_effort: None,
             max_tokens: None,
+            retries_allowed: true,
         }
     }
 
@@ -416,6 +418,19 @@ impl ChatRequest {
     pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
+    }
+
+    /// Limit this completion to one HTTP send, including transport failures.
+    #[must_use]
+    pub const fn without_retries(mut self) -> Self {
+        self.retries_allowed = false;
+        self
+    }
+
+    /// Whether transport recovery may resend before any completion event.
+    #[must_use]
+    pub const fn retries_allowed(&self) -> bool {
+        self.retries_allowed
     }
 
     pub(crate) fn into_parts(self) -> ChatRequestParts {
