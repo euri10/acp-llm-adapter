@@ -41,6 +41,8 @@ pub enum SessionPersistenceError {
 /// `Result` whose error variant is this type).  The ACP boundary owns the
 /// single `From` implementation that converts `AdapterError` into
 /// [`agent_client_protocol::Error`].
+/// Internal [`Display`](std::fmt::Display) and source errors retain diagnostic
+/// detail; ACP conversion exposes only fixed, reviewed messages.
 ///
 /// # Errors
 ///
@@ -83,20 +85,75 @@ pub enum AdapterError {
 
 impl From<AdapterError> for agent_client_protocol::Error {
     /// Converts any [`AdapterError`] into an ACP error with the appropriate
-    /// JSON-RPC error code.
+    /// JSON-RPC error code and a fixed message without private input or causes.
     fn from(err: AdapterError) -> Self {
         match err {
-            AdapterError::InvalidParams(msg) => {
-                agent_client_protocol::Error::invalid_params().data(msg)
+            AdapterError::InvalidParams(msg) => agent_client_protocol::Error::invalid_params()
+                .data(validation_message(&msg, "invalid method parameters")),
+            AdapterError::InvalidRequest(msg) => agent_client_protocol::Error::invalid_request()
+                .data(validation_message(&msg, "invalid request")),
+            AdapterError::SessionNotFound(_) => {
+                agent_client_protocol::Error::invalid_params().data("session not found")
             }
-            AdapterError::InvalidRequest(msg) => {
-                agent_client_protocol::Error::invalid_request().data(msg)
+            AdapterError::Llm(error) => {
+                agent_client_protocol::Error::internal_error().data(match error {
+                    ChatError::MissingApiKey => "provider API key is not configured",
+                    ChatError::Transport(_) => "provider connection failed",
+                    ChatError::InvalidResponse(_) | ChatError::Json(_) => {
+                        "provider returned an invalid response"
+                    }
+                })
             }
-            AdapterError::SessionNotFound(id) => agent_client_protocol::Error::invalid_params()
-                .data(format!("session not found: {id}")),
-            other => agent_client_protocol::Error::into_internal_error(other),
+            AdapterError::SessionPersistence(_) => {
+                agent_client_protocol::Error::internal_error().data("session storage failed")
+            }
+            AdapterError::Internal(_) => {
+                agent_client_protocol::Error::internal_error().data("adapter operation failed")
+            }
         }
     }
+}
+
+/// Select only static diagnostic text. Domain validation strings may contain
+/// peer values or wrapped MCP failures, so even recognized prefixes are never
+/// returned from the original string. Unrecognized errors fail closed.
+fn validation_message(detail: &str, fallback: &'static str) -> &'static str {
+    if detail.starts_with("MCP server '") {
+        return "MCP server command must be absolute";
+    }
+    if detail.starts_with("session ") && detail.ends_with(" already has an active turn") {
+        return "session already has an active turn";
+    }
+    if detail.starts_with("tool call delta ") {
+        return "provider tool call is incomplete";
+    }
+    [
+        "unknown session id",
+        "unknown permission option selected",
+        "unsupported permission outcome variant",
+        "unsupported max_tokens value",
+        "unsupported model",
+        "unsupported MCP server transport",
+        "failed to start MCP server",
+        "failed to initialize MCP server",
+        "failed to list MCP tools",
+        "invalid HTTP header name",
+        "invalid HTTP header value",
+        "binary resource prompt blocks are not supported",
+        "unsupported embedded resource prompt block",
+        "only text, resource link, and text resource prompt blocks are supported",
+        "prompt must include non-empty text",
+        "session/load requires filesystem persistence",
+        "selected-content prompts require text snapshots",
+        "selected-content deadline exceeded",
+        "selected-content output byte limit exceeded",
+        "selected-content Sessions refuse all tool calls",
+        "selected-content Sessions allow one attempt",
+        "selected-content input byte limit exceeded",
+    ]
+    .into_iter()
+    .find(|message| detail.starts_with(message))
+    .unwrap_or(fallback)
 }
 
 impl From<std::io::Error> for AdapterError {
@@ -126,6 +183,10 @@ impl From<agent_client_protocol::Error> for AdapterError {
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
+    use std::error::Error as _;
+
+    use agent_client_protocol::ErrorCode::{InternalError, InvalidParams, InvalidRequest};
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -255,16 +316,22 @@ mod tests {
     fn from_adapter_error_invalid_params_to_acp_error() {
         let adapter_err = AdapterError::InvalidParams("missing field".into());
         let acp_err: agent_client_protocol::Error = adapter_err.into();
-        let msg = acp_err.to_string();
-        assert!(msg.contains("missing field"));
+        assert_eq!(
+            acp_err.code,
+            agent_client_protocol::ErrorCode::InvalidParams
+        );
+        assert_eq!(acp_err.data, Some("invalid method parameters".into()));
     }
 
     #[test_log::test]
     fn from_adapter_error_invalid_request_to_acp_error() {
         let adapter_err = AdapterError::InvalidRequest("bad json".into());
         let acp_err: agent_client_protocol::Error = adapter_err.into();
-        let msg = acp_err.to_string();
-        assert!(msg.contains("bad json"));
+        assert_eq!(
+            acp_err.code,
+            agent_client_protocol::ErrorCode::InvalidRequest
+        );
+        assert_eq!(acp_err.data, Some("invalid request".into()));
     }
 
     #[test_log::test]
@@ -273,16 +340,21 @@ mod tests {
         let acp_err: agent_client_protocol::Error = adapter_err.into();
         let msg = acp_err.to_string();
         assert!(msg.contains("session not found"));
-        assert!(msg.contains("sess-42"));
+        assert!(!msg.contains("sess-42"));
     }
 
     #[test_log::test]
     fn from_adapter_error_llm_to_acp_internal_error() {
         let adapter_err = AdapterError::Llm(ChatError::MissingApiKey);
         let acp_err: agent_client_protocol::Error = adapter_err.into();
-        let msg = acp_err.to_string();
-        // LLM variant hits the `other => into_internal_error` arm.
-        assert!(msg.contains("LLM_API_KEY is not set") || msg.contains("MissingApiKey"));
+        assert_eq!(
+            acp_err.code,
+            agent_client_protocol::ErrorCode::InternalError
+        );
+        assert_eq!(
+            acp_err.data,
+            Some("provider API key is not configured".into())
+        );
     }
 
     #[test_log::test]
@@ -290,16 +362,153 @@ mod tests {
         let persist_err = SessionPersistenceError::StateDir("no-dir".into());
         let adapter_err = AdapterError::SessionPersistence(persist_err);
         let acp_err: agent_client_protocol::Error = adapter_err.into();
-        let msg = acp_err.to_string();
-        assert!(msg.contains("failed to resolve state directory"));
+        assert_eq!(
+            acp_err.code,
+            agent_client_protocol::ErrorCode::InternalError
+        );
+        assert_eq!(acp_err.data, Some("session storage failed".into()));
     }
 
     #[test_log::test]
     fn from_adapter_error_internal_to_acp_internal_error() {
         let adapter_err = AdapterError::Internal("assertion failed".into());
         let acp_err: agent_client_protocol::Error = adapter_err.into();
-        let msg = acp_err.to_string();
-        assert!(msg.contains("assertion failed"));
+        assert_eq!(
+            acp_err.code,
+            agent_client_protocol::ErrorCode::InternalError
+        );
+        assert_eq!(acp_err.data, Some("adapter operation failed".into()));
+    }
+
+    #[test_log::test]
+    fn acp_presentation_never_serializes_private_error_details()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sentinel = "PRIVATE_ERROR_SENTINEL";
+        let json_error = serde_json::from_value::<u64>(serde_json::json!(sentinel))
+            .err()
+            .ok_or("expected a JSON type error")?;
+        let provider: AdapterError = ChatError::Json(json_error).into();
+        let storage: AdapterError =
+            std::io::Error::other(format!("/private/{sentinel}/sessions")).into();
+        let transport: AdapterError = ChatError::Transport(Box::new(std::io::Error::other(
+            format!("https://example.invalid/?token={sentinel}"),
+        )))
+        .into();
+        for (error, code, message) in [
+            (
+                provider,
+                InternalError,
+                "provider returned an invalid response",
+            ),
+            (transport, InternalError, "provider connection failed"),
+            (storage, InternalError, "session storage failed"),
+            (
+                AdapterError::Llm(ChatError::InvalidResponse(sentinel.into())),
+                InternalError,
+                "provider returned an invalid response",
+            ),
+            (
+                AdapterError::InvalidParams(sentinel.into()),
+                InvalidParams,
+                "invalid method parameters",
+            ),
+            (
+                AdapterError::InvalidRequest(sentinel.into()),
+                InvalidRequest,
+                "invalid request",
+            ),
+            (
+                AdapterError::SessionNotFound(sentinel.into()),
+                InvalidParams,
+                "session not found",
+            ),
+            (
+                AdapterError::Internal(sentinel.into()),
+                InternalError,
+                "adapter operation failed",
+            ),
+            (
+                AdapterError::InvalidParams(format!(
+                    "invalid HTTP header name '{sentinel}' for MCP server '{sentinel}': invalid header"
+                )),
+                InvalidParams,
+                "invalid HTTP header name",
+            ),
+            (
+                AdapterError::InvalidParams(format!(
+                    "invalid HTTP header value for 'Authorization' on MCP server '{sentinel}': {sentinel}"
+                )),
+                InvalidParams,
+                "invalid HTTP header value",
+            ),
+            (
+                AdapterError::InvalidParams(format!(
+                    "failed to initialize MCP server '{sentinel}': https://example.invalid/?token={sentinel}"
+                )),
+                InvalidParams,
+                "failed to initialize MCP server",
+            ),
+            (
+                AdapterError::InvalidParams(format!("unsupported model: {sentinel}")),
+                InvalidParams,
+                "unsupported model",
+            ),
+        ] {
+            assert!(error.to_string().contains(sentinel));
+            let presented: agent_client_protocol::Error = error.into();
+            assert_eq!(presented.code, code);
+            assert_eq!(presented.data, Some(message.into()));
+            assert!(!serde_json::to_string(&presented)?.contains(sentinel));
+            assert!(!format!("{presented:?}").contains(sentinel));
+        }
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn domain_errors_retain_typed_private_causes() -> Result<(), Box<dyn std::error::Error>> {
+        let sentinel = "PRIVATE_CAUSE_SENTINEL";
+        let json_error = serde_json::from_value::<u64>(serde_json::json!(sentinel))
+            .err()
+            .ok_or("expected a JSON type error")?;
+        let provider: AdapterError = ChatError::Json(json_error).into();
+        let llm = provider.source().ok_or("missing LLM cause")?;
+        assert!(llm.downcast_ref::<ChatError>().is_some());
+        let json = llm.source().ok_or("missing JSON cause")?;
+        assert!(json.downcast_ref::<serde_json::Error>().is_some());
+        assert!(json.to_string().contains(sentinel));
+
+        for error in [
+            AdapterError::from(std::io::Error::other(sentinel)),
+            AdapterError::from(ChatError::Transport(Box::new(std::io::Error::other(
+                sentinel,
+            )))),
+        ] {
+            let cause = error
+                .source()
+                .ok_or("missing domain cause")?
+                .source()
+                .ok_or("missing I/O cause")?;
+            assert!(cause.downcast_ref::<std::io::Error>().is_some());
+            assert!(cause.to_string().contains(sentinel));
+        }
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn acp_presentation_preserves_safe_validation_diagnostics() {
+        for message in [
+            "prompt must include non-empty text",
+            "selected-content Sessions refuse all tool calls",
+            "selected-content input byte limit exceeded",
+        ] {
+            let error = if message.contains("refuse") {
+                AdapterError::InvalidRequest(message.into())
+            } else {
+                AdapterError::InvalidParams(message.into())
+            };
+            let presented: agent_client_protocol::Error = error.into();
+            assert_eq!(presented.data, Some(message.into()));
+        }
     }
 
     // -----------------------------------------------------------------------

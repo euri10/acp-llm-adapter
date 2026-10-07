@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{ChatMessage, LlmClient, MessageRole, ToolCall as ChatToolCall};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -48,8 +49,7 @@ pub(crate) async fn serve_with_transport_and_state_dir(
 ) -> Result<(), agent_client_protocol::Error> {
     let persistence = match state_dir {
         Some(dir) => FilesystemSessionStore::new(dir),
-        None => FilesystemSessionStore::from_default_state_dir()
-            .map_err(agent_client_protocol::Error::into_internal_error)?,
+        None => FilesystemSessionStore::from_default_state_dir().map_err(AdapterError::from)?,
     };
     serve_with_transport_impl(
         transport,
@@ -74,8 +74,7 @@ pub(crate) async fn serve_with_transport_and_state_dir_logging(
 ) -> Result<(), agent_client_protocol::Error> {
     let persistence = match state_dir {
         Some(dir) => FilesystemSessionStore::new(dir),
-        None => FilesystemSessionStore::from_default_state_dir()
-            .map_err(agent_client_protocol::Error::into_internal_error)?,
+        None => FilesystemSessionStore::from_default_state_dir().map_err(AdapterError::from)?,
     };
     serve_with_transport_impl(
         transport,
@@ -144,21 +143,21 @@ async fn serve_with_transport_impl(
                 let connection = cx.clone();
 
                 cx.spawn(async move {
-                    let response =
-                        handle_new_session_request_connected(&session_store, &request).await?;
-                    let session_id = response.session_id.clone();
-
-                    let commands = adapter_available_commands();
-                    if !commands.is_empty() {
-                        connection.send_notification(session_notification(
-                            session_id,
-                            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                                commands,
-                            )),
-                        ))?;
+                    let result =
+                        handle_new_session_request_connected(&session_store, &request).await;
+                    if let Ok(response) = &result {
+                        let commands = adapter_available_commands();
+                        if !commands.is_empty() {
+                            connection.send_notification(session_notification(
+                                response.session_id.clone(),
+                                SessionUpdate::AvailableCommandsUpdate(
+                                    AvailableCommandsUpdate::new(commands),
+                                ),
+                            ))?;
+                        }
                     }
 
-                    responder.respond(response)?;
+                    responder.respond_with_result(result)?;
                     Ok(())
                 })?;
 
@@ -344,8 +343,7 @@ pub(crate) fn handle_close_session_request(
 ) -> Result<CloseSessionResponse, agent_client_protocol::Error> {
     let existed = store.remove_session(&request.session_id)?;
     if !existed {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data(format!("unknown session id: {}", request.session_id.0)));
+        return Err(agent_client_protocol::Error::invalid_params().data("unknown session id"));
     }
 
     Ok(CloseSessionResponse::new())
@@ -358,8 +356,7 @@ pub(crate) fn handle_delete_session_request(
 ) -> Result<DeleteSessionResponse, agent_client_protocol::Error> {
     let existed = store.delete_session(&request.session_id)?;
     if !existed {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data(format!("unknown session id: {}", request.session_id.0)));
+        return Err(agent_client_protocol::Error::invalid_params().data("unknown session id"));
     }
 
     Ok(DeleteSessionResponse::new())
@@ -440,21 +437,15 @@ async fn restore_persisted_session(
 ) -> Result<(SessionId, Vec<ChatMessage>), agent_client_protocol::Error> {
     let persisted = store.load_persisted_record(requested_session_id)?;
     if persisted.meta.cwd != cwd {
-        return Err(agent_client_protocol::Error::invalid_params().data(format!(
-            "session {} was persisted for cwd {}, not {}",
-            requested_session_id.0,
-            persisted.meta.cwd.display(),
-            cwd.display()
-        )));
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("session was persisted for cwd different from the requested cwd"));
     }
 
     let mcp_sessions = connect_mcp_sessions(&persisted.meta.mcp_servers).await?;
     let session_id = SessionId::new(persisted.meta.session_id.clone());
     if session_id != *requested_session_id {
-        return Err(agent_client_protocol::Error::invalid_params().data(format!(
-            "persisted session id {} does not match requested session id {}",
-            session_id.0, requested_session_id.0
-        )));
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("persisted session id does not match requested session id"));
     }
     let history = persisted.history;
 
@@ -542,8 +533,7 @@ fn insert_session_record(
     if let Some(limits) = selected_content {
         response = response.meta(serde_json::Map::from_iter([(
             crate::selected_content::META_KEY.to_string(),
-            serde_json::to_value(limits)
-                .map_err(agent_client_protocol::Error::into_internal_error)?,
+            serde_json::to_value(limits).map_err(AdapterError::from)?,
         )]));
     }
     Ok(response)
@@ -663,8 +653,7 @@ pub(crate) fn handle_set_session_mode_request_notifying(
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
     let Some(mode) = SessionBehavior::from_mode_id(&request.mode_id) else {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data(format!("unsupported session mode: {}", request.mode_id.0)));
+        return Err(agent_client_protocol::Error::invalid_params().data("unsupported session mode"));
     };
 
     store.set_mode(&request.session_id, mode)?;
@@ -695,16 +684,15 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
         SESSION_CONFIG_MODE_ID => {
             let mode_id = agent_client_protocol::schema::v1::SessionModeId::new(value.0.clone());
             let Some(mode) = SessionBehavior::from_mode_id(&mode_id) else {
-                return Err(agent_client_protocol::Error::invalid_params()
-                    .data(format!("unsupported session mode: {}", value.0)));
+                return Err(
+                    agent_client_protocol::Error::invalid_params().data("unsupported session mode")
+                );
             };
             store.set_mode(&request.session_id, mode)?;
         }
         SESSION_CONFIG_MODEL_ID => {
             let model = value.0.as_ref();
-            let available_models = store
-                .available_models()
-                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let available_models = store.available_models()?;
             store.with_session(&request.session_id, |session| {
                 validate_session_model(session, model, &available_models)?;
                 Ok(())
@@ -714,7 +702,7 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
         SESSION_CONFIG_REASONING_EFFORT_ID => {
             let Some(effort) = ReasoningEffort::from_value_id(value) else {
                 return Err(agent_client_protocol::Error::invalid_params()
-                    .data(format!("unsupported reasoning effort: {}", value.0)));
+                    .data("unsupported reasoning effort"));
             };
             store.set_reasoning_effort(&request.session_id, effort)?;
         }
@@ -723,10 +711,8 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
             store.set_max_tokens(&request.session_id, max_tokens)?;
         }
         _ => {
-            return Err(agent_client_protocol::Error::invalid_params().data(format!(
-                "unsupported session config option: {}",
-                request.config_id.0
-            )));
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("unsupported session config option"));
         }
     }
 
@@ -820,16 +806,13 @@ pub(crate) fn validate_load_session_paths(
     request: &LoadSessionRequest,
 ) -> Result<(), agent_client_protocol::Error> {
     if !request.cwd.is_absolute() {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data(format!("cwd must be absolute: {}", request.cwd.display())));
+        return Err(agent_client_protocol::Error::invalid_params().data("cwd must be absolute"));
     }
 
     for path in &request.additional_directories {
         if !path.is_absolute() {
-            return Err(agent_client_protocol::Error::invalid_params().data(format!(
-                "additional directory must be absolute: {}",
-                path.display()
-            )));
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("additional directory must be absolute"));
         }
     }
 

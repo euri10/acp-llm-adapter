@@ -277,6 +277,7 @@ The adapter bridges two independent channels:
 ### Design Principles
 
 - **Translation boundary**: ACP and HTTP types stay at their respective edges. Business logic in the adapter core (`turn`, `tools`, `session_store`) depends only on the adapter's own types — not on `agent-client-protocol` schema types or raw HTTP types.
+- **Error presentation**: ACP errors retain their JSON-RPC classification and return fixed provider, storage, or validation diagnostics. Private response values, credentials, URLs, paths, and raw internal causes are omitted; domain errors retain their diagnostic detail internally.
 - **Testable seams**: The `LlmClient` trait lets prompt-turn tests run against canned SSE fixtures without a network. The `ToolRegistry` trait lets tool-loop tests inject fake tools. ACP handler tests use in-memory fake client connections.
 - **Single async runtime**: Tokio multi-thread throughout. No lock is held across `.await`. No mixing of async runtimes.
 - **No unsafe code**: `#![forbid(unsafe_code)]` at every crate root.
