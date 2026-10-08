@@ -429,29 +429,34 @@ fn serve_log() -> Result<Option<Arc<LogSink>>, agent_client_protocol::Error> {
         .map_err(agent_client_protocol::Error::into_internal_error)
 }
 
-/// Resolve when the process receives `SIGTERM`, `SIGINT`, or `SIGHUP`.
+/// Register immediately, then resolve on `SIGTERM`, `SIGINT`, or `SIGHUP`.
 ///
 /// # Errors
 ///
-/// Returns an internal ACP error if a signal listener cannot be registered.
+/// The returned future reports an internal ACP error if registration fails.
 #[cfg(unix)]
-async fn shutdown_signal() -> Result<(), agent_client_protocol::Error> {
+fn shutdown_signal() -> impl std::future::Future<Output = Result<(), agent_client_protocol::Error>>
+{
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigterm = signal(SignalKind::terminate())
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let mut sigint = signal(SignalKind::interrupt())
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let mut sighup =
-        signal(SignalKind::hangup()).map_err(agent_client_protocol::Error::into_internal_error)?;
+    // select! constructs every branch before polling any of them. Register
+    // here so discovery cannot expose startup before shutdown is handled.
+    let sigterm = signal(SignalKind::terminate());
+    let sigint = signal(SignalKind::interrupt());
+    let sighup = signal(SignalKind::hangup());
 
-    let which = tokio::select! {
-        _ = sigterm.recv() => "SIGTERM",
-        _ = sigint.recv() => "SIGINT",
-        _ = sighup.recv() => "SIGHUP",
-    };
-    tracing::info!(signal = which, "received termination signal");
-    Ok(())
+    async move {
+        let mut sigterm = sigterm.map_err(agent_client_protocol::Error::into_internal_error)?;
+        let mut sigint = sigint.map_err(agent_client_protocol::Error::into_internal_error)?;
+        let mut sighup = sighup.map_err(agent_client_protocol::Error::into_internal_error)?;
+        let which = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+            _ = sighup.recv() => "SIGHUP",
+        };
+        tracing::info!(signal = which, "received termination signal");
+        Ok(())
+    }
 }
 
 #[cfg(not(unix))]
@@ -661,6 +666,44 @@ mod tests {
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::prelude::*;
+
+    #[cfg(target_os = "linux")]
+    #[test_log::test(tokio::test)]
+    async fn shutdown_listener_captures_sigterm_before_polling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let child_marker = "ACP_TEST_SHUTDOWN_SIGNAL_CHILD";
+        if std::env::var_os(child_marker).is_some() {
+            let shutdown = super::shutdown_signal();
+            rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::TERM,
+            )?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), shutdown).await??;
+            return Ok(());
+        }
+
+        // Tokio retains installed handlers process-wide. Use a fresh process
+        // so another test cannot mask registration that happened too late.
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::shutdown_listener_captures_sigterm_before_polling",
+                "--nocapture",
+            ])
+            .env(child_marker, "1")
+            .kill_on_drop(true)
+            .spawn()?;
+        let status =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(status) => status?,
+                Err(error) => {
+                    child.kill().await?;
+                    return Err(error.into());
+                }
+            };
+        assert!(status.success(), "isolated shutdown probe failed: {status}");
+        Ok(())
+    }
 
     #[test_log::test]
     fn rejects_serve_subcommand_without_backend() {
