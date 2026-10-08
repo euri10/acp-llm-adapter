@@ -231,8 +231,9 @@ intact. If all sources are unknown, no `usage_update` is emitted.
 
 Optional startup discovery has a two-second deadline covering connection,
 response headers, and the full body. Failure keeps the configured default model.
-Termination signals cancel discovery immediately; editor disconnect is observed
-when this bounded startup step finishes, within two seconds of starting discovery.
+Unix termination handlers are registered before discovery starts, so signals
+cancel it immediately. Editor disconnect is observed when this bounded startup
+step finishes, within two seconds of starting discovery.
 
 ## Architecture
 

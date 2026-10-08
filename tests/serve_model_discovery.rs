@@ -182,11 +182,8 @@ async fn termination_during_stalled_discovery_releases_request_and_exits()
         let pid = rustix::process::Pid::from_raw(i32::try_from(child.id().ok_or("no child PID")?)?)
             .ok_or("invalid PID")?;
         rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), child.wait())
-                .await??
-                .success()
-        );
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await??;
+        assert!(status.success(), "serve exited after SIGTERM: {status}");
         tokio::time::timeout(Duration::from_secs(2), fixture.disconnected.cancelled()).await?;
     }
     Ok(())
