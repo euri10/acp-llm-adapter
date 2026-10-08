@@ -26,18 +26,18 @@ pre-existing failure is never mistaken for one you introduced:
 ```sh
 # 1. Baseline, before your changes.
 git stash
-cargo test -q 2>&1 | grep -E "^test result|FAILED"
+cargo test --locked --all-features -q 2>&1 | grep -E "^test result|FAILED"
 git stash pop
 
 # 2. The same suite with your changes applied.
-cargo test -q 2>&1 | grep -E "^test result|FAILED"
+cargo test --locked --all-features -q 2>&1 | grep -E "^test result|FAILED"
 
 # 3. Formatting and linting.
 cargo fmt --all && cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 
 # 4. Public documentation.
-cargo doc --no-deps --all-features   # RUSTDOCFLAGS="-D warnings" in CI
+cargo doc --locked --no-deps --all-features   # RUSTDOCFLAGS="-D warnings" in CI
 ```
 
 Every `test result` line must say `ok`. Any `FAILED` line that was not in the
@@ -52,10 +52,18 @@ lifecycle defect, not a flake to retry.
 ## Gates
 
 CI (`.github/workflows/ci.yml`) enforces fmt, clippy `--all-targets`,
-`cargo test --all-features`, doc-tests, `cargo doc` with `-D warnings`, a
+`cargo test --locked --all-features`, doc-tests, `cargo doc` with `-D warnings`, a
 release build, `cargo audit`, and the AGENTS.md size check. Tests run with
 `LLM_API_KEY=skip-ci-no-key` so an accidental network call fails fast rather
 than hanging.
+
+Every dependency-resolving Cargo gate (clippy, tests, doc-tests, documentation,
+and release build) uses `--locked`, starting with clippy. A green gate must test
+the committed dependency versions, not a lockfile Cargo silently repaired.
+Update the manifest and lockfile deliberately in a dependency change; never
+regenerate the lockfile automatically or drop `--locked` to make validation pass.
+Verify this guard with an inconsistent manifest/lockfile pair: the command must
+fail before compilation and leave `Cargo.lock` unchanged (daa-fvy5).
 
 CI runs the same `cargo test` invocation prescribed above, without
 `--all-targets`, and that is deliberate. The child-process fixtures live in
