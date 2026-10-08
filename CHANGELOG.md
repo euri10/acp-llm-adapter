@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/euri10/acp-llm-adapter/compare/v0.8.0...v0.9.0) - 2026-10-08
+
+### Added
+
+- *(session)* enforce bounded tool-less readers
+
+### Fixed
+
+- *(mcp)* implement legacy SSE transport
+- harden agent execution and file authority
+- *(llm)* [**breaking**] reject overflowing usage counters
+- *(llm)* bound streamed tool-call indices
+- *(llm)* enforce completion replay policy
+- *(acp)* sanitize editor-visible errors
+- *(logsink)* redact ACP content and raw text
+- *(mcp)* enforce approval and cancellation
+- *(logsink)* [**breaking**] never evict logs another writer asked to keep
+- *(session)* persist prompts before provider calls
+
+### Other
+
+- *(deps)* switch to Dependabot
+- isolate agent core from ACP
+- *(beads)* accept MCP approval QA
+- *(beads)* correct MCP QA status
+- *(beads)* record MCP confirmation
+- *(beads)* close shared log retention bug
+- *(beads)* file shared log retention pruning bug
+
 ## [0.8.0](https://github.com/euri10/acp-llm-adapter/compare/v0.7.6...v0.8.0) - 2026-09-21
 
 ### Added
