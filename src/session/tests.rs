@@ -1,5 +1,7 @@
 #![allow(clippy::indexing_slicing)]
 use super::{PendingToolCalls, PermissionDecision, ReasoningEffort, SessionBehavior};
+use acp_llm_adapter::error::AdapterError;
+use acp_llm_adapter::llm::{ChatError, ToolCall, ToolCallDelta};
 use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome, SessionModeId,
     ToolKind,
@@ -167,6 +169,75 @@ fn max_tokens_select_options_include_default_and_presets() {
     );
 }
 
+#[test_log::test]
+fn pending_tool_calls_reject_out_of_range_index_without_growth() -> Result<(), AdapterError> {
+    for populated in [false, true] {
+        let mut pending = PendingToolCalls::default();
+        if populated {
+            pending.push(&ToolCallDelta::new(
+                0,
+                Some("kept".into()),
+                Some("echo".into()),
+                Some("{}".into()),
+            ))?;
+        }
+        let len = pending.calls.len();
+        let capacity = pending.calls.capacity();
+        // Test the cheap boundary first so removing the guard fails before the
+        // extreme index can cause an unbounded allocation in this regression.
+        for index in [super::MAX_TOOL_CALLS_PER_COMPLETION, usize::MAX] {
+            assert!(matches!(
+                pending.push(&ToolCallDelta::new(index, None, None, None)),
+                Err(AdapterError::Llm(ChatError::InvalidResponse(_)))
+            ));
+            assert_eq!(
+                pending.calls.len(),
+                len,
+                "invalid index allocated call slots"
+            );
+            assert_eq!(pending.calls.capacity(), capacity);
+        }
+        assert_eq!(
+            pending.finish()?,
+            if populated {
+                vec![ToolCall::new("kept", "echo", "{}")]
+            } else {
+                vec![]
+            }
+        );
+    }
+    Ok(())
+}
+
+#[test_log::test]
+fn pending_tool_calls_accept_interleaved_fragments_up_to_the_limit() -> Result<(), AdapterError> {
+    let mut pending = PendingToolCalls::default();
+    for index in (0..super::MAX_TOOL_CALLS_PER_COMPLETION).rev() {
+        pending.push(&ToolCallDelta::new(
+            index,
+            Some(format!("call-{index}")),
+            Some("echo".into()),
+            Some(format!("{{\"index\":{index}")),
+        ))?;
+    }
+    for index in 0..super::MAX_TOOL_CALLS_PER_COMPLETION {
+        pending.push(&ToolCallDelta::new(index, None, None, Some("}".into())))?;
+    }
+    let calls = pending.finish()?;
+    assert_eq!(calls.len(), super::MAX_TOOL_CALLS_PER_COMPLETION);
+    for (index, call) in calls.iter().enumerate() {
+        assert_eq!(
+            call,
+            &ToolCall::new(
+                format!("call-{index}"),
+                "echo",
+                format!("{{\"index\":{index}}}")
+            )
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn pending_tool_calls_require_complete_metadata() -> Result<(), agent_client_protocol::Error> {
     use acp_llm_adapter::llm::ToolCallDelta;
@@ -177,7 +248,7 @@ fn pending_tool_calls_require_complete_metadata() -> Result<(), agent_client_pro
         None,
         Some("echo".to_string()),
         Some("{}".to_string()),
-    ));
+    ))?;
     let Err(error) = missing_id.finish() else {
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected missing tool call id to fail"));
@@ -190,7 +261,7 @@ fn pending_tool_calls_require_complete_metadata() -> Result<(), agent_client_pro
         Some("call-1".to_string()),
         None,
         Some("{}".to_string()),
-    ));
+    ))?;
     let Err(error) = missing_name.finish() else {
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected missing tool call name to fail"));

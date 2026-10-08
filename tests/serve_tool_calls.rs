@@ -23,8 +23,15 @@ mod acp_client;
 
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::routing::{get, post};
+use futures_util::{StreamExt as _, stream};
 use serde_json::{Value, json};
 
 use acp_client::{Serve, Stopped, alive, backgrounding_command};
@@ -114,6 +121,146 @@ async fn run_prompt(serve: &mut Serve, text: &str) -> Result<Value, Box<dyn Erro
         Stopped::Response(response) => Ok(*response),
         other => Err(format!("prompt never finished: {other:?}").into()),
     }
+}
+
+fn tool_index_provider(posts: Arc<AtomicUsize>) -> Router {
+    Router::new()
+        .route(
+            "/models",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    json!({"data":[{"id":"fixture-model"}]}).to_string(),
+                )
+            }),
+        )
+        .route(
+            "/chat/completions",
+            post(|State(posts): State<Arc<AtomicUsize>>| async move {
+                let call = json!({"index":0, "id":"call-0", "function":{
+                "name":"run_command", "arguments":"{\"command\":\"printf TOOL_INDEX_OK\"}"}});
+                let attempt = posts.fetch_add(1, Ordering::SeqCst);
+                let chunks = match attempt {
+                    // Small enough to run safely even if validation regresses. Include
+                    // a complete valid call to prove the whole batch is rejected.
+                    0 => vec![json!({"choices":[{"delta":{"tool_calls":[call,
+                    {"index":128, "id":"bad-index", "function":{
+                        "name":"run_command", "arguments":"{}"}}]},
+                    "finish_reason":null}]})],
+                    1 => vec![
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+                        "id":"call-0", "function":{"name":"run_command",
+                            "arguments":"{\"command\":"}}]}, "finish_reason":null}]}),
+                        json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+                        "function":{"arguments":"\"printf TOOL_INDEX_OK\"}"}}]},
+                        "finish_reason":"tool_calls"}]}),
+                    ],
+                    _ => vec![json!({"choices":[{"delta":{"content":"done"},
+                    "finish_reason":"stop"}]})],
+                };
+                let mut body = String::new();
+                for chunk in chunks {
+                    body.push_str("data: ");
+                    body.push_str(&chunk.to_string());
+                    body.push_str("\n\n");
+                }
+                let body = if attempt == 0 {
+                    // Keep the invalid response open: rejection must happen on the
+                    // delta itself, without waiting for completion or disconnect.
+                    Body::from_stream(
+                        stream::once(async move { Ok::<_, std::io::Error>(body) })
+                            .chain(stream::pending()),
+                    )
+                } else {
+                    body.push_str("data: [DONE]\n\n");
+                    Body::from(body)
+                };
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    body,
+                )
+            }),
+        )
+        .with_state(posts)
+}
+
+#[test_log::test(tokio::test)]
+async fn invalid_tool_index_fails_before_execution_and_session_recovers()
+-> Result<(), Box<dyn Error>> {
+    let posts = Arc::new(AtomicUsize::new(0));
+    let router = tool_index_provider(Arc::clone(&posts));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let mut server = tokio::task::JoinSet::new();
+    server.spawn(async move { axum::serve(listener, router).await });
+    let root =
+        LogRoot(std::env::temp_dir().join(format!("acp-tool-index-{}", uuid::Uuid::new_v4())));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+    command
+        .args(["serve", "--backend", "groq"])
+        .env("LLM_API_KEY", "fixture-key")
+        .env("LLM_BASE_URL", base_url)
+        .env("LLM_MODEL", "fixture-model")
+        .env("XDG_STATE_HOME", &root.0)
+        .env_remove("ACP_LOG");
+    let mut serve = Serve::start_with(command, json!({"cwd":"/tmp", "mcpServers":[]})).await?;
+    let failed = run_prompt(&mut serve, "invalid batch").await?;
+    assert_eq!(failed.pointer("/error/code"), Some(&json!(-32603)));
+    assert_eq!(
+        failed.pointer("/error/data"),
+        Some(&json!("provider returned an invalid response"))
+    );
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        1,
+        "invalid completion was retried"
+    );
+    assert!(
+        serve
+            .position_of_method("session/request_permission")
+            .is_none()
+    );
+    assert!(serve.updates("tool_call").is_empty());
+    assert!(serve.updates("tool_call_update").is_empty());
+    let history = std::fs::read_to_string(
+        root.0
+            .join("acp-llm-adapter/sessions")
+            .join(serve.session_id())
+            .join("history.jsonl"),
+    )?;
+    for line in history.lines() {
+        let message: Value = serde_json::from_str(line)?;
+        assert_eq!(
+            message.get("role"),
+            Some(&json!("user")),
+            "invalid provider batch changed conversation history"
+        );
+    }
+
+    let recovered = run_prompt(&mut serve, "valid fragmented call").await?;
+    assert_eq!(
+        recovered.pointer("/result/stopReason"),
+        Some(&json!("end_turn"))
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 3);
+    assert!(
+        serve
+            .position_of_method("session/request_permission")
+            .is_some()
+    );
+    assert_eq!(serve.updates("tool_call").len(), 1);
+    assert!(
+        serve
+            .updates("tool_call_update")
+            .iter()
+            .any(|update| update.get("status") == Some(&json!("completed"))
+                && update.to_string().contains("TOOL_INDEX_OK")),
+        "valid tool deltas did not execute after rejection"
+    );
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    server.shutdown().await;
+    Ok(())
 }
 
 /// The editor must be told a tool ran, and told what it produced.

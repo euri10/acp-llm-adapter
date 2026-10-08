@@ -749,7 +749,7 @@ pub(crate) async fn stream_model_turn(
                     ),
                 ))?;
             }
-            StreamEvent::ToolCallDelta(delta) => tool_calls.push(&delta),
+            StreamEvent::ToolCallDelta(delta) => tool_calls.push(&delta)?,
             StreamEvent::Finished(reason) => {
                 stop_reason = stop_reason_from_finish(&reason);
                 finish_reason = reason;

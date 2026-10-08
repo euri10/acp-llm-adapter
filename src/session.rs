@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use acp_llm_adapter::llm::MessageRole;
 use acp_llm_adapter::llm::{
-    ChatConfig, ChatMessage, ModelCatalog, ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition,
+    ChatConfig, ChatError, ChatMessage, ModelCatalog, ToolCall as ChatToolCall, ToolCallDelta,
+    ToolDefinition,
 };
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, McpServer, PermissionOption, PermissionOptionKind,
@@ -266,14 +267,30 @@ fn permission_options() -> Vec<PermissionOption> {
     ]
 }
 
+// Local defensive bound, not a provider capability: allow large tool batches
+// while limiting slot allocation and synchronous work driven by untrusted indices.
+const MAX_TOOL_CALLS_PER_COMPLETION: usize = 128;
+
 #[derive(Debug, Default)]
 pub(crate) struct PendingToolCalls {
     calls: Vec<PendingToolCall>,
 }
 
 impl PendingToolCalls {
-    pub(crate) fn push(&mut self, delta: &ToolCallDelta) {
+    /// Accumulate a fragment after validating its slot index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-provider-response error without changing pending calls
+    /// when the index exceeds the local per-completion bound.
+    pub(crate) fn push(&mut self, delta: &ToolCallDelta) -> Result<(), AdapterError> {
         let index = delta.index();
+        if index >= MAX_TOOL_CALLS_PER_COMPLETION {
+            return Err(ChatError::InvalidResponse(format!(
+                "tool call index {index} exceeds the per-completion limit of {MAX_TOOL_CALLS_PER_COMPLETION} calls"
+            ))
+            .into());
+        }
         while self.calls.len() <= index {
             self.calls.push(PendingToolCall::default());
         }
@@ -289,6 +306,7 @@ impl PendingToolCalls {
                 call.arguments.push_str(arguments);
             }
         }
+        Ok(())
     }
 
     pub(crate) fn finish(self) -> Result<Vec<ChatToolCall>, AdapterError> {

@@ -281,6 +281,12 @@ After output, a dropped stream fails without replaying the generation.
 completion POST. Cancelling or dropping a stream releases its HTTP response and
 transport task. Completion POSTs do not follow redirects.
 
+Each completion accepts at most 128 tool calls, with indices from 0 through 127.
+This is a local defensive limit that bounds allocation and work driven by provider
+indices. Out-of-range indices fail immediately as an invalid provider response,
+before any calls in that completion are authorized, executed, or saved to history.
+Fragmented and interleaved calls within the limit remain supported.
+
 ### Design Principles
 
 - **Translation boundary**: ACP and HTTP types stay at their respective edges. Business logic in the adapter core (`turn`, `tools`, `session_store`) depends only on the adapter's own types — not on `agent-client-protocol` schema types or raw HTTP types.
