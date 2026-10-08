@@ -2,6 +2,7 @@
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
+use serde_json::json;
 use sse_reqwest_client::{RequestBuilderExt as _, SseErrorEvent, SseEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -261,6 +262,32 @@ fn parses_deepseek_usage_details() -> Result<(), ChatError> {
     );
 
     Ok(())
+}
+
+#[test_log::test]
+fn rejects_invalid_usage_counters() {
+    for usage in [
+        json!({"prompt_tokens": u64::MAX, "completion_tokens": 1}),
+        json!({"prompt_tokens": u64::MAX, "completion_tokens": 1, "total_tokens": u64::MAX}),
+        json!({"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 6}),
+        json!({"prompt_tokens": 3, "prompt_cache_hit_tokens": 4}),
+        json!({"prompt_tokens": 3, "prompt_cache_miss_tokens": 4}),
+        json!({"prompt_tokens": 3, "prompt_cache_hit_tokens": 2, "prompt_cache_miss_tokens": 2}),
+        json!({"prompt_tokens": u64::MAX, "prompt_cache_hit_tokens": u64::MAX, "prompt_cache_miss_tokens": 1}),
+        json!({"completion_tokens": 4, "completion_tokens_details": {"reasoning_tokens": 5}}),
+    ] {
+        let payload = json!({
+            "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": usage,
+        });
+        assert!(
+            matches!(
+                parse_chat_completion_chunk(&payload.to_string()),
+                Err(ChatError::InvalidResponse(_))
+            ),
+            "invalid usage was accepted: {usage}"
+        );
+    }
 }
 
 #[test_log::test]

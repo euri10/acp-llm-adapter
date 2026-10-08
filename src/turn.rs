@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 
 use acp_llm_adapter::llm::{
-    ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
+    ChatError, ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
     ToolCall as ChatToolCall, ToolDefinition, UsageData, context_window_for_model,
     model_cost_micros,
 };
@@ -55,6 +55,7 @@ pub(crate) struct StreamContext<'a> {
     store: Option<&'a SessionStore>,
     messages: &'a [ChatMessage],
     tool_definitions: &'a [ToolDefinition],
+    usage_totals: &'a mut UsageTotals,
 }
 
 /// Filter messages to fit within a byte budget, keeping the first and most recent messages.
@@ -453,6 +454,7 @@ async fn run_prompt_turn(
                 store: Some(env.store),
                 messages: &request_messages,
                 tool_definitions: &tool_definitions,
+                usage_totals: &mut usage_totals,
             },
             model_settings,
             env.cancellation_token.clone(),
@@ -460,10 +462,6 @@ async fn run_prompt_turn(
             notify,
         )
         .await?;
-
-        if let Some(ref usage) = turn.usage {
-            usage_totals.add(usage);
-        }
 
         if turn.stop_reason == StopReason::Cancelled {
             stop_reason = StopReason::Cancelled;
@@ -537,7 +535,7 @@ async fn run_prompt_turn(
 }
 
 /// Accumulates [`UsageData`] across the sub-turns of a single prompt turn.
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_field_names)]
 struct UsageTotals {
     input_tokens: u64,
@@ -549,21 +547,32 @@ struct UsageTotals {
 }
 
 impl UsageTotals {
-    fn add(&mut self, usage: &UsageData) {
-        self.input_tokens += usage.input_tokens;
-        self.output_tokens += usage.output_tokens;
-        self.total_tokens += usage
-            .total_tokens
-            .unwrap_or(usage.input_tokens + usage.output_tokens);
-        if let Some(thought_tokens) = usage.thought_tokens {
-            *self.thought_tokens.get_or_insert(0) += thought_tokens;
-        }
-        if let Some(cached_read_tokens) = usage.cached_read_tokens {
-            *self.cached_read_tokens.get_or_insert(0) += cached_read_tokens;
-        }
-        if let Some(cached_write_tokens) = usage.cached_write_tokens {
-            *self.cached_write_tokens.get_or_insert(0) += cached_write_tokens;
-        }
+    fn add(&mut self, usage: &UsageData) -> Result<(), ChatError> {
+        let total_tokens = usage.validated_total_tokens()?;
+        let add = |current: u64, incoming: u64| {
+            current.checked_add(incoming).ok_or_else(|| {
+                ChatError::InvalidResponse(
+                    "cumulative token usage exceeds the supported range".to_string(),
+                )
+            })
+        };
+        let add_optional = |current: Option<u64>, incoming: Option<u64>| {
+            if current.is_some() || incoming.is_some() {
+                add(current.unwrap_or(0), incoming.unwrap_or(0)).map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        let next = Self {
+            input_tokens: add(self.input_tokens, usage.input_tokens)?,
+            output_tokens: add(self.output_tokens, usage.output_tokens)?,
+            total_tokens: add(self.total_tokens, total_tokens)?,
+            thought_tokens: add_optional(self.thought_tokens, usage.thought_tokens)?,
+            cached_read_tokens: add_optional(self.cached_read_tokens, usage.cached_read_tokens)?,
+            cached_write_tokens: add_optional(self.cached_write_tokens, usage.cached_write_tokens)?,
+        };
+        *self = next;
+        Ok(())
     }
 
     fn into_acp_usage(self) -> Option<Usage> {
@@ -629,7 +638,8 @@ fn emit_mode_transition_notifications(
 ///
 /// Returns an ACP protocol error when the underlying LLM stream fails, when a
 /// streamed tool-call delta cannot be assembled into a complete call, or when
-/// a session update notification fails.
+/// usage counters or costs are invalid or unrepresentable, or a session update
+/// notification fails.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn stream_model_turn(
     context: StreamContext<'_>,
@@ -755,6 +765,7 @@ pub(crate) async fn stream_model_turn(
                 finish_reason = reason;
             }
             StreamEvent::Usage(data) => {
+                data.validated_total_tokens()?;
                 tracing::debug!(
                     input_tokens = data.input_tokens,
                     output_tokens = data.output_tokens,
@@ -770,6 +781,8 @@ pub(crate) async fn stream_model_turn(
 
     // Send usage update if available
     if let Some(mut usage_data) = usage {
+        // Check the whole prompt before emitting usage or changing session cost.
+        context.usage_totals.add(&usage_data)?;
         // Prefer discovery metadata over the static fallback when usage omits it.
         if usage_data.context_length == 0 {
             let discovered = context
@@ -789,20 +802,17 @@ pub(crate) async fn stream_model_turn(
                     tool_calls,
                     finish_reason,
                     stop_reason,
-                    usage,
                 });
             };
             usage_data.context_length = window;
         }
-        let used_tokens = usage_data
-            .total_tokens
-            .unwrap_or(usage_data.input_tokens + usage_data.output_tokens);
+        let used_tokens = usage_data.validated_total_tokens()?;
         tracing::debug!(
             used = used_tokens,
             size = usage_data.context_length,
             "sending usage_update notification"
         );
-        let cost = model_cost_micros(model_settings.model, &usage_data)
+        let cost = model_cost_micros(model_settings.model, &usage_data)?
             .zip(context.store)
             .map(|(cost_micros, store)| store.add_cost_micros(session_id, cost_micros))
             .transpose()?;
@@ -825,7 +835,6 @@ pub(crate) async fn stream_model_turn(
         tool_calls,
         finish_reason,
         stop_reason,
-        usage,
     })
 }
 
@@ -840,8 +849,6 @@ pub(crate) struct ModelTurn {
     pub(crate) finish_reason: FinishReason,
     /// ACP stop reason derived for the client.
     pub(crate) stop_reason: StopReason,
-    /// Token usage for this sub-turn (accumulated across the prompt loop).
-    pub(crate) usage: Option<UsageData>,
 }
 
 fn report_tool_call(

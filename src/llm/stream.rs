@@ -218,7 +218,7 @@ pub(crate) fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEve
                  falling back to the model context-window table"
             );
         }
-        updates.push(StreamEvent::Usage(UsageData {
+        let usage = UsageData {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
             context_length: usage.context_length,
@@ -235,7 +235,9 @@ pub(crate) fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEve
             // Tokens that missed the prompt cache are newly written to it,
             // so they map to ACP's "cache write" counter.
             cached_write_tokens: usage.prompt_cache_miss_tokens,
-        }));
+        };
+        usage.validated_total_tokens()?;
+        updates.push(StreamEvent::Usage(usage));
     }
 
     Ok(updates)

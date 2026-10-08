@@ -1762,6 +1762,7 @@ async fn stream_model_turn_respects_cancellation_token() -> Result<(), agent_cli
                 store: None,
                 messages: &messages,
                 tool_definitions: &tool_definitions,
+                usage_totals: &mut super::UsageTotals::default(),
             },
             ModelRequestSettings {
                 model: "deepseek-v4-pro",
@@ -1815,12 +1816,14 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
     let tool_definitions: Vec<ToolDefinition> = Vec::new();
     let mut notifications = Vec::new();
 
-    let turn = stream_model_turn(
+    let mut usage_totals = super::UsageTotals::default();
+    stream_model_turn(
         StreamContext {
             llm_client: &client,
             store: Some(&store),
             messages: &messages,
             tool_definitions: &tool_definitions,
+            usage_totals: &mut usage_totals,
         },
         ModelRequestSettings {
             model: "deepseek-v4-pro",
@@ -1837,16 +1840,8 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
     .await?;
 
     assert_eq!(
-        turn.usage,
-        Some(UsageData {
-            input_tokens: 3,
-            output_tokens: 4,
-            context_length: 0,
-            total_tokens: Some(10),
-            thought_tokens: None,
-            cached_read_tokens: None,
-            cached_write_tokens: None,
-        })
+        usage_totals.into_acp_usage(),
+        Some(agent_client_protocol::schema::v1::Usage::new(10, 3, 4))
     );
 
     let usage_updates: Vec<&SessionUpdate> = notifications
@@ -1876,7 +1871,178 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
 }
 
 #[test_log::test]
-fn usage_totals_preserve_provider_total_and_sum_optional_fields() {
+fn session_cost_overflow_leaves_previous_total_unchanged() -> Result<(), AdapterError> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    assert_eq!(
+        store.add_cost_micros(&session.session_id, u64::MAX)?,
+        u64::MAX
+    );
+    assert!(matches!(
+        store.add_cost_micros(&session.session_id, 1),
+        Err(AdapterError::Llm(ChatError::InvalidResponse(_)))
+    ));
+    assert_eq!(store.add_cost_micros(&session.session_id, 0)?, u64::MAX);
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn prompt_rejects_invalid_usage_before_state_changes() -> Result<(), AdapterError> {
+    for model in ["deepseek-v4-pro", "unknown-model"] {
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+        store.set_model(&session.session_id, model.to_string())?;
+        let client = FakeLlmClient::new(vec![
+            Ok(StreamEvent::Usage(UsageData {
+                input_tokens: 3,
+                output_tokens: 4,
+                context_length: 0,
+                total_tokens: Some(6),
+                thought_tokens: None,
+                cached_read_tokens: None,
+                cached_write_tokens: None,
+            })),
+            Ok(StreamEvent::Message("invalid answer".to_string())),
+            Ok(StreamEvent::Finished(FinishReason::EndTurn)),
+        ]);
+        let mut updates = Vec::new();
+        let result = handle_prompt_request(
+            &store,
+            &client,
+            &EmptyToolRegistry,
+            None,
+            PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("hi")]),
+            DEFAULT_MAX_TURN_REQUESTS,
+            |notification| {
+                updates.push(notification.update);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AdapterError::Llm(ChatError::InvalidResponse(_)))
+        ));
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::UsageUpdate(_)))
+        );
+        store.with_session(&session.session_id, |record| {
+            assert_eq!(record.history, vec![ChatMessage::user("hi")]);
+            assert_eq!(record.cost_micros, 0);
+            assert!(record.active_turn.is_none());
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn prompt_cumulative_usage_overflow_precedes_updates_and_tools() -> Result<(), AdapterError> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    store.set_model(&session.session_id, "unknown-model".to_string())?;
+    let client = FakeLlmClient::with_streams(
+        [u64::MAX, 1]
+            .into_iter()
+            .map(|input_tokens| {
+                vec![
+                    StreamEvent::Usage(UsageData {
+                        input_tokens,
+                        output_tokens: 0,
+                        context_length: 4096,
+                        total_tokens: Some(input_tokens),
+                        thought_tokens: None,
+                        cached_read_tokens: None,
+                        cached_write_tokens: None,
+                    }),
+                    StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                        0,
+                        Some(format!("call-{input_tokens}")),
+                        Some("echo".to_string()),
+                        Some(r#"{"message":"hi"}"#.to_string()),
+                    )),
+                    StreamEvent::Finished(FinishReason::ToolCalls),
+                ]
+                .into_iter()
+                .map(|event| FakeStreamStep::Event(Ok(event)))
+                .collect()
+            })
+            .collect(),
+    );
+    let registry = FakeToolRegistry::new();
+    let mut updates = Vec::new();
+    let result = handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        PromptRequest::new(session.session_id.clone(), vec![ContentBlock::from("hi")]),
+        DEFAULT_MAX_TURN_REQUESTS,
+        |notification| {
+            updates.push(notification.update);
+            Ok(())
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(AdapterError::Llm(ChatError::InvalidResponse(_)))
+    ));
+    assert_eq!(
+        updates
+            .iter()
+            .filter(|update| matches!(update, SessionUpdate::UsageUpdate(_)))
+            .count(),
+        1
+    );
+    let calls = registry.calls();
+    assert_eq!(
+        calls
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?
+            .len(),
+        1
+    );
+    store.with_session(&session.session_id, |record| {
+        assert_eq!(record.history.len(), 3);
+        assert_eq!(record.cost_micros, 0);
+        assert!(record.active_turn.is_none());
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test_log::test]
+fn cumulative_usage_failure_leaves_all_counters_unchanged() -> Result<(), ChatError> {
+    let first = UsageData {
+        input_tokens: u64::MAX - 2,
+        output_tokens: 1,
+        context_length: 0,
+        total_tokens: None,
+        thought_tokens: Some(1),
+        cached_read_tokens: Some(u64::MAX - 2),
+        cached_write_tokens: Some(0),
+    };
+    let mut totals = super::UsageTotals::default();
+    totals.add(&first)?;
+    let before = totals;
+    // Input and output additions fit individually; the combined total does not.
+    assert!(matches!(
+        totals.add(&UsageData {
+            input_tokens: 1,
+            cached_read_tokens: Some(1),
+            ..first
+        }),
+        Err(ChatError::InvalidResponse(_))
+    ));
+    assert_eq!(totals, before);
+    Ok(())
+}
+
+#[test_log::test]
+fn usage_totals_preserve_provider_total_and_sum_optional_fields() -> Result<(), ChatError> {
     let mut totals = super::UsageTotals::default();
     totals.add(&UsageData {
         input_tokens: 100,
@@ -1886,7 +2052,7 @@ fn usage_totals_preserve_provider_total_and_sum_optional_fields() {
         thought_tokens: Some(12),
         cached_read_tokens: Some(80),
         cached_write_tokens: Some(8),
-    });
+    })?;
     totals.add(&UsageData {
         input_tokens: 30,
         output_tokens: 10,
@@ -1895,12 +2061,12 @@ fn usage_totals_preserve_provider_total_and_sum_optional_fields() {
         thought_tokens: Some(3),
         cached_read_tokens: None,
         cached_write_tokens: Some(2),
-    });
+    })?;
 
     let usage = totals.into_acp_usage();
     assert!(usage.is_some());
     let Some(usage) = usage else {
-        return;
+        return Ok(());
     };
     assert_eq!(usage.total_tokens, 240);
     assert_eq!(usage.input_tokens, 130);
@@ -1908,6 +2074,7 @@ fn usage_totals_preserve_provider_total_and_sum_optional_fields() {
     assert_eq!(usage.thought_tokens, Some(15));
     assert_eq!(usage.cached_read_tokens, Some(80));
     assert_eq!(usage.cached_write_tokens, Some(10));
+    Ok(())
 }
 
 #[test_log::test(tokio::test)]
@@ -1950,6 +2117,7 @@ async fn discovered_windows_follow_selected_model_and_usage_precedence()
                 store: Some(&store),
                 messages: &[],
                 tool_definitions: &[],
+                usage_totals: &mut super::UsageTotals::default(),
             },
             ModelRequestSettings {
                 model,
@@ -1991,12 +2159,14 @@ async fn stream_model_turn_skips_usage_update_for_unknown_model()
     let tool_definitions: Vec<ToolDefinition> = Vec::new();
     let mut notifications = Vec::new();
 
-    let turn = stream_model_turn(
+    let mut usage_totals = super::UsageTotals::default();
+    stream_model_turn(
         StreamContext {
             llm_client: &client,
             store: None,
             messages: &messages,
             tool_definitions: &tool_definitions,
+            usage_totals: &mut usage_totals,
         },
         ModelRequestSettings {
             model: "mock-model",
@@ -2013,16 +2183,8 @@ async fn stream_model_turn_skips_usage_update_for_unknown_model()
     .await?;
 
     assert_eq!(
-        turn.usage,
-        Some(UsageData {
-            input_tokens: 3,
-            output_tokens: 4,
-            context_length: 0,
-            total_tokens: None,
-            thought_tokens: None,
-            cached_read_tokens: None,
-            cached_write_tokens: None,
-        })
+        usage_totals.into_acp_usage(),
+        Some(agent_client_protocol::schema::v1::Usage::new(7, 3, 4))
     );
     assert!(
         notifications

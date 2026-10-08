@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::ChatError;
+
 /// Conversation role encoded in a chat-completions request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -485,8 +487,8 @@ pub struct UsageData {
     pub context_length: u64,
     /// Total tokens reported by the provider, when available.
     ///
-    /// When the provider does not report a total, callers fall back to
-    /// `input_tokens + output_tokens`.
+    /// Use [`Self::validated_total_tokens`] to validate the counters and fall
+    /// back to the checked input/output sum when the provider omits the total.
     pub total_tokens: Option<u64>,
     /// Reasoning/thinking tokens reported by the provider, when available.
     pub thought_tokens: Option<u64>,
@@ -494,6 +496,54 @@ pub struct UsageData {
     pub cached_read_tokens: Option<u64>,
     /// Prompt cache write (cache miss) tokens, when available.
     pub cached_write_tokens: Option<u64>,
+}
+
+impl UsageData {
+    /// Validate token counters and return the provider total or input/output sum.
+    ///
+    /// Larger provider totals are preserved. Cache counters are subsets of
+    /// input tokens, and reasoning tokens are a subset of output tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatError::InvalidResponse`] if a sum overflows, a supplied
+    /// total is below the input/output sum, or a subset exceeds its parent.
+    pub fn validated_total_tokens(&self) -> Result<u64, ChatError> {
+        let token_sum = self
+            .input_tokens
+            .checked_add(self.output_tokens)
+            .ok_or_else(|| {
+                ChatError::InvalidResponse("token usage exceeds the supported range".to_string())
+            })?;
+        if self.total_tokens.is_some_and(|total| total < token_sum) {
+            return Err(ChatError::InvalidResponse(
+                "total token usage is below the input/output sum".to_string(),
+            ));
+        }
+        if self
+            .thought_tokens
+            .is_some_and(|thought| thought > self.output_tokens)
+        {
+            return Err(ChatError::InvalidResponse(
+                "reasoning token usage exceeds output tokens".to_string(),
+            ));
+        }
+        let cached_tokens = self
+            .cached_read_tokens
+            .unwrap_or(0)
+            .checked_add(self.cached_write_tokens.unwrap_or(0))
+            .ok_or_else(|| {
+                ChatError::InvalidResponse(
+                    "cache token usage exceeds the supported range".to_string(),
+                )
+            })?;
+        if cached_tokens > self.input_tokens {
+            return Err(ChatError::InvalidResponse(
+                "cache token usage exceeds input tokens".to_string(),
+            ));
+        }
+        Ok(self.total_tokens.unwrap_or(token_sum))
+    }
 }
 
 /// A normalized update emitted while streaming an LLM response.

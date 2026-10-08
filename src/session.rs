@@ -1257,13 +1257,26 @@ impl SessionStore {
     }
 
     /// Add a model cost to a session and return its cumulative cost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is unavailable or its cumulative cost
+    /// overflows. On overflow, the existing cost is unchanged.
     pub(crate) fn add_cost_micros(
         &self,
         session_id: &SessionId,
         cost_micros: u64,
     ) -> Result<u64, AdapterError> {
         self.with_session_mut(session_id, |session| {
-            session.cost_micros = session.cost_micros.saturating_add(cost_micros);
+            session.cost_micros =
+                session
+                    .cost_micros
+                    .checked_add(cost_micros)
+                    .ok_or_else(|| {
+                        ChatError::InvalidResponse(
+                            "cumulative session cost exceeds the supported range".to_string(),
+                        )
+                    })?;
             Ok(session.cost_micros)
         })
     }

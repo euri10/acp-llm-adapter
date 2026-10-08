@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::UsageData;
+use super::{ChatError, UsageData};
 
 const ENV_PRICING: &str = "LLM_PRICING";
 const MICROS_PER_MILLION: u64 = 1_000_000;
@@ -20,20 +20,29 @@ struct Pricing {
 ///
 /// Returns `None` for a model with no known published rates, which leaves the
 /// `usage_update` without a cost rather than reporting an invented one.
-#[must_use]
-pub fn model_cost_micros(model: &str, usage: &UsageData) -> Option<u64> {
-    let pricing = pricing_for(model)?;
+///
+/// # Errors
+///
+/// Returns [`ChatError::InvalidResponse`] for invalid token counters or a
+/// cost that cannot be represented in microdollars.
+pub fn model_cost_micros(model: &str, usage: &UsageData) -> Result<Option<u64>, ChatError> {
+    usage.validated_total_tokens()?;
+    pricing_for(model)
+        .map(|pricing| cost_micros(pricing, usage))
+        .transpose()
+}
+
+fn cost_micros(pricing: Pricing, usage: &UsageData) -> Result<u64, ChatError> {
     let cache_hit = usage.cached_read_tokens.unwrap_or(0);
-    let cache_miss = usage
-        .cached_write_tokens
-        .unwrap_or_else(|| usage.input_tokens.saturating_sub(cache_hit));
-    let uncached_input = usage.input_tokens.saturating_sub(cache_hit + cache_miss);
-    let cost = cache_hit
-        .saturating_mul(pricing.cache_hit)
-        .saturating_add(cache_miss.saturating_mul(pricing.cache_miss))
-        .saturating_add(uncached_input.saturating_mul(pricing.cache_miss))
-        .saturating_add(usage.output_tokens.saturating_mul(pricing.output));
-    Some(cost / MICROS_PER_MILLION)
+    // Cache writes and uncached input have the same rate. Validation ensures
+    // all billed counts together fit u64, so their weighted sum fits u128.
+    let uncached_input = usage.input_tokens - cache_hit;
+    let cost = u128::from(cache_hit) * u128::from(pricing.cache_hit)
+        + u128::from(uncached_input) * u128::from(pricing.cache_miss)
+        + u128::from(usage.output_tokens) * u128::from(pricing.output);
+    u64::try_from(cost / u128::from(MICROS_PER_MILLION)).map_err(|_| {
+        ChatError::InvalidResponse("usage cost exceeds the supported range".to_string())
+    })
 }
 
 fn pricing_for(model: &str) -> Option<Pricing> {
@@ -112,8 +121,38 @@ fn parse_price_micros(value: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[test_log::test]
+    fn wide_cost_intermediates_preserve_representable_results() -> Result<(), ChatError> {
+        let usage = UsageData {
+            input_tokens: u64::MAX,
+            output_tokens: 0,
+            context_length: 0,
+            total_tokens: Some(u64::MAX),
+            thought_tokens: None,
+            cached_read_tokens: Some(u64::MAX / 2),
+            cached_write_tokens: Some(u64::MAX - u64::MAX / 2),
+        };
+        assert_eq!(usage.validated_total_tokens()?, u64::MAX);
+        let pricing = Pricing {
+            cache_hit: MICROS_PER_MILLION,
+            cache_miss: MICROS_PER_MILLION,
+            output: MICROS_PER_MILLION,
+        };
+        assert_eq!(cost_micros(pricing, &usage)?, u64::MAX);
+        let doubled = Pricing {
+            cache_hit: 2 * MICROS_PER_MILLION,
+            cache_miss: 2 * MICROS_PER_MILLION,
+            ..pricing
+        };
+        assert!(matches!(
+            cost_micros(doubled, &usage),
+            Err(ChatError::InvalidResponse(_))
+        ));
+        Ok(())
+    }
+
     #[test]
-    fn prices_deepseek_flash_cache_and_output_tokens() {
+    fn prices_deepseek_flash_cache_and_output_tokens() -> Result<(), ChatError> {
         let usage = UsageData {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
@@ -124,13 +163,14 @@ mod tests {
             cached_write_tokens: Some(600_000),
         };
         assert_eq!(
-            model_cost_micros("deepseek-v4-flash", &usage),
+            model_cost_micros("deepseek-v4-flash", &usage)?,
             Some(365_120)
         );
+        Ok(())
     }
 
     #[test]
-    fn unknown_models_have_no_price() {
+    fn unknown_models_have_no_price() -> Result<(), ChatError> {
         let usage = UsageData {
             input_tokens: 1,
             output_tokens: 1,
@@ -140,14 +180,25 @@ mod tests {
             cached_read_tokens: None,
             cached_write_tokens: None,
         };
-        assert_eq!(model_cost_micros("glm-5", &usage), None);
+        assert_eq!(model_cost_micros("glm-5", &usage)?, None);
+        assert!(matches!(
+            model_cost_micros(
+                "glm-5",
+                &UsageData {
+                    output_tokens: u64::MAX,
+                    ..usage
+                }
+            ),
+            Err(ChatError::InvalidResponse(_))
+        ));
+        Ok(())
     }
 
     /// Groq's prompt cache bills reads at half the uncached input rate, so a
     /// usage report that splits cache hits from misses must come out strictly
     /// cheaper than the same token count billed entirely uncached.
     #[test]
-    fn groq_discounts_cached_input_tokens() {
+    fn groq_discounts_cached_input_tokens() -> Result<(), ChatError> {
         let uncached = UsageData {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
@@ -165,19 +216,20 @@ mod tests {
 
         // 1M in at $0.15/M + 1M out at $0.60/M = $0.75.
         assert_eq!(
-            model_cost_micros("openai/gpt-oss-120b", &uncached),
+            model_cost_micros("openai/gpt-oss-120b", &uncached)?,
             Some(750_000)
         );
         // Half the input cached at $0.075/M: 0.5 * 0.15 + 0.5 * 0.075 + 0.60
         // = $0.7125.
         assert_eq!(
-            model_cost_micros("openai/gpt-oss-120b", &half_cached),
+            model_cost_micros("openai/gpt-oss-120b", &half_cached)?,
             Some(712_500)
         );
+        Ok(())
     }
 
     #[test]
-    fn groq_gpt_oss_20b_is_priced_below_the_120b() {
+    fn groq_gpt_oss_20b_is_priced_below_the_120b() -> Result<(), ChatError> {
         let usage = UsageData {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
@@ -189,12 +241,13 @@ mod tests {
         };
         // 1M in at $0.075/M + 1M out at $0.30/M = $0.375.
         assert_eq!(
-            model_cost_micros("openai/gpt-oss-20b", &usage),
+            model_cost_micros("openai/gpt-oss-20b", &usage)?,
             Some(375_000)
         );
         assert!(
-            model_cost_micros("openai/gpt-oss-20b", &usage)
-                < model_cost_micros("openai/gpt-oss-120b", &usage)
+            model_cost_micros("openai/gpt-oss-20b", &usage)?
+                < model_cost_micros("openai/gpt-oss-120b", &usage)?
         );
+        Ok(())
     }
 }

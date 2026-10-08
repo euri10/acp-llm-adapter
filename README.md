@@ -198,6 +198,16 @@ Before structured records are written, the shared field policy replaces prompts,
 
 For local testing or a provider price change, `LLM_PRICING` accepts JSON such as `{"deepseek-v4-pro":{"cache_hit":0.003625,"cache_miss":0.435,"output":0.87}}`, with values in USD per million tokens.
 
+Usage counters are validated before they update telemetry, session cost, or
+assistant/tool history. Input/output and cache sums must fit `u64`; a supplied
+total must cover input plus output, reasoning tokens must fit within output,
+and cache reads plus writes must fit within input. Larger provider totals are
+preserved. Unrepresentable per-response or cumulative totals and costs fail the
+prompt with a provider error; the session remains usable for the next prompt.
+Costs use wide integer arithmetic before conversion to microdollars, avoiding
+silent wrapping or saturation. Missing usage or unknown model prices remain
+unknown.
+
 Tracing spans for prompt turns, tool dispatch, LLM requests, and session lifecycle handlers carry `session_id`. Startup, model-list discovery, `initialize`, and new-session setup intentionally use `session_id="none"` because no ACP session exists at those entry points; child prompt spans replace that value once a session is established.
 
 When serve logging is enabled, those tracing events are written alongside wire records: session-scoped events go to that session's `log.jsonl`, while unscoped events stay in the connection fallback log. They continue to be emitted to stderr and remain controlled by `RUST_LOG`.
