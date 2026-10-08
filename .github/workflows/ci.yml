@@ -2,9 +2,10 @@
 #
 # Enforces all checks mandated by AGENTS.md:
 #   • cargo fmt --all -- --check
-#   • cargo clippy --all-targets --all-features -- -D warnings
-#   • cargo test
-#   • cargo doc --no-deps
+#   • cargo clippy --locked --all-targets --all-features -- -D warnings
+#   • cargo test --locked --all-features (including doc-tests)
+#   • cargo doc --locked --no-deps --all-features
+#   • cargo build --locked --release --all-features
 #   • cargo audit (dependency vulnerabilities)
 #   • scripts/check-agent-instructions (AGENTS.md size limit)
 #
@@ -54,8 +55,10 @@ jobs:
       # ------------------------------------------------------------------
       # 2. Linting    (AGENTS.md -> docs/agent-rust.md)
       # ------------------------------------------------------------------
+      # Guard the first dependency resolver and every later Cargo gate:
+      # validate the submitted lockfile instead of silently rewriting it.
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       # ------------------------------------------------------------------
       # 3. Testing    (AGENTS.md -> docs/agent-testing.md)
@@ -68,19 +71,19 @@ jobs:
       # green CI run now mean the same thing. Nothing is lost: there are no
       # benches, and the examples contain no #[test] to run.
       - name: cargo test
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
         env:
           # Prevent accidental network calls in tests that would hang in CI.
           LLM_API_KEY: "skip-ci-no-key"
 
       - name: cargo test (doc-tests)
-        run: cargo test --doc --all-features
+        run: cargo test --locked --doc --all-features
 
       # ------------------------------------------------------------------
       # 4. Documentation  (AGENTS.md -> docs/agent-rust.md)
       # ------------------------------------------------------------------
       - name: cargo doc --no-deps
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
@@ -88,7 +91,7 @@ jobs:
       # 5. Release build  (catches release-profile regressions early)
       # ------------------------------------------------------------------
       - name: cargo build --release
-        run: cargo build --release --all-features
+        run: cargo build --locked --release --all-features
 
       # ------------------------------------------------------------------
       # 6. Security audit  (AGENTS.md -> Security)
