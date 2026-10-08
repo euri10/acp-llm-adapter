@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock as McpContent, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as McpTool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock as McpContent,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::stdio;
@@ -62,15 +62,15 @@ impl StdioFixtureServer {
 }
 
 impl ServerHandler for StdioFixtureServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let message = request
             .arguments
             .as_ref()
@@ -90,7 +90,8 @@ impl ServerHandler for StdioFixtureServer {
         Ok(CallToolResult::success(vec![McpContent::text(format!(
             "stdio echo: {message}; arg: {}; env: {}",
             self.launch_arg, self.env_token
-        ))]))
+        ))])
+        .into())
     }
 
     async fn list_tools(

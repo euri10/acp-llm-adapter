@@ -17,8 +17,8 @@ use agent_client_protocol::schema::v1::{
 };
 use futures_util::future::BoxFuture;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock as McpContent, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as McpTool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock as McpContent,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
@@ -43,24 +43,22 @@ use mcp_sse_fixture::{Behavior, LegacyServer, TOKEN};
 struct EchoMcpServer;
 
 impl ServerHandler for EchoMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let message = request
             .arguments
             .as_ref()
             .and_then(|arguments| arguments.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        Ok(CallToolResult::success(vec![McpContent::text(format!(
-            "echo: {message}"
-        ))]))
+        Ok(CallToolResult::success(vec![McpContent::text(format!("echo: {message}"))]).into())
     }
 
     async fn list_tools(
@@ -986,15 +984,15 @@ async fn mcp_tool_execution_bad_arguments_for_registered_tool()
 struct FailingMcpServer;
 
 impl ServerHandler for FailingMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
         &self,
         _request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         Err(rmcp::ErrorData::internal_error(
             "simulated tool failure",
             None,
@@ -1090,18 +1088,18 @@ async fn mcp_tool_execution_peer_call_tool_error() -> Result<(), agent_client_pr
 struct ErrorFlagMcpServer;
 
 impl ServerHandler for ErrorFlagMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
         &self,
         _request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let mut result = CallToolResult::error(vec![McpContent::text("err output")]);
         result.is_error = Some(true);
-        Ok(result)
+        Ok(result.into())
     }
 
     async fn list_tools(
