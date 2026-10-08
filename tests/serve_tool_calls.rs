@@ -239,6 +239,189 @@ fn tool_index_provider(posts: Arc<AtomicUsize>) -> Router {
 }
 
 #[test_log::test(tokio::test)]
+async fn load_during_approval_preserves_cancellation() -> Result<(), Box<dyn Error>> {
+    restore_during_approval_preserves_cancellation("session/load").await
+}
+
+#[test_log::test(tokio::test)]
+async fn resume_during_approval_preserves_cancellation() -> Result<(), Box<dyn Error>> {
+    restore_during_approval_preserves_cancellation("session/resume").await
+}
+
+#[test_log::test(tokio::test)]
+async fn closing_during_approval_cancels_before_late_reply() -> Result<(), Box<dyn Error>> {
+    let root =
+        LogRoot(std::env::temp_dir().join(format!("acp-close-approval-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&root.0)?;
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+    command
+        .args(["serve", "--backend", "mock"])
+        .env("XDG_STATE_HOME", &root.0)
+        .env_remove("ACP_LOG");
+    let mut serve = Serve::start_with(command, json!({"cwd":root.0, "mcpServers":[]})).await?;
+    let prompt = serve
+        .start_prompt("!tool run_command printf executed > executed")
+        .await?;
+    let Stopped::Permission(permission) = serve
+        .pump_with_permission(Duration::from_secs(5), Some(prompt), || false, None)
+        .await?
+    else {
+        return Err("original command did not request permission".into());
+    };
+    let closed = serve
+        .request("session/close", &json!({"sessionId":serve.session_id()}))
+        .await?;
+    assert!(closed.get("error").is_none());
+    let cancelled = serve
+        .pump_with_permission(Duration::from_secs(2), Some(prompt), || false, None)
+        .await?;
+    serve
+        .select_permission(
+            permission.get("id").ok_or("missing permission id")?,
+            "allow_always",
+        )
+        .await?;
+    if matches!(cancelled, Stopped::Timeout) {
+        serve
+            .pump(Duration::from_secs(5), Some(prompt), || false)
+            .await?;
+    }
+    assert!(
+        matches!(&cancelled, Stopped::Response(response)
+        if response.pointer("/result/stopReason") == Some(&json!("cancelled"))),
+        "close left work pending: {cancelled:?}"
+    );
+    assert!(!root.0.join("executed").exists());
+    let resumed = serve
+        .request(
+            "session/resume",
+            &json!({"sessionId":serve.session_id(), "cwd":root.0, "mcpServers":[]}),
+        )
+        .await?;
+    assert!(
+        resumed.get("error").is_none(),
+        "resume after cleanup failed: {resumed}"
+    );
+    // Close preserved the accepted user message, but discarded its cancelled
+    // tool results. Consecutive user messages are merged for the provider, so
+    // the mock sees its earlier !tool directive again: require fresh approval.
+    let recovery = serve.start_prompt("recovered").await?;
+    let Stopped::Permission(permission) = serve
+        .pump_with_permission(Duration::from_secs(5), Some(recovery), || false, None)
+        .await?
+    else {
+        return Err("late approval was remembered after close/resume".into());
+    };
+    serve
+        .select_permission(
+            permission.get("id").ok_or("missing permission id")?,
+            "reject_once",
+        )
+        .await?;
+    assert!(
+        matches!(serve.pump(Duration::from_secs(5), Some(recovery), || false).await?,
+        Stopped::Response(response) if response.pointer("/result/stopReason") == Some(&json!("end_turn")))
+    );
+    assert!(
+        !root.0.join("executed").exists(),
+        "closed command executed after late approval"
+    );
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    Ok(())
+}
+
+async fn restore_during_approval_preserves_cancellation(
+    method: &str,
+) -> Result<(), Box<dyn Error>> {
+    for late_choice in ["allow_once", "allow_always"] {
+        let root = LogRoot(
+            std::env::temp_dir().join(format!("acp-restore-approval-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&root.0)?;
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+        command
+            .args(["serve", "--backend", "mock"])
+            .env("XDG_STATE_HOME", &root.0)
+            .env_remove("ACP_LOG");
+        let mut serve =
+            Serve::start_with(command, json!({"cwd": root.0, "mcpServers": []})).await?;
+        let prompt = serve
+            .start_prompt("!tool run_command printf executed > executed")
+            .await?;
+        let Stopped::Permission(permission) = serve
+            .pump_with_permission(Duration::from_secs(5), Some(prompt), || false, None)
+            .await?
+        else {
+            return Err("original command did not request permission".into());
+        };
+        let restored = serve
+            .request(
+                method,
+                &json!({"sessionId":serve.session_id(), "cwd":root.0, "mcpServers":[]}),
+            )
+            .await?;
+        serve
+            .notify("session/cancel", &json!({"sessionId":serve.session_id()}))
+            .await?;
+        let cancelled = serve
+            .pump_with_permission(Duration::from_secs(2), Some(prompt), || false, None)
+            .await?;
+        serve
+            .select_permission(
+                permission.get("id").ok_or("missing approval id")?,
+                late_choice,
+            )
+            .await?;
+        if matches!(cancelled, Stopped::Timeout) {
+            // Observe actual effects on the broken path before reporting failure.
+            serve
+                .pump(Duration::from_secs(5), Some(prompt), || false)
+                .await?;
+        }
+        let after = run_prompt(&mut serve, "still here?").await?;
+        assert!(
+            !root.0.join("executed").exists(),
+            "{method} lost cancellation ownership and late approval executed the command"
+        );
+        assert!(
+            matches!(&cancelled, Stopped::Response(response)
+            if response.pointer("/result/stopReason") == Some(&json!("cancelled"))),
+            "cancel must finish before the late approval: {cancelled:?}"
+        );
+        assert_eq!(restored.pointer("/error/code"), Some(&json!(-32600)));
+        assert_eq!(
+            after.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        assert!(serve.position_of_status("in_progress").is_none());
+
+        let next = serve
+            .start_prompt("!tool run_command printf recovered")
+            .await?;
+        let Stopped::Permission(permission) = serve
+            .pump_with_permission(Duration::from_secs(5), Some(next), || false, None)
+            .await?
+        else {
+            return Err("late approval was remembered by the next prompt".into());
+        };
+        serve
+            .select_permission(
+                permission.get("id").ok_or("missing approval id")?,
+                "allow_once",
+            )
+            .await?;
+        assert!(
+            matches!(serve.pump(Duration::from_secs(5), Some(next), || false).await?,
+            Stopped::Response(response) if response.pointer("/result/stopReason") == Some(&json!("end_turn")))
+        );
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn invalid_tool_index_fails_before_execution_and_session_recovers()
 -> Result<(), Box<dyn Error>> {
     let posts = Arc::new(AtomicUsize::new(0));
@@ -482,13 +665,25 @@ async fn a_failing_command_is_reported_as_failed() -> Result<(), Box<dyn Error>>
 #[test_log::test(tokio::test)]
 async fn session_cancel_stops_the_command_and_leaves_the_session_usable()
 -> Result<(), Box<dyn Error>> {
-    let pid_file = std::env::temp_dir().join(format!(
-        "acp-serve-cancel-descendant-{}.pid",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&pid_file);
+    for restore in [None, Some("session/load"), Some("session/resume")] {
+        cancel_running_command(restore, false).await?;
+    }
+    cancel_running_command(None, true).await?;
+    Ok(())
+}
 
-    let mut serve = Serve::start().await?;
+#[cfg(target_os = "linux")]
+async fn cancel_running_command(restore: Option<&str>, close: bool) -> Result<(), Box<dyn Error>> {
+    let root =
+        LogRoot(std::env::temp_dir().join(format!("acp-running-restore-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&root.0)?;
+    let pid_file = root.0.join("descendant.pid");
+    let mut adapter = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+    adapter
+        .args(["serve", "--backend", "mock"])
+        .env("XDG_STATE_HOME", &root.0)
+        .env_remove("ACP_LOG");
+    let mut serve = Serve::start_with(adapter, json!({"cwd":root.0, "mcpServers":[]})).await?;
     let command = backgrounding_command(&pid_file);
     let prompt = serve
         .start_prompt(&format!("!tool run_command {command}"))
@@ -505,17 +700,32 @@ async fn session_cancel_stops_the_command_and_leaves_the_session_usable()
         "the command never started: {started:?}"
     );
     let descendant = std::fs::read_to_string(&pid_file)?.trim().to_owned();
-    let _ = std::fs::remove_file(&pid_file);
     assert!(
         alive(&descendant),
         "the descendant was gone before we began"
     );
+    if let Some(method) = restore {
+        let response = serve
+            .request(
+                method,
+                &json!({"sessionId":serve.session_id(), "cwd":root.0, "mcpServers":[]}),
+            )
+            .await?;
+        assert_eq!(response.pointer("/error/code"), Some(&json!(-32600)));
+    }
 
     // The stop button: a notification, with the connection left open.
     let session_id = serve.session_id().to_owned();
-    serve
-        .notify("session/cancel", &json!({"sessionId": session_id}))
-        .await?;
+    if close {
+        let response = serve
+            .request("session/close", &json!({"sessionId":session_id}))
+            .await?;
+        assert!(response.get("error").is_none());
+    } else {
+        serve
+            .notify("session/cancel", &json!({"sessionId": session_id}))
+            .await?;
+    }
 
     let cancelled = serve
         .pump(Duration::from_secs(20), Some(prompt), || false)
@@ -551,6 +761,18 @@ async fn session_cancel_stops_the_command_and_leaves_the_session_usable()
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    if close {
+        let response = serve
+            .request(
+                "session/resume",
+                &json!({"sessionId":session_id, "cwd":root.0, "mcpServers":[]}),
+            )
+            .await?;
+        assert!(response.get("error").is_none());
+        // Avoid asking the mock to parse the retained !tool directive again.
+        run_prompt(&mut serve, "/clear").await?;
+    }
+
     // Cancelling a turn must not take the session with it.
     let after = run_prompt(&mut serve, "still there?").await?;
     assert_eq!(
@@ -558,5 +780,7 @@ async fn session_cancel_stops_the_command_and_leaves_the_session_usable()
         Some("end_turn"),
         "the session was unusable after a cancelled turn: {after}"
     );
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
     Ok(())
 }

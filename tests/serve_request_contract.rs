@@ -176,6 +176,68 @@ async fn prompt(serve: &mut Serve, session: &str, text: &str) -> Result<(), Box<
     Ok(())
 }
 
+#[test_log::test(tokio::test)]
+async fn oversized_current_prompt_is_rejected_without_provider_work_and_session_recovers()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = Fixture::new().await?;
+    let mut serve = fixture.start(false, "fixture-model").await?;
+    let session = serve.session_id().to_owned();
+    let oversized = format!("USER-SENTINEL {}", "x".repeat(270_000));
+    for subsequent in [false, true] {
+        let response = serve
+            .request(
+                "session/prompt",
+                &json!({
+                    "sessionId":session,"prompt":[{"type":"text","text":oversized}]
+                }),
+            )
+            .await?;
+        assert_eq!(
+            response.pointer("/error/code"),
+            Some(&json!(-32602)),
+            "oversized prompt was accepted (subsequent={subsequent})"
+        );
+        assert_eq!(
+            response.pointer("/error/data"),
+            Some(&json!("current prompt exceeds request size limit"))
+        );
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "rejected prompt reached provider"
+        );
+        let history_path = fixture
+            .root
+            .join("acp-llm-adapter/sessions")
+            .join(&session)
+            .join("history.jsonl");
+        let history = match std::fs::read_to_string(history_path) {
+            Ok(history) => history,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        assert!(
+            !history.contains("USER-SENTINEL"),
+            "rejected input changed persisted history"
+        );
+        let recovery = "RECOVERY-SENTINEL";
+        prompt(&mut serve, &session, recovery).await?;
+        let request = fixture.request().await?;
+        assert_instruction(&request, false)?;
+        let messages = request
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or("no messages")?;
+        assert_eq!(
+            messages.last().and_then(|message| message.get("content")),
+            Some(&json!(recovery))
+        );
+        assert!(!request.to_string().contains("USER-SENTINEL"));
+    }
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(3)).await?.success());
+    Ok(())
+}
+
 fn assert_instruction(request: &Value, plan: bool) -> Result<(), Box<dyn Error>> {
     let messages = request
         .get("messages")

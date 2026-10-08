@@ -516,34 +516,11 @@ pub(crate) async fn edit_file_tool_execution(
         .client_capabilities
         .as_ref()
         .is_some_and(|capabilities| capabilities.read_text_file);
-    let original_result = if use_client_read {
-        match read_connection {
-            Some(connection) => {
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => return ToolExecution::failed("edit_file cancelled"),
-                    result = read_full_file_from_client(connection, &context.session_id, &resolved_path) => result,
-                }
-            }
-            None => Err("edit_file needs a client connection for fs/read_text_file".to_owned()),
-        }
-    } else {
-        let path = resolved_path.clone();
-        blocking::unblock(move || {
-            path.read_to_string().map_err(|error| {
-                format!(
-                    "failed to read {} before editing: {error}",
-                    path.path.display()
-                )
-            })
-        })
-        .await
-    };
-
-    let original = match original_result {
-        Ok(file_text) => file_text,
-        Err(error) => return ToolExecution::failed(error),
-    };
+    let original =
+        match read_edit_source(context, &resolved_path, read_connection, cancellation).await {
+            Ok(file_text) => file_text,
+            Err(error) => return ToolExecution::failed(error),
+        };
 
     let matches = original.matches(&parsed_arguments.old_text).count();
     if matches == 0 {
@@ -570,6 +547,19 @@ pub(crate) async fn edit_file_tool_execution(
     .await
     {
         return ToolExecution::failed(error);
+    }
+
+    // Approval can stay open while the user edits or replaces this document.
+    // Check the same confined source again before using its original snapshot.
+    match read_edit_source(context, &resolved_path, read_connection, cancellation).await {
+        Ok(current) if current == original => {}
+        Ok(_) => {
+            return ToolExecution::failed(format!(
+                "edit_file: {} changed while awaiting approval; read it again before retrying",
+                resolved_path.path.display()
+            ));
+        }
+        Err(error) => return ToolExecution::failed(error),
     }
 
     let edit_line = match original.find(&parsed_arguments.old_text) {
@@ -1135,6 +1125,32 @@ async fn read_full_file_from_client<'a>(
     Ok(response.content)
 }
 
+async fn read_edit_source(
+    context: &ToolContext,
+    path: &ConfinedPath,
+    read_connection: Option<&dyn ReadTextFileRequester>,
+    cancellation: &CancellationToken,
+) -> Result<String, String> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err("edit_file cancelled".to_owned()),
+        result = async {
+            if context.client_capabilities.as_ref().is_some_and(|caps| caps.read_text_file) {
+                let connection = read_connection.ok_or_else(||
+                    "edit_file needs a client connection for fs/read_text_file".to_owned())?;
+                read_full_file_from_client(connection, &context.session_id, path).await
+            } else {
+                let path = path.clone();
+                blocking::unblock(move || {
+                    path.read_to_string().map_err(|error| {
+                        format!("failed to read {} before editing: {error}", path.path.display())
+                    })
+                }).await
+            }
+        } => result,
+    }
+}
+
 async fn read_existing_text(
     context: &ToolContext,
     path: &ConfinedPath,
@@ -1152,9 +1168,20 @@ async fn read_existing_text(
         let Some(connection) = read_connection else {
             return Ok(None);
         };
-        return read_full_file_from_client(connection, &context.session_id, path)
+        let path = client_file_path(path).await?;
+        return match connection
+            .read_text_file(ReadTextFileRequest::new(
+                context.session_id.clone(),
+                path.clone(),
+            ))
             .await
-            .map(Some);
+        {
+            Ok(response) => Ok(Some(response.content)),
+            Err(error) if error.code == agent_client_protocol::ErrorCode::ResourceNotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(read_file_client_error(&path, &error.to_string())),
+        };
     }
 
     let path = path.clone();
@@ -1624,3 +1651,6 @@ mod tests;
 
 #[cfg(test)]
 mod confinement_tests;
+
+#[cfg(test)]
+mod edit_approval_tests;

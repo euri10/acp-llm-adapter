@@ -2869,17 +2869,103 @@ fn tool_call_title_empty_string_filtered_out() {
 }
 
 #[test]
-fn filter_messages_by_size_returns_unchanged_when_under_budget() {
+fn filter_messages_by_size_returns_unchanged_when_under_budget() -> Result<(), AdapterError> {
     let messages = vec![
         ChatMessage::user("first"),
         ChatMessage::user("second"),
         ChatMessage::user("third"),
     ];
-    assert_eq!(super::filter_messages_by_size(&messages, 1_000), messages);
+    assert_eq!(super::filter_messages_by_size(&messages, 1_000)?, messages);
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn provider_request_drops_oversized_tool_arguments_with_their_results()
+-> Result<(), AdapterError> {
+    for argument_bytes in [1024, 300_000] {
+        let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+        let messages = vec![
+            ChatMessage::system("instruction"),
+            ChatMessage::user("CURRENT-PROMPT"),
+            ChatMessage::assistant_with_tool_calls(
+                "",
+                vec![ChatToolCall::new(
+                    "call",
+                    "write_file",
+                    serde_json::json!({"path":"saved.txt","content":"x".repeat(argument_bytes)})
+                        .to_string(),
+                )],
+            ),
+            ChatMessage::tool_result("call", "saved"),
+        ];
+        super::stream_model_turn(
+            StreamContext {
+                llm_client: &client,
+                store: None,
+                messages: &messages,
+                tool_definitions: &[],
+                usage_totals: &mut super::UsageTotals::default(),
+            },
+            ModelRequestSettings {
+                model: "mock",
+                reasoning_effort: None,
+                max_tokens: None,
+            },
+            CancellationToken::new(),
+            "domain",
+            &mut |_| Ok(()),
+        )
+        .await?;
+        let requests = client.requests();
+        let requests = requests
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?;
+        let sent = requests[0].messages();
+        let actual_bytes = serde_json::to_vec(sent).map_err(ChatError::from)?.len();
+        assert!(
+            actual_bytes <= super::MAX_MESSAGE_BYTES,
+            "provider received {actual_bytes} message bytes despite the 256 KiB budget"
+        );
+        assert_eq!(sent.first(), messages.first());
+        assert!(
+            sent.iter()
+                .any(|message| message.content() == "CURRENT-PROMPT")
+        );
+        if argument_bytes < super::MAX_MESSAGE_BYTES {
+            assert_eq!(sent, messages);
+        } else {
+            assert_eq!(sent.len(), 2);
+            assert!(sent.iter().all(|message| message.tool_calls().is_empty()));
+            assert!(
+                sent.iter()
+                    .all(|message| message.role() != MessageRole::Tool)
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]
-fn reasoning_counts_toward_the_size_budget_and_keeps_tool_pairs_whole() {
+fn size_filter_reserves_current_prompt_before_more_recent_tool_history() -> Result<(), AdapterError>
+{
+    let system = ChatMessage::system("instruction");
+    let prompt = ChatMessage::user("CURRENT-USER-PROMPT");
+    let call =
+        ChatMessage::assistant_with_tool_calls("", vec![ChatToolCall::new("call", "echo", "{}")]);
+    let result = ChatMessage::tool_result("call", "result");
+    let budget = [&system, &call, &result]
+        .into_iter()
+        .map(super::estimate_message_size)
+        .sum();
+    let filtered =
+        super::filter_messages_by_size(&[system.clone(), prompt.clone(), call, result], budget)?;
+    assert_eq!(filtered, vec![system, prompt]);
+    Ok(())
+}
+
+#[test]
+fn reasoning_counts_toward_the_size_budget_and_keeps_tool_pairs_whole() -> Result<(), AdapterError>
+{
     let first = ChatMessage::user("first");
     let assistant =
         ChatMessage::assistant_with_tool_calls("", vec![ChatToolCall::new("call", "echo", "{}")])
@@ -2889,8 +2975,9 @@ fn reasoning_counts_toward_the_size_budget_and_keeps_tool_pairs_whole() {
         assistant,
         ChatMessage::tool_result("call", "done"),
     ];
-    assert_eq!(super::filter_messages_by_size(&messages, 500), vec![first]);
-    assert_eq!(super::filter_messages_by_size(&messages, 2000), messages);
+    assert_eq!(super::filter_messages_by_size(&messages, 500)?, vec![first]);
+    assert_eq!(super::filter_messages_by_size(&messages, 2000)?, messages);
+    Ok(())
 }
 
 #[test]
@@ -2906,21 +2993,29 @@ fn sanitization_preserves_complete_reasoning_without_coalescing_assistant_turns(
 }
 
 #[test]
-fn filter_messages_by_size_keeps_older_message_past_an_oversized_recent_one() {
+fn filter_messages_by_size_keeps_older_message_past_an_oversized_recent_one()
+-> Result<(), AdapterError> {
     // Regression test for daa-wx1: a single oversized *recent* message must not
     // stop the walk-back before smaller, older messages get a chance to fit.
     let first = ChatMessage::user("first");
     let older_small = ChatMessage::user("keep me");
     let newest_huge = ChatMessage::user("x".repeat(1_000));
-    let messages = vec![first.clone(), older_small.clone(), newest_huge];
+    let current = ChatMessage::user("current");
+    let messages = vec![
+        first.clone(),
+        older_small.clone(),
+        newest_huge,
+        current.clone(),
+    ];
 
-    let filtered = super::filter_messages_by_size(&messages, 100);
+    let filtered = super::filter_messages_by_size(&messages, 100)?;
 
-    assert_eq!(filtered, vec![first, older_small]);
+    assert_eq!(filtered, vec![first, older_small, current]);
+    Ok(())
 }
 
 #[test]
-fn filter_messages_by_size_drops_oversized_tool_call_unit_as_a_whole() {
+fn filter_messages_by_size_drops_oversized_tool_call_unit_as_a_whole() -> Result<(), AdapterError> {
     // An assistant message requesting tool calls and the tool results that
     // answer it must be dropped or kept together - never split, which would
     // otherwise produce a dangling tool call or an orphaned tool result.
@@ -2938,15 +3033,17 @@ fn filter_messages_by_size_drops_oversized_tool_call_unit_as_a_whole() {
         tool_result,
     ];
 
-    let filtered = super::filter_messages_by_size(&messages, 200);
+    let filtered = super::filter_messages_by_size(&messages, 200)?;
 
     assert_eq!(filtered, vec![first, older_small]);
     assert!(filtered.iter().all(|m| m.tool_calls().is_empty()));
     assert!(filtered.iter().all(|m| m.role() != MessageRole::Tool));
+    Ok(())
 }
 
 #[test]
-fn filter_messages_by_size_keeps_tool_call_unit_together_when_it_fits() {
+fn filter_messages_by_size_keeps_tool_call_unit_together_when_it_fits() -> Result<(), AdapterError>
+{
     let first = ChatMessage::user("first");
     let assistant_call = ChatMessage::assistant_with_tool_calls(
         "checking",
@@ -2954,16 +3051,19 @@ fn filter_messages_by_size_keeps_tool_call_unit_together_when_it_fits() {
     );
     let tool_result = ChatMessage::tool_result("call-1", "small result");
     let padding = ChatMessage::user("x".repeat(500));
+    let current = ChatMessage::user("current");
     let messages = vec![
         first.clone(),
         padding,
+        current.clone(),
         assistant_call.clone(),
         tool_result.clone(),
     ];
 
-    let filtered = super::filter_messages_by_size(&messages, 250);
+    let filtered = super::filter_messages_by_size(&messages, 250)?;
 
-    assert_eq!(filtered, vec![first, assistant_call, tool_result]);
+    assert_eq!(filtered, vec![first, current, assistant_call, tool_result]);
+    Ok(())
 }
 
 #[test]

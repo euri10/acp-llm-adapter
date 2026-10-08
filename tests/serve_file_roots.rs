@@ -3,7 +3,7 @@
 mod acp_client;
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use acp_client::{Serve, Stopped};
@@ -164,6 +164,204 @@ async fn serve_file_roots_reject_outside_paths_before_editor_io_and_recover()
                     .last()
                     .is_some_and(|update| update.to_string().contains("additional text"))
             );
+        }
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn serve_file_edits_reject_approval_time_changes() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new().await?;
+    let path = fixture.root.join("project/inside.txt");
+    for delegated in [false, true] {
+        let mut buffer = "alpha\nuser original\n".to_owned();
+        std::fs::write(&path, &buffer)?;
+        let mut serve = fixture.start(delegated).await?;
+        let id = serve
+            .start_prompt(
+                &json!({"name":"edit_file", "arguments":{
+                    "path":"inside.txt", "old_text":"alpha", "new_text":"beta"
+                }})
+                .to_string(),
+            )
+            .await?;
+        let mut writes = Vec::new();
+        loop {
+            match serve
+                .pump_with_permission(Duration::from_secs(10), Some(id), || false, None)
+                .await?
+            {
+                Stopped::Permission(request) => {
+                    buffer = "alpha\nUSER CHANGED THIS WHILE APPROVING\n".to_owned();
+                    if !delegated {
+                        std::fs::write(&path, &buffer)?;
+                    }
+                    serve
+                        .select_permission(
+                            request.get("id").ok_or("missing permission id")?,
+                            "allow_once",
+                        )
+                        .await?;
+                }
+                Stopped::ClientRequest(request) => {
+                    assert_eq!(
+                        request
+                            .pointer("/params/path")
+                            .and_then(Value::as_str)
+                            .map(Path::new),
+                        Some(path.as_path())
+                    );
+                    match request.get("method").and_then(Value::as_str) {
+                        Some("fs/read_text_file") => {
+                            serve.respond(&request, json!({"content":buffer})).await?;
+                        }
+                        Some("fs/write_text_file") => {
+                            buffer = request
+                                .pointer("/params/content")
+                                .and_then(Value::as_str)
+                                .ok_or("missing write content")?
+                                .to_owned();
+                            writes.push(buffer.clone());
+                            serve.respond(&request, json!({})).await?;
+                        }
+                        method => {
+                            return Err(format!("unexpected editor request: {method:?}").into());
+                        }
+                    }
+                }
+                Stopped::Response(response) => {
+                    assert_eq!(
+                        response.pointer("/result/stopReason"),
+                        Some(&json!("end_turn"))
+                    );
+                    break;
+                }
+                other => return Err(format!("edit did not finish: {other:?}").into()),
+            }
+        }
+        let updates = serve.updates("tool_call_update");
+        let result = updates.last().ok_or("missing edit result")?;
+        assert_eq!(result.get("status"), Some(&json!("failed")));
+        assert!(
+            result
+                .to_string()
+                .contains("changed while awaiting approval")
+        );
+        assert!(writes.is_empty(), "stale editor writes: {writes:?}");
+        assert_eq!(buffer, "alpha\nUSER CHANGED THIS WHILE APPROVING\n");
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            if delegated {
+                "alpha\nuser original\n"
+            } else {
+                "alpha\nUSER CHANGED THIS WHILE APPROVING\n"
+            }
+        );
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn serve_file_writes_create_missing_editor_files_and_preserve_read_errors()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new().await?;
+    for (name, old_text, error_code) in [
+        ("new.txt", None, -32002),
+        ("existing.txt", Some("old content"), 0),
+        ("unreadable.txt", None, -32603),
+    ] {
+        let path = fixture.root.join("project").join(name);
+        if let Some(content) = old_text {
+            std::fs::write(&path, content)?;
+        }
+        let mut serve = fixture.start(true).await?;
+        let id = serve
+            .start_prompt(
+                &json!({"name":"write_file", "arguments":{
+                    "path":name, "content":"new content"
+                }})
+                .to_string(),
+            )
+            .await?;
+        let mut writes = 0;
+        loop {
+            match serve
+                .pump(Duration::from_secs(10), Some(id), || false)
+                .await?
+            {
+                Stopped::ClientRequest(request) => {
+                    assert_eq!(
+                        request
+                            .pointer("/params/path")
+                            .and_then(Value::as_str)
+                            .map(Path::new),
+                        Some(path.as_path())
+                    );
+                    match request.get("method").and_then(Value::as_str) {
+                        Some("fs/read_text_file") => {
+                            if let Some(content) = old_text {
+                                serve.respond(&request, json!({"content":content})).await?;
+                            } else {
+                                serve.respond_error(&request, json!({"code":error_code,
+                                    "message": if error_code == -32002 {"Resource not found"} else {"Internal error"}
+                                })).await?;
+                            }
+                        }
+                        Some("fs/write_text_file") => {
+                            let content = request
+                                .pointer("/params/content")
+                                .and_then(Value::as_str)
+                                .ok_or("missing write content")?;
+                            assert_eq!(content, "new content");
+                            std::fs::write(&path, content)?;
+                            writes += 1;
+                            serve.respond(&request, json!({})).await?;
+                        }
+                        method => {
+                            return Err(format!("unexpected editor request: {method:?}").into());
+                        }
+                    }
+                }
+                Stopped::Response(response) => {
+                    assert_eq!(
+                        response.pointer("/result/stopReason"),
+                        Some(&json!("end_turn"))
+                    );
+                    break;
+                }
+                other => return Err(format!("write did not finish: {other:?}").into()),
+            }
+        }
+        let succeeds = error_code != -32603;
+        assert_eq!(writes, usize::from(succeeds));
+        let updates = serve.updates("tool_call_update");
+        let result = updates.last().ok_or("missing write result")?;
+        assert_eq!(
+            result.get("status"),
+            Some(&json!(if succeeds { "completed" } else { "failed" }))
+        );
+        if succeeds {
+            assert_eq!(std::fs::read_to_string(&path)?, "new content");
+            let diff = result
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| {
+                    content
+                        .iter()
+                        .find(|item| item.get("type") == Some(&json!("diff")))
+                })
+                .ok_or("missing native diff")?;
+            assert_eq!(diff.get("oldText").and_then(Value::as_str), old_text);
+            assert_eq!(
+                diff.get("newText").and_then(Value::as_str),
+                Some("new content")
+            );
+        } else {
+            assert!(!path.exists());
         }
         serve.disconnect();
         assert!(serve.wait(Duration::from_secs(5)).await?.success());

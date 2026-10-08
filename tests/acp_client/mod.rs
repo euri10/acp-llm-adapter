@@ -330,6 +330,20 @@ impl Serve {
             .await
     }
 
+    /// Answer a client operation with a JSON-RPC error.
+    ///
+    /// # Errors
+    /// Returns an error if the request has no id or the client write fails.
+    pub(crate) async fn respond_error(
+        &mut self,
+        request: &Value,
+        error: Value,
+    ) -> Result<(), Box<dyn Error>> {
+        let id = request.get("id").ok_or("client request has no id")?;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "error": error}))
+            .await
+    }
+
     /// Wait for the process to exit.
     ///
     /// # Errors

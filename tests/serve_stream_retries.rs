@@ -476,3 +476,164 @@ async fn a_finish_reason_completes_without_done_or_replay() -> Result<(), Box<dy
     }
     Ok(())
 }
+
+fn oversized_tool_completion() -> String {
+    let [prefix, middle, suffix] = [
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write-1",
+            "function":{"name":"write_file","arguments":"{\"path\":\"proof.txt\",\"content\":\""}}]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+            "function":{"arguments":"x".repeat(614_400)}}]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+            "function":{"arguments":"END\"}"}}]},"finish_reason":"tool_calls"}]}),
+    ];
+    format!("data: {prefix}\n\ndata: {middle}\n\ndata: {suffix}\n\ndata: [DONE]\n\n")
+}
+
+#[test_log::test(tokio::test)]
+async fn oversized_tool_delta_cannot_authorize_write_or_commit_history()
+-> Result<(), Box<dyn Error>> {
+    for mode in ["ask", "yolo"] {
+        let (url, posts, mut server) =
+            replay_provider(FirstReply::Drop(oversized_tool_completion()), true).await?;
+        let state_dir =
+            std::env::temp_dir().join(format!("acp-stream-integrity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir)?;
+        let mut serve = Serve::start_with(
+            serve_command(&url, &state_dir),
+            json!({"cwd":state_dir,"mcpServers":[]}),
+        )
+        .await?;
+        serve
+            .request(
+                "session/set_mode",
+                &json!({"sessionId":serve.session_id(),"modeId":mode}),
+            )
+            .await?;
+        let response = serve
+            .request(
+                "session/prompt",
+                &json!({"sessionId":serve.session_id(),
+                "prompt":[{"type":"text","text":"write the complete file"}]}),
+            )
+            .await?;
+        assert!(
+            !state_dir.join("proof.txt").exists(),
+            "a discarded argument delta allowed a corrupted file write in {mode} mode"
+        );
+        assert!(
+            response.get("error").is_some(),
+            "lost data succeeded: {response}"
+        );
+        assert!(
+            serve
+                .position_of_method("session/request_permission")
+                .is_none()
+        );
+        assert!(serve.position_of_status("in_progress").is_none());
+        assert!(serve.position_of_status("completed").is_none());
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "tool feedback or replay was sent"
+        );
+        assert!(serve.updates("usage_update").is_empty());
+        let history_path = state_dir
+            .join("acp-llm-adapter/sessions")
+            .join(serve.session_id())
+            .join("history.jsonl");
+        let history = std::fs::read_to_string(&history_path)?;
+        let entries = history
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            entries.len(),
+            1,
+            "a failed completion polluted persisted history"
+        );
+        assert_eq!(
+            entries.first().and_then(|entry| entry.get("role")),
+            Some(&json!("user"))
+        );
+        let recovered = serve
+            .request(
+                "session/prompt",
+                &json!({"sessionId":serve.session_id(),
+                "prompt":[{"type":"text","text":"try another prompt"}]}),
+            )
+            .await?;
+        assert_eq!(
+            recovered.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        let history = std::fs::read_to_string(history_path)?;
+        assert!(
+            !history.contains("write-1"),
+            "corrupt tool history survived recovery"
+        );
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+        server.shutdown().await;
+        std::fs::remove_dir_all(state_dir)?;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn selected_content_rejects_lost_output_and_post_finish_accounting()
+-> Result<(), Box<dyn Error>> {
+    let finish = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+    for after_finish in [false, true] {
+        let lost = if after_finish {
+            json!({"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"context_length":1024},
+                "provider_metadata":"x".repeat(614_400)})
+        } else {
+            json!({"choices":[{"delta":{"content":"x".repeat(614_400)}}]})
+        };
+        let [first, second] = if after_finish {
+            [finish.clone(), lost]
+        } else {
+            [lost, finish.clone()]
+        };
+        let body = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+        let (url, posts, mut server) = replay_provider(FirstReply::Drop(body), true).await?;
+        let state_dir =
+            std::env::temp_dir().join(format!("acp-stream-integrity-{}", uuid::Uuid::new_v4()));
+        let mut serve =
+            Serve::start_with(serve_command(&url, &state_dir), selected_session(4000)).await?;
+        let response = serve
+            .request(
+                "session/prompt",
+                &json!({"sessionId":serve.session_id(),
+                "prompt":[{"type":"text","text":"private selected snapshot"}]}),
+            )
+            .await?;
+        assert!(
+            response.get("error").is_some(),
+            "discarded selected-content event succeeded"
+        );
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "selected prompt was replayed"
+        );
+        assert!(serve.updates("agent_message_chunk").is_empty());
+        assert!(
+            serve.updates("usage_update").is_empty(),
+            "lost accounting became known usage"
+        );
+        let persisted = state_dir
+            .join("acp-llm-adapter/sessions")
+            .join(serve.session_id());
+        assert!(!persisted.join("history.jsonl").exists());
+        assert!(!persisted.join("meta.json").exists());
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+        server.shutdown().await;
+        if state_dir.exists() {
+            std::fs::remove_dir_all(state_dir)?;
+        }
+    }
+    Ok(())
+}

@@ -229,6 +229,11 @@ Discovery metadata is retained in memory and refreshed on adapter startup;
 no extra request is made per turn. Missing or invalid sizes leave the fallback
 intact. If all sources are unknown, no `usage_update` is emitted.
 
+Optional startup discovery has a two-second deadline covering connection,
+response headers, and the full body. Failure keeps the configured default model.
+Termination signals cancel discovery immediately; editor disconnect is observed
+when this bounded startup step finishes, within two seconds of starting discovery.
+
 ## Architecture
 
 The adapter bridges two independent channels:
@@ -299,6 +304,11 @@ After output, a dropped stream fails without replaying the generation.
 completion POST. Cancelling or dropping a stream releases its HTTP response and
 transport task. Completion POSTs do not follow redirects.
 
+An oversized SSE event or a malformed stream fails the completion, including
+errors after its finish reason. Lost deltas never become executable tool calls
+or completed assistant/tool history. Clean EOF after a valid finish remains
+supported, as does valid trailing usage accounting.
+
 Each completion accepts at most 128 tool calls, with indices from 0 through 127.
 This is a local defensive limit that bounds allocation and work driven by provider
 indices. Out-of-range indices fail immediately as an invalid provider response,
@@ -354,6 +364,13 @@ the provider's [thinking-mode contract](https://api-docs.deepseek.com/guides/thi
 It counts toward the request-size budget and stays with its assistant/tool unit
 when old history is dropped. Other providers' outgoing message formats are
 unchanged; selected-content sessions still do not persist their payloads.
+
+History filtering reserves the system instruction and the latest user prompt
+within the estimated 256 KiB message budget before considering older messages
+and complete assistant/tool units, including their argument strings. A current
+prompt that cannot fit is rejected with `current prompt exceeds request size limit`
+before provider work or history changes; its text is never silently dropped or
+truncated. A subsequent smaller prompt can proceed normally.
 
 - `ask`
 - `accept-edits`
@@ -428,6 +445,13 @@ canonical absolute paths. Roots must be locally verifiable, even for editor I/O.
 The trusted editor must preserve confinement when accessing the path: ACP passes
 a path, not an atomic filesystem capability.
 
+`edit_file` rereads the document after approval and reports a conflict without
+writing if its contents changed while approval was pending. The user can reread
+and retry against the updated document. This does not guarantee atomicity against
+changes between that final read and the write. `write_file` creates new
+editor-managed files when the editor's preflight read returns `ResourceNotFound`;
+other read failures prevent the write.
+
 `run_command` remains permission-gated host execution starting in `cwd`, **not a
 filesystem sandbox**. MCP tools have their own permission boundary; these file
 roots do not sandbox MCP servers.
@@ -452,6 +476,14 @@ test-only hook: it is the only way to drive tool execution without a provider,
 from an editor session as much as from the test suite.
 
 ## ACP Protocol Coverage
+
+Loading or resuming a session with an active turn is rejected at session
+publication, including when the turn began during restore setup. Cancellation
+continues to target the original turn until its cleanup completes.
+
+Closing or deleting an active session cancels its work and keeps restoration
+blocked until that turn finishes cleanup. An older turn cannot clear a newer
+turn's cancellation owner or recreate a deleted session's history.
 
 | Feature                                                                                     | Status                                                                |
 | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |

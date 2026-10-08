@@ -9,14 +9,188 @@ use std::error::Error;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::routing::{get, post};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
+
+mod acp_client;
+
+struct StalledDiscovery {
+    root: std::path::PathBuf,
+    url: String,
+    started: CancellationToken,
+    disconnected: CancellationToken,
+    tasks: tokio::task::JoinSet<std::io::Result<()>>,
+}
+
+impl StalledDiscovery {
+    async fn start(partial_body: bool) -> Result<Self, Box<dyn Error>> {
+        let root = std::env::temp_dir().join(format!("acp-discovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let started = CancellationToken::new();
+        let disconnected = CancellationToken::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn({
+            let started = started.clone();
+            let disconnected = disconnected.clone();
+            async move {
+                let (socket, _) = listener.accept().await?;
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await?;
+                assert!(line.starts_with("GET /models "));
+                loop {
+                    line.clear();
+                    socket.read_line(&mut line).await?;
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if partial_body {
+                    socket.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"data\":[").await?;
+                }
+                started.cancel();
+                let mut byte = [0];
+                assert_eq!(socket.read(&mut byte).await?, 0, "discovery must release its socket");
+                disconnected.cancel();
+                let router = Router::new().route("/chat/completions", post(|| async {
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                     "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                }));
+                axum::serve(listener, router).await
+            }
+        });
+        Ok(Self {
+            root,
+            url,
+            started,
+            disconnected,
+            tasks,
+        })
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+        command
+            .args(["serve", "--backend", "groq"])
+            .env("LLM_API_KEY", "fixture-key")
+            .env("LLM_BASE_URL", &self.url)
+            .env("LLM_MODEL", "discovery-fallback")
+            .env("XDG_STATE_HOME", &self.root)
+            .env_remove("ACP_LOG");
+        command
+    }
+}
+
+impl Drop for StalledDiscovery {
+    fn drop(&mut self) {
+        self.tasks.abort_all();
+        if let Err(error) = std::fs::remove_dir_all(&self.root) {
+            tracing::warn!(%error, "failed to remove isolated discovery fixture state");
+        }
+    }
+}
+
+#[test_log::test(tokio::test)]
+async fn stalled_discovery_headers_and_body_fall_back_and_allow_prompts()
+-> Result<(), Box<dyn Error>> {
+    for partial_body in [false, true] {
+        let fixture = StalledDiscovery::start(partial_body).await?;
+        let mut serve = tokio::time::timeout(
+            Duration::from_secs(6),
+            acp_client::Serve::start_with(fixture.command(), json!({"cwd":"/tmp","mcpServers":[]})),
+        )
+        .await??;
+        assert!(fixture.started.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), fixture.disconnected.cancelled()).await?;
+        let response = serve
+            .request(
+                "session/set_config_option",
+                &json!({
+                    "sessionId":serve.session_id(),"configId":"model","value":"discovery-fallback"
+                }),
+            )
+            .await?;
+        assert!(
+            response.get("result").is_some(),
+            "default model missing: {response}"
+        );
+        let response = serve
+            .request(
+                "session/prompt",
+                &json!({
+                    "sessionId":serve.session_id(),"prompt":[{"type":"text","text":"hello"}]
+                }),
+            )
+            .await?;
+        assert_eq!(
+            response.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(3)).await?.success());
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn disconnect_during_stalled_discovery_releases_request_and_exits()
+-> Result<(), Box<dyn Error>> {
+    for partial_body in [false, true] {
+        let fixture = StalledDiscovery::start(partial_body).await?;
+        let mut child = fixture
+            .command()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        tokio::time::timeout(Duration::from_secs(3), fixture.started.cancelled()).await?;
+        drop(child.stdin.take());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await??
+                .success()
+        );
+        tokio::time::timeout(Duration::from_secs(2), fixture.disconnected.cancelled()).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_log::test(tokio::test)]
+async fn termination_during_stalled_discovery_releases_request_and_exits()
+-> Result<(), Box<dyn Error>> {
+    for partial_body in [false, true] {
+        let fixture = StalledDiscovery::start(partial_body).await?;
+        let mut child = fixture
+            .command()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        tokio::time::timeout(Duration::from_secs(3), fixture.started.cancelled()).await?;
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id().ok_or("no child PID")?)?)
+            .ok_or("invalid PID")?;
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await??
+                .success()
+        );
+        tokio::time::timeout(Duration::from_secs(2), fixture.disconnected.cancelled()).await?;
+    }
+    Ok(())
+}
 
 /// A stand-in provider that records whether its `/models` route was called.
 async fn spawn_provider_fixture()

@@ -794,6 +794,142 @@ async fn cancellation_or_consumer_drop_stops_a_pending_reconnect()
     Ok(())
 }
 
+#[test_log::test(tokio::test)]
+async fn lost_sse_events_fail_before_and_after_finish() -> Result<(), Box<dyn std::error::Error>> {
+    let finish = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+    let oversized_chunks = [
+        json!({"choices":[{"delta":{"content":"x".repeat(1024)}}]}),
+        json!({"choices":[{"delta":{"reasoning_content":"x".repeat(1024)}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"x".repeat(1024)}}]}}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2},"extra":"x".repeat(1024)}),
+    ];
+    for lost in oversized_chunks {
+        for after_finish in [false, true] {
+            for fatal_decoder in [false, true] {
+                let [first, second] = if after_finish {
+                    [&finish, &lost]
+                } else {
+                    [&lost, &finish]
+                };
+                let body = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+                let (url, server) = spawn_sse_server(body, Arc::new(Mutex::new(None))).await?;
+                let source = reqwest::Client::new()
+                    .post(url)
+                    .json(&json!({}))
+                    .into_event_source_builder()
+                    .max_payload_size(std::num::NonZeroUsize::new(256).ok_or("zero size")?)
+                    .fail_on_oversized_event(fatal_decoder)
+                    .build();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                run_stream_attempt(source, &tx, &CancellationToken::new()).await;
+                drop(tx);
+                let mut failed = false;
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        Err(ChatError::Transport(_)) => failed = true,
+                        Ok(StreamEvent::Finished(_)) if after_finish => {}
+                        other => {
+                            return Err(
+                                format!("unexpected event from lossy stream: {other:?}").into()
+                            );
+                        }
+                    }
+                }
+                server.await??;
+                assert!(
+                    failed,
+                    "lost event accepted: after_finish={after_finish}, fatal_decoder={fatal_decoder}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn network_failure_after_finish_is_not_clean_eof() -> Result<(), Box<dyn std::error::Error>> {
+    for single_send in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await?;
+                if count == 0 {
+                    return Err(std::io::Error::other("request ended before headers"));
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+            // Claim more body bytes than are sent: reqwest must report a body
+            // transport failure, even though a complete finish event arrived.
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len() + 100).as_bytes()).await?;
+            socket.shutdown().await
+        });
+        let mut builder = reqwest::Client::new().get(url).into_event_source_builder();
+        if single_send {
+            builder = builder.retry_config(sse_reqwest_client::SseRetryConfig::disabled());
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        run_stream_attempt(builder.build(), &tx, &CancellationToken::new()).await;
+        drop(tx);
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(StreamEvent::Finished(_)))
+        ));
+        assert!(
+            matches!(rx.recv().await, Some(Err(ChatError::Transport(_)))),
+            "truncated HTTP body after finish was accepted: single_send={single_send}"
+        );
+        server.await??;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn trailing_usage_is_validated_after_finish_without_done()
+-> Result<(), Box<dyn std::error::Error>> {
+    for single_send in [false, true] {
+        for malformed in [false, true] {
+            let usage = if malformed {
+                json!({"prompt_tokens":5})
+            } else {
+                json!({"prompt_tokens":5,"completion_tokens":2})
+            };
+            let finish = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let accounting = json!({"choices":[],"usage":usage});
+            let (url, server) = spawn_sse_server(
+                format!("data: {finish}\n\ndata: {accounting}\n\n"),
+                Arc::new(Mutex::new(None)),
+            )
+            .await?;
+            let client = ChatClient::new(ChatConfig::new("fixture-key", url, "fixture-model"));
+            let mut request = ChatRequest::new(vec![ChatMessage::user("hello")]);
+            if single_send {
+                request = request.without_retries();
+            }
+            let mut response = client.stream_chat(request, CancellationToken::new())?;
+            assert!(matches!(
+                response.next().await,
+                Some(Ok(StreamEvent::Finished(_)))
+            ));
+            match response.next().await {
+                Some(Err(ChatError::InvalidResponse(_))) if malformed => {}
+                Some(Ok(StreamEvent::Usage(data))) if !malformed => {
+                    assert_eq!(data.input_tokens, 5);
+                    assert_eq!(data.output_tokens, 2);
+                }
+                other => return Err(format!("unexpected trailing usage event: {other:?}").into()),
+            }
+            assert!(response.next().await.is_none());
+            server.await??;
+        }
+    }
+    Ok(())
+}
+
 #[test_log::test]
 fn deepseek_config_rejects_blank_api_key_from_environment() {
     assert!(matches!(

@@ -15,6 +15,9 @@ use crate::tools::{ToolContext, ToolExecution, ToolExecutor, ToolKind, ToolRegis
 use crate::{PendingToolCalls, ReasoningEffort, SessionBehavior, SessionStore};
 use acp_llm_adapter::error::AdapterError;
 
+// Leave headroom for tool definitions, JSON escaping and request metadata.
+const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+
 /// Validated prompt translated by the editor adapter.
 #[derive(Debug)]
 pub(crate) struct PromptInput {
@@ -111,35 +114,47 @@ pub(crate) struct StreamContext<'a> {
     usage_totals: &'a mut UsageTotals,
 }
 
-/// Filter messages to fit within a byte budget, keeping the first and most recent messages.
+/// Filter history while retaining the first message and latest user prompt.
 ///
 /// The provider API enforces a request size limit (e.g. ~1MB for CloudFront-backed endpoints).
-/// We filter messages to stay well under this limit (512KB budget) to ensure requests
-/// complete successfully. The filter keeps the first message and as many recent
-/// tool-call units as fit within the budget, dropping older messages if needed. A
-/// single oversized recent message never blocks smaller, older messages from
-/// also being considered.
+/// The first message (the ordinary system instruction) and the current user
+/// prompt are mandatory. Remaining space goes to the most recent tool-call units
+/// that fit. Oversized historical units never block smaller, older messages.
 ///
 /// # Arguments
 ///
 /// * `messages` - All messages in the conversation
 /// * `max_bytes` - Maximum bytes allowed for the filtered message list
 ///
-/// # Returns
-///
-/// A filtered message list that fits within the byte budget.
-fn filter_messages_by_size(messages: &[ChatMessage], max_bytes: usize) -> Vec<ChatMessage> {
+/// # Errors
+/// Returns an input error if the mandatory messages exceed the byte budget.
+fn filter_messages_by_size(
+    messages: &[ChatMessage],
+    max_bytes: usize,
+) -> Result<Vec<ChatMessage>, AdapterError> {
     if messages.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+    let first_size = messages.first().map_or(0, estimate_message_size);
+    let prompt_size = messages
+        .iter()
+        .skip(1)
+        .rev()
+        .find(|message| message.role() == MessageRole::User)
+        .map_or(0, estimate_message_size);
+    if first_size.saturating_add(prompt_size) > max_bytes {
+        return Err(AdapterError::InvalidParams(
+            "current prompt exceeds request size limit".into(),
+        ));
     }
 
     // Calculate total size - if it fits, return as-is
     let total_size: usize = messages.iter().map(estimate_message_size).sum();
     if total_size <= max_bytes {
-        return messages.to_vec();
+        return Ok(messages.to_vec());
     }
 
-    filter_messages_truncate(messages, max_bytes)
+    Ok(filter_messages_truncate(messages, max_bytes))
 }
 
 #[allow(clippy::indexing_slicing)]
@@ -158,13 +173,25 @@ fn filter_messages_truncate(messages: &[ChatMessage], max_bytes: usize) -> Vec<C
     // travels with the tool results answering it - truncation must keep or
     // drop such a pair together, never split it.
     let groups = group_tool_call_units(&messages[1..]);
+    let current_prompt = groups.iter().rposition(|group| {
+        group
+            .first()
+            .is_some_and(|message| message.role() == MessageRole::User)
+    });
+    if let Some(prompt) = current_prompt.and_then(|index| groups.get(index)) {
+        budget = budget.saturating_sub(prompt.iter().map(estimate_message_size).sum());
+    }
 
     // Walk groups from most recent to oldest. A single oversized recent group
     // must not stop older, smaller groups from also being considered -
     // otherwise one large tool result collapses the whole history down to
     // just the pinned first message.
     let mut kept_groups = Vec::new();
-    for group in groups.iter().rev() {
+    for (index, group) in groups.iter().enumerate().rev() {
+        if Some(index) == current_prompt {
+            kept_groups.push(group);
+            continue;
+        }
         let group_size: usize = group.iter().map(estimate_message_size).sum();
         if group_size > budget {
             continue;
@@ -354,12 +381,17 @@ fn estimate_message_size(msg: &ChatMessage) -> usize {
     // Account for JSON serialization overhead using integer arithmetic:
     // - Role field + delimiters: ~10 bytes
     // - Content as quoted string: (content.len() * 21) / 20 ≈ content.len() * 1.05
-    // - Tool calls with IDs and function info: ~150 bytes each
+    // - Tool-call structure: ~150 bytes each, plus their variable strings
     let base: usize = 10;
     let content_len = msg
         .content()
         .len()
         .saturating_add(msg.reasoning_content().map_or(0, str::len));
+    let content_len = msg.tool_calls().iter().fold(content_len, |size, call| {
+        size.saturating_add(call.id().len())
+            .saturating_add(call.name().len())
+            .saturating_add(call.arguments().len())
+    });
     let content_overhead = (content_len.saturating_mul(21)) / 20;
     let tool_overhead = msg.tool_calls().len().saturating_mul(150);
     base + content_overhead + tool_overhead
@@ -388,6 +420,13 @@ pub(crate) async fn handle_prompt_request(
 ) -> Result<PromptResult, AdapterError> {
     let selected_content = store.selected_content_limits(&request.session_id)?;
     let user_message = ChatMessage::user(request.text.clone());
+    // Reject oversized external input before admitting or persisting the turn.
+    let mandatory_messages = request_messages_for_behavior(
+        store.session_behavior(&request.session_id)?,
+        selected_content.is_some(),
+        std::slice::from_ref(&user_message),
+    );
+    filter_messages_by_size(&mandatory_messages, MAX_MESSAGE_BYTES)?;
     let session_id = request.session_id.clone();
     let cancellation_token = CancellationToken::new();
 
@@ -462,11 +501,7 @@ pub(crate) async fn handle_prompt_request(
     if selected_content.is_some() && result.is_err() {
         cancellation_token.cancel();
     }
-    let clear_result = match store.clear_active_turn(&session_id) {
-        Ok(()) => Ok(()),
-        Err(AdapterError::InvalidParams(msg)) if msg.starts_with("unknown session id:") => Ok(()),
-        Err(err) => Err(err),
-    };
+    let clear_result = store.clear_active_turn(&session_id, &cancellation_token);
     match (result, clear_result) {
         (Ok(response), Ok(())) => Ok(response),
         (Err(error), Ok(())) => Err(error),
@@ -727,8 +762,7 @@ pub(crate) async fn stream_model_turn(
     // - Tool definitions (can be 100KB+ with long descriptions)
     // - JSON serialization overhead (quotes, escapes, structure)
     // - Request metadata (model, stream flag, etc.)
-    let max_message_bytes = 256 * 1024; // 256KB
-    let filtered_messages = filter_messages_by_size(context.messages, max_message_bytes);
+    let filtered_messages = filter_messages_by_size(context.messages, MAX_MESSAGE_BYTES)?;
 
     if filtered_messages.len() < context.messages.len() {
         tracing::warn!(

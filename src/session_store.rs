@@ -39,6 +39,8 @@ pub(crate) struct AdapterState {
     pub(crate) client_capabilities: Option<ClientCapabilities>,
     pub(crate) sessions: HashMap<String, SessionRecord>,
     resources: HashMap<String, SessionResources>,
+    /// Removed sessions still own their prompt until cancellation cleanup ends.
+    retired_turns: HashMap<String, CancellationToken>,
 }
 
 impl AdapterState {
@@ -54,6 +56,7 @@ impl AdapterState {
             client_capabilities: None,
             sessions: HashMap::new(),
             resources: HashMap::new(),
+            retired_turns: HashMap::new(),
         }
     }
 
@@ -67,6 +70,18 @@ impl AdapterState {
             ids: models,
             ..ModelCatalog::default()
         };
+    }
+
+    fn remove_session(&mut self, session_id: &str) -> bool {
+        let Some(session) = self.sessions.remove(session_id) else {
+            return false;
+        };
+        if let Some(token) = session.active_turn {
+            token.cancel();
+            self.retired_turns.insert(session_id.to_string(), token);
+        }
+        self.resources.remove(session_id);
+        true
     }
 }
 
@@ -130,8 +145,7 @@ impl SessionStore {
             .state
             .lock()
             .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        guard.resources.remove(session_id);
-        Ok(guard.sessions.remove(session_id).is_some())
+        Ok(guard.remove_session(session_id))
     }
 
     /// Insert a new session record.
@@ -306,12 +320,25 @@ impl SessionStore {
         })
     }
 
-    /// Clear the active turn token for a session.
-    pub(crate) fn clear_active_turn(&self, session_id: &str) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
+    /// Release only the completing turn's ownership, including after removal.
+    pub(crate) fn clear_active_turn(
+        &self,
+        session_id: &str,
+        token: &CancellationToken,
+    ) -> Result<(), AdapterError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
+        if state.retired_turns.get(session_id) == Some(token) {
+            state.retired_turns.remove(session_id);
+        }
+        if let Some(session) = state.sessions.get_mut(session_id)
+            && session.active_turn.as_ref() == Some(token)
+        {
             session.active_turn = None;
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     /// Set the session behavior (mode) for a session.
@@ -873,22 +900,15 @@ impl SessionStore {
 
     /// Remove a session from memory and persistent storage.
     pub(crate) fn delete_session(&self, session_id: &str) -> Result<bool, AdapterError> {
-        let persistence = self.persistence.clone();
-        let deleted_from_memory = {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|e| AdapterError::Internal(e.to_string()))?;
-            if let Some(session) = guard.sessions.get(session_id)
-                && let Some(token) = &session.active_turn
-            {
-                token.cancel();
-            }
-            guard.resources.remove(session_id);
-            guard.sessions.remove(session_id).is_some()
-        };
-
-        let deleted_from_persistence = if let Some(persistence) = persistence {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
+        let deleted_from_memory = state.remove_session(session_id);
+        // Like history commits, deletion runs on the blocking pool. Serialize
+        // both disk and memory with save_history so a pending save cannot
+        // resurrect a deleted session after this method returns.
+        let deleted_from_persistence = if let Some(persistence) = &self.persistence {
             persistence
                 .delete_session(session_id)
                 .map_err(|e| AdapterError::Internal(e.to_string()))?
@@ -900,6 +920,10 @@ impl SessionStore {
     }
 
     /// Publish a session and its external resources together.
+    ///
+    /// Reject replacement until an active turn has finished cleanup, including
+    /// after cancellation. This check shares the admission lock so asynchronous
+    /// restore setup cannot discard a turn that started while it was awaiting I/O.
     pub(crate) fn insert_session_with_resources(
         &self,
         session_id: String,
@@ -911,6 +935,16 @@ impl SessionStore {
             .state
             .lock()
             .map_err(|e| AdapterError::Internal(e.to_string()))?;
+        if state.retired_turns.contains_key(&session_id)
+            || state
+                .sessions
+                .get(&session_id)
+                .is_some_and(|session| session.active_turn.is_some())
+        {
+            return Err(AdapterError::InvalidRequest(
+                "cannot restore a session with an active turn".into(),
+            ));
+        }
         state
             .resources
             .insert(session_id.clone(), SessionResources { servers, sessions });
@@ -997,48 +1031,46 @@ impl SessionStore {
         session_id: &str,
         messages: &[ChatMessage],
     ) -> Result<(), AdapterError> {
-        if self.with_session(session_id, |session| Ok(session.selected_content.is_some()))? {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
+        if guard.retired_turns.contains_key(session_id) {
+            // A removed turn may finish cancellation bookkeeping, but must not
+            // recreate persisted history or update a replacement session.
+            return Ok(());
+        }
+        let state = &mut *guard;
+        let session = state.sessions.get_mut(session_id).ok_or_else(|| {
+            AdapterError::InvalidParams(format!("unknown session id: {session_id}"))
+        })?;
+        if session.selected_content.is_some() {
             // Helpers are ephemeral: no raw question, selected source or answer on disk.
             return Ok(());
         }
-        let (persistence, meta, new_messages) = {
-            let guard = self
-                .state
-                .lock()
-                .map_err(|e| AdapterError::Internal(e.to_string()))?;
-            let session = guard.sessions.get(session_id).ok_or_else(|| {
-                AdapterError::InvalidParams(format!("unknown session id: {session_id}"))
-            })?;
-            let previous_len = session.history.len();
-            let new_messages = messages
-                .iter()
-                .skip(previous_len)
-                .cloned()
-                .collect::<Vec<_>>();
-            (
-                self.persistence.clone(),
-                session.persisted_meta(
-                    session_id,
-                    guard
-                        .resources
-                        .get(session_id)
-                        .map(|resources| resources.servers.as_slice())
-                        .unwrap_or_default(),
-                ),
-                new_messages,
-            )
-        };
-
-        if let Some(persistence) = persistence {
+        let new_messages = messages
+            .iter()
+            .skip(session.history.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        let meta = session.persisted_meta(
+            session_id,
+            state
+                .resources
+                .get(session_id)
+                .map(|resources| resources.servers.as_slice())
+                .unwrap_or_default(),
+        );
+        // This synchronous method runs on the blocking pool in production.
+        // Hold admission/removal ownership through disk and memory publication.
+        if let Some(persistence) = &self.persistence {
             persistence
                 .persist_turn(&meta, &new_messages)
                 .map_err(|e| AdapterError::Internal(e.to_string()))?;
         }
 
-        self.with_session_mut(session_id, |session| {
-            session.history = messages.to_vec();
-            Ok(())
-        })
+        session.history = messages.to_vec();
+        Ok(())
     }
 
     /// Clear an idle ordinary session's history, preserving settings and spend.

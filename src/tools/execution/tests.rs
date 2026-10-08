@@ -532,7 +532,7 @@ async fn edit_file_tool_routes_to_client_fs_read_and_write()
         *read_calls
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?,
-        1
+        2
     );
 
     let write_requests_guard = write_requests
@@ -545,6 +545,115 @@ async fn edit_file_tool_routes_to_client_fs_read_and_write()
     assert_eq!(request.path, temp_root.join("note.txt"));
     assert_eq!(request.content, "client buffer");
 
+    Ok(())
+}
+
+struct PreflightReadError {
+    error: agent_client_protocol::Error,
+    cancel: Option<CancellationToken>,
+}
+
+impl ReadTextFileRequester for PreflightReadError {
+    fn read_text_file(
+        &self,
+        _request: ReadTextFileRequest,
+    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move {
+            if let Some(token) = &self.cancel {
+                token.cancel();
+            }
+            Err(self.error.clone())
+        })
+    }
+}
+
+#[test_log::test(tokio::test)]
+async fn write_file_client_preflight_only_accepts_missing_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (error, cancel, allowed) in [
+        (
+            agent_client_protocol::Error::resource_not_found(None),
+            false,
+            true,
+        ),
+        (agent_client_protocol::Error::internal_error(), false, true),
+        (
+            agent_client_protocol::Error::resource_not_found(None),
+            true,
+            true,
+        ),
+        (
+            agent_client_protocol::Error::resource_not_found(None),
+            false,
+            false,
+        ),
+    ] {
+        let root =
+            std::env::temp_dir().join(format!("acp-write-preflight-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&root))?;
+        let context = ToolContext {
+            session_id: session.session_id.0.to_string(),
+            cwd: root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                (ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true)))
+                .into(),
+            ),
+        };
+        let token = CancellationToken::new();
+        let reader = PreflightReadError {
+            error,
+            cancel: cancel.then(|| token.clone()),
+        };
+        let writer = RecordingWriteTextFileRequester::new();
+        let permission = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(if allowed {
+                PERMISSION_ALLOW_ONCE_OPTION_ID
+            } else {
+                crate::session::PERMISSION_REJECT_ONCE_OPTION_ID
+            })),
+        )]);
+        let call = ChatToolCall::new(
+            "new-file",
+            "write_file",
+            serde_json::json!({
+                "path":"new.txt", "content":"new content"
+            })
+            .to_string(),
+        );
+        let result = write_file_tool_execution(
+            &store,
+            &call,
+            &context,
+            Some(&reader),
+            Some(&writer),
+            Some(&permission),
+            &token,
+        )
+        .await;
+        let expected_success = reader.error.code
+            == agent_client_protocol::ErrorCode::ResourceNotFound
+            && !cancel
+            && allowed;
+        assert_eq!(result.success, expected_success, "{}", result.content);
+        let requests = writer.requests();
+        let requests = requests.lock().map_err(|error| error.to_string())?;
+        assert_eq!(requests.len(), usize::from(expected_success));
+        if expected_success {
+            let request = requests.first().ok_or("missing client write")?;
+            assert_eq!(request.path, root.join("new.txt"));
+            assert_eq!(request.content, "new content");
+            let edit = result.edit.ok_or("missing native diff")?;
+            assert_eq!(edit.old_text, None);
+            assert_eq!(edit.new_text, "new content");
+        }
+        assert!(!root.join("new.txt").exists(), "unexpected local fallback");
+        std::fs::remove_dir_all(root)?;
+    }
     Ok(())
 }
 

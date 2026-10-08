@@ -492,33 +492,35 @@ async fn serve(
     );
     let state = Arc::new(Mutex::new(AdapterState::new(default_model.clone())));
 
-    // Fetch the live model list from the same endpoint the completions go to.
-    if let Some(ref config) = chat_config {
-        let models = acp_llm_adapter::llm::fetch_available_models(
-            config.base_url(),
-            config.api_key(),
-            &default_model,
-        )
-        .await;
-        if let Err(e) = state.lock().map(|mut g| g.model_catalog = models) {
-            tracing::warn!(%e, "failed to store fetched model list");
-        }
-    }
-
     let shutdown = CancellationToken::new();
     let logging_enabled = connection.is_some();
     let transport = stdio_transport_with_eof(shutdown.clone(), connection);
 
     let result = tokio::select! {
-        result = serve_with_transport_and_state_dir_logging(
-            transport,
-            state,
-            llm_client,
-            tool_registry,
-            max_turn_requests,
-            None,
-            logging_enabled,
-        ) => {
+        result = async {
+            // Discovery shares signal ownership with serving. Its two-second
+            // deadline also bounds the wait before the transport observes EOF.
+            if let Some(ref config) = chat_config {
+                let models = acp_llm_adapter::llm::fetch_available_models(
+                    config.base_url(),
+                    config.api_key(),
+                    &default_model,
+                )
+                .await;
+                if let Err(e) = state.lock().map(|mut g| g.model_catalog = models) {
+                    tracing::warn!(%e, "failed to store fetched model list");
+                }
+            }
+            serve_with_transport_and_state_dir_logging(
+                transport,
+                state,
+                llm_client,
+                tool_registry,
+                max_turn_requests,
+                None,
+                logging_enabled,
+            ).await
+        } => {
             tracing::info!("ACP serve loop returned");
             result
         }

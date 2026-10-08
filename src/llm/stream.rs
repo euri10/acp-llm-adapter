@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use serde::Deserialize;
-use sse_reqwest_client::{EventSource, SseEvent};
+use sse_reqwest_client::{Error as SseError, EventSource, SseErrorEvent, SseEvent};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -57,7 +57,7 @@ pub(super) async fn run_stream_attempt(
                 }
             }
             Ok(SseEvent::Error(error)) => {
-                if saw_finish {
+                if saw_finish && matches!(error, SseErrorEvent::Eof) {
                     // The terminal finish reason completes the generation;
                     // providers may close without a separate [DONE] marker.
                     return;
@@ -69,10 +69,13 @@ pub(super) async fn run_stream_attempt(
                 tracing::warn!(error = ?error, "SSE stream dropped before output; reconnecting");
             }
             Ok(SseEvent::Discarded(error)) => {
-                tracing::warn!(error = ?error, "SSE event discarded as oversized");
+                // Dropping a delta can leave different but valid tool arguments.
+                // Fail the completion and drop its owned source before any replay.
+                let _ = tx.send(Err(SseError::PayloadTooLarge(error).into()));
+                return;
             }
             Err(error) => {
-                if saw_finish {
+                if saw_finish && matches!(error, SseError::Timeout(_, SseErrorEvent::Eof)) {
                     // Retry-disabled streams report EOF as a terminal error,
                     // even when the completion already had its finish reason.
                     return;

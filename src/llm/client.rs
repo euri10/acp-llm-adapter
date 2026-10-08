@@ -83,7 +83,8 @@ impl ChatClient {
 /// Fetch model IDs and positive `context_window` metadata from `GET /models`.
 ///
 /// `preferred_default` is placed first in the returned list. On any failure
-/// (transport, auth, parse) the function logs a warning and returns
+/// (transport, auth, parse, or a two-second request deadline including the body)
+/// the function logs a warning and returns
 /// a catalog containing only the default ID so callers can always proceed.
 #[tracing::instrument(name = "model_list_fetch", skip_all, fields(session_id = "none"))]
 pub async fn fetch_available_models(
@@ -98,7 +99,13 @@ pub async fn fetch_available_models(
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let http = HttpClient::new();
 
-    let response = match http.get(&url).bearer_auth(api_key).send().await {
+    let response = match http
+        .get(&url)
+        .bearer_auth(api_key)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
         Ok(resp) => resp,
         Err(err) => {
             tracing::warn!(
