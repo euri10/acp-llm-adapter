@@ -41,6 +41,12 @@ pub(super) async fn run_stream_attempt(
                 match parse_chat_completion_chunk(data) {
                     Ok(updates) => {
                         for update in updates {
+                            if saw_finish && !matches!(update, StreamEvent::Usage(_)) {
+                                let _ = tx.send(Err(ChatError::InvalidResponse(
+                                    "generation event received after a finish reason".to_string(),
+                                )));
+                                return;
+                            }
                             if matches!(update, StreamEvent::Finished(_)) {
                                 saw_finish = true;
                             }

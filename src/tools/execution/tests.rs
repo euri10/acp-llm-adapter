@@ -1483,9 +1483,12 @@ fn read_file_client_error_with_non_utf8_message() {
 
 #[test_log::test(tokio::test)]
 async fn write_file_to_client_propagates_error() -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("write-err");
+    let store = test_store();
+    let session_id =
+        handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?.session_id;
     let result = write_file_to_client(
         &FailingWriteRequester,
+        &store,
         &session_id.0,
         &confined_test_path(std::path::Path::new("/tmp/note.txt"))?,
         "content",

@@ -346,6 +346,12 @@ pub(crate) async fn request_tool_permission(
     if cancellation.is_cancelled() {
         return Ok(PermissionDecision::Cancelled);
     }
+    if !store
+        .session_behavior(&context.session_id)?
+        .allows_tool_kind(kind)
+    {
+        return Ok(PermissionDecision::RejectOnce);
+    }
     if store.is_always_rejected(&context.session_id, call.name())? {
         return Ok(PermissionDecision::RejectAlways);
     }
@@ -382,6 +388,14 @@ pub(crate) async fn request_tool_permission(
     // neither authorize this call nor change remembered permission decisions.
     if cancellation.is_cancelled() {
         return Ok(PermissionDecision::Cancelled);
+    }
+    // A mode change while approval was pending can revoke this operation.
+    // Such a reply must not authorize work or become a remembered approval.
+    if !store
+        .session_behavior(&context.session_id)?
+        .allows_tool_kind(kind)
+    {
+        return Ok(PermissionDecision::RejectOnce);
     }
     let decision = match response.outcome {
         RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,

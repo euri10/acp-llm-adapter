@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 enum FirstReply {
     Drop(String),
     Pending {
+        prefix: String,
         started: Arc<Notify>,
         closed: Arc<Notify>,
     },
@@ -72,10 +73,10 @@ async fn replay_provider(
                 FirstReply::Drop(body) => (
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")], body
                 ).into_response(),
-                FirstReply::Pending { started, closed } => {
+                FirstReply::Pending { prefix, started, closed } => {
                     let closed = StreamClosed(closed);
-                    let body = stream::once(async {
-                        Ok::<_, std::io::Error>("retry: 10\n\n")
+                    let body = stream::once(async move {
+                        Ok::<_, std::io::Error>(prefix)
                     }).chain(stream::pending()).map(move |part| {
                         let _keep_until_stream_drop = &closed;
                         part
@@ -308,6 +309,7 @@ async fn selected_content_deadline_and_cancel_cannot_resend() -> Result<(), Box<
         let closed = Arc::new(Notify::new());
         let (url, posts, mut server) = replay_provider(
             FirstReply::Pending {
+                prefix: "retry: 10\n\n".into(),
                 started: Arc::clone(&started),
                 closed: Arc::clone(&closed),
             },
@@ -402,6 +404,107 @@ async fn selected_content_redirect_cannot_send_a_second_post() -> Result<(), Box
 }
 
 #[test_log::test(tokio::test)]
+async fn cancelling_fragmented_tool_stream_returns_cancelled_and_recovers()
+-> Result<(), Box<dyn Error>> {
+    for fragment in [
+        json!({"index":0,"id":"partial-call"}),
+        json!({"index":0,"function":{"name":"run_command"}}),
+        json!({"index":0,"id":"partial-call","function":{"name":"run_command","arguments":"{"}}),
+    ] {
+        let closed = Arc::new(Notify::new());
+        let call = json!({"choices":[{"delta":{"tool_calls":[fragment]}}]});
+        // This later text chunk proves the tool delta was consumed before cancellation.
+        let ready = json!({"choices":[{"delta":{"content":"fragment received"}}]});
+        let (url, posts, mut server) = replay_provider(
+            FirstReply::Pending {
+                prefix: format!("data: {call}\n\ndata: {ready}\n\n"),
+                started: Arc::new(Notify::new()),
+                closed: Arc::clone(&closed),
+            },
+            true,
+        )
+        .await?;
+        let state_dir =
+            std::env::temp_dir().join(format!("acp-cancel-fragment-{}", uuid::Uuid::new_v4()));
+        let mut serve = Serve::start_with(
+            serve_command(&url, &state_dir),
+            json!({"cwd":"/tmp","mcpServers":[]}),
+        )
+        .await?;
+        let prompt = serve.start_prompt("cancel the partial tool").await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while serve.updates("agent_message_chunk").is_empty() {
+                let result = serve
+                    .pump(Duration::from_millis(20), Some(prompt), || false)
+                    .await?;
+                assert!(
+                    matches!(result, Stopped::Timeout),
+                    "stream ended before cancellation: {result:?}"
+                );
+            }
+            Ok::<_, Box<dyn Error>>(())
+        })
+        .await??;
+        serve
+            .notify("session/cancel", &json!({"sessionId":serve.session_id()}))
+            .await?;
+        let result = serve
+            .pump(Duration::from_secs(3), Some(prompt), || false)
+            .await?;
+        let Stopped::Response(response) = result else {
+            return Err(format!("cancellation did not complete: {result:?}").into());
+        };
+        assert_eq!(
+            response.pointer("/result/stopReason"),
+            Some(&json!("cancelled")),
+            "{response}"
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert!(
+            serve
+                .position_of_method("session/request_permission")
+                .is_none()
+        );
+        assert!(serve.updates("tool_call").is_empty());
+        assert!(serve.updates("usage_update").is_empty());
+        assert_eq!(serve.updates("agent_message_chunk").len(), 1);
+        tokio::time::timeout(Duration::from_secs(3), closed.notified()).await?;
+        let history_path = state_dir
+            .join("acp-llm-adapter/sessions")
+            .join(serve.session_id())
+            .join("history.jsonl");
+        let history = std::fs::read_to_string(&history_path)?;
+        let entries = history
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries.first().and_then(|entry| entry.get("role")),
+            Some(&json!("user"))
+        );
+        let recovered = serve
+            .request(
+                "session/prompt",
+                &json!({"sessionId":serve.session_id(),
+            "prompt":[{"type":"text","text":"hello again"}]}),
+            )
+            .await?;
+        assert_eq!(
+            recovered.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        assert!(!std::fs::read_to_string(history_path)?.contains("partial-call"));
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+        server.shutdown().await;
+        std::fs::remove_dir_all(state_dir)?;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn cancelling_or_dropping_a_client_stream_closes_its_pending_http_response()
 -> Result<(), Box<dyn Error>> {
     for cancel in [false, true] {
@@ -409,6 +512,7 @@ async fn cancelling_or_dropping_a_client_stream_closes_its_pending_http_response
         let closed = Arc::new(Notify::new());
         let (url, posts, mut server) = replay_provider(
             FirstReply::Pending {
+                prefix: "retry: 10\n\n".into(),
                 started: Arc::clone(&started),
                 closed: Arc::clone(&closed),
             },
@@ -492,9 +596,25 @@ fn oversized_tool_completion() -> String {
 #[test_log::test(tokio::test)]
 async fn oversized_tool_delta_cannot_authorize_write_or_commit_history()
 -> Result<(), Box<dyn Error>> {
+    assert_corrupt_tool_completion_is_rejected(oversized_tool_completion()).await
+}
+
+#[test_log::test(tokio::test)]
+async fn post_finish_tool_cannot_authorize_write_or_commit_history() -> Result<(), Box<dyn Error>> {
+    let finish = json!({"choices":[{"delta":{"content":"finished"},"finish_reason":"stop"}]});
+    let late_tool = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"write-1",
+        "function":{"name":"write_file","arguments":"{\"path\":\"proof.txt\",\"content\":\"too late\"}"}}]},
+        "finish_reason":"tool_calls"}]});
+    assert_corrupt_tool_completion_is_rejected(format!(
+        "data: {finish}\n\ndata: {late_tool}\n\ndata: [DONE]\n\n"
+    ))
+    .await
+}
+
+async fn assert_corrupt_tool_completion_is_rejected(body: String) -> Result<(), Box<dyn Error>> {
     for mode in ["ask", "yolo"] {
         let (url, posts, mut server) =
-            replay_provider(FirstReply::Drop(oversized_tool_completion()), true).await?;
+            replay_provider(FirstReply::Drop(body.clone()), true).await?;
         let state_dir =
             std::env::temp_dir().join(format!("acp-stream-integrity-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&state_dir)?;
@@ -518,11 +638,11 @@ async fn oversized_tool_delta_cannot_authorize_write_or_commit_history()
             .await?;
         assert!(
             !state_dir.join("proof.txt").exists(),
-            "a discarded argument delta allowed a corrupted file write in {mode} mode"
+            "a corrupt completion allowed a file write in {mode} mode"
         );
         assert!(
             response.get("error").is_some(),
-            "lost data succeeded: {response}"
+            "a corrupt completion succeeded: {response}"
         );
         assert!(
             serve
@@ -575,6 +695,44 @@ async fn oversized_tool_delta_cannot_authorize_write_or_commit_history()
         serve.disconnect();
         assert!(serve.wait(Duration::from_secs(5)).await?.success());
         server.shutdown().await;
+        std::fs::remove_dir_all(state_dir)?;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn selected_content_post_finish_output_fails_without_replay() -> Result<(), Box<dyn Error>> {
+    let finish = json!({"choices":[{"delta":{"content":"finished"},"finish_reason":"stop"}]});
+    let late = json!({"choices":[{"delta":{"content":"too late"}}]});
+    let body = format!("data: {finish}\n\ndata: {late}\n\ndata: [DONE]\n\n");
+    let (url, posts, mut server) = replay_provider(FirstReply::Drop(body), true).await?;
+    let state_dir = std::env::temp_dir().join(format!("acp-post-finish-{}", uuid::Uuid::new_v4()));
+    let mut serve =
+        Serve::start_with(serve_command(&url, &state_dir), selected_session(4000)).await?;
+    let response = serve
+        .request(
+            "session/prompt",
+            &json!({"sessionId":serve.session_id(),
+            "prompt":[{"type":"text","text":"private selected snapshot"}]}),
+        )
+        .await?;
+    assert!(response.get("error").is_some(), "late output succeeded");
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let text: Vec<_> = serve
+        .updates("agent_message_chunk")
+        .into_iter()
+        .filter_map(|update| update.pointer("/content/text").and_then(Value::as_str))
+        .collect();
+    assert_eq!(text, ["finished"], "post-finish output reached the editor");
+    let persisted = state_dir
+        .join("acp-llm-adapter/sessions")
+        .join(serve.session_id());
+    assert!(!persisted.join("history.jsonl").exists());
+    assert!(!persisted.join("meta.json").exists());
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    server.shutdown().await;
+    if state_dir.exists() {
         std::fs::remove_dir_all(state_dir)?;
     }
     Ok(())

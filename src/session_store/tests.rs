@@ -21,6 +21,107 @@ fn idle_record(cwd: &str) -> Result<crate::session::SessionRecord, Box<dyn std::
 }
 
 #[test_log::test]
+fn acknowledged_settings_persist_without_another_prompt() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = std::env::temp_dir().join(format!("acp-idle-settings-{}", Uuid::new_v4()));
+    let persistence = FilesystemSessionStore::new(&root);
+    let store = crate::test_store().with_persistence(persistence.clone());
+    let id = "idle-settings";
+    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new(), Vec::new())?;
+    store.set_mode(id, SessionBehavior::Yolo)?;
+    let history = vec![ChatMessage::user("save automatic approval")];
+    store.save_history(id, &history)?;
+
+    store.set_mode(id, SessionBehavior::Plan)?;
+    store.set_model(id, "deepseek-v4-pro".into())?;
+    store.set_reasoning_effort(id, ReasoningEffort::High)?;
+    store.set_max_tokens(id, Some(4096))?;
+    let record = persistence.load_record(id)?;
+    assert_eq!(record.meta.mode, SessionBehavior::Plan);
+    assert_eq!(record.meta.model, "deepseek-v4-pro");
+    assert_eq!(record.meta.reasoning_effort, ReasoningEffort::High);
+    assert_eq!(record.meta.max_tokens, Some(4096));
+    assert_eq!(
+        record.history, history,
+        "settings must not duplicate history"
+    );
+
+    store.set_model(id, "glm-4.6".into())?;
+    store.set_max_tokens(id, None)?;
+    let record = persistence.load_record(id)?;
+    assert_eq!(record.meta.reasoning_effort, ReasoningEffort::Default);
+    assert_eq!(record.meta.max_tokens, None);
+    store.save_history(id, &history)?;
+    assert_eq!(
+        persistence.load_record(id)?.meta,
+        record.meta,
+        "a later history save must retain the acknowledged settings"
+    );
+    assert!(store.delete_session(id)?);
+    assert!(store.set_mode(id, SessionBehavior::Yolo).is_err());
+    assert!(
+        !root.join("sessions").join(id).exists(),
+        "late settings must not recreate a deleted session"
+    );
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test_log::test]
+fn failed_settings_save_preserves_memory_and_disk() -> Result<(), Box<dyn std::error::Error>> {
+    let root = std::env::temp_dir().join(format!("acp-failed-settings-{}", Uuid::new_v4()));
+    let persistence = FilesystemSessionStore::new(&root);
+    let store = crate::test_store().with_persistence(persistence.clone());
+    let id = "failed-settings";
+    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new(), Vec::new())?;
+    store.save_history(id, &[ChatMessage::user("persist original")])?;
+    let original = persistence.load_record(id)?;
+    // A directory at the atomic-write staging path reliably rejects a save,
+    // including when the tests run as a privileged filesystem user.
+    std::fs::create_dir(root.join("sessions").join(id).join("meta.json.tmp"))?;
+    assert!(store.set_mode(id, SessionBehavior::Plan).is_err());
+    assert!(store.set_model(id, "deepseek-v4-pro".into()).is_err());
+    assert!(
+        store
+            .set_reasoning_effort(id, ReasoningEffort::Default)
+            .is_err()
+    );
+    assert!(store.set_max_tokens(id, Some(4096)).is_err());
+    store.with_session(id, |session| {
+        assert_eq!(session.mode, original.meta.mode);
+        assert_eq!(session.model, original.meta.model);
+        assert_eq!(session.reasoning_effort, original.meta.reasoning_effort);
+        assert_eq!(session.max_tokens, original.meta.max_tokens);
+        Ok(())
+    })?;
+    assert_eq!(persistence.load_record(id)?, original);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test_log::test]
+fn selected_content_settings_remain_ephemeral() -> Result<(), Box<dyn std::error::Error>> {
+    let root = std::env::temp_dir().join(format!("acp-helper-settings-{}", Uuid::new_v4()));
+    let store = crate::test_store().with_persistence(FilesystemSessionStore::new(&root));
+    let mut record = idle_record("/tmp")?;
+    record.selected_content = Some(crate::selected_content::Limits {
+        version: 1,
+        input_bytes: 1024,
+        output_bytes: 1024,
+        max_tokens: 64,
+        timeout_ms: 1000,
+    });
+    let id = "ephemeral-settings";
+    store.insert_session_with_resources(id.into(), record, Vec::new(), Vec::new())?;
+    store.set_mode(id, SessionBehavior::Yolo)?;
+    store.set_model(id, "deepseek-v4-pro".into())?;
+    store.set_reasoning_effort(id, ReasoningEffort::High)?;
+    store.set_max_tokens(id, None)?;
+    assert!(!root.exists(), "helper settings created persistent state");
+    Ok(())
+}
+
+#[test_log::test]
 fn session_publication_preserves_active_turn_and_resources()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = crate::test_store();

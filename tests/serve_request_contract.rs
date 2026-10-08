@@ -177,6 +177,71 @@ async fn prompt(serve: &mut Serve, session: &str, text: &str) -> Result<(), Box<
 }
 
 #[test_log::test(tokio::test)]
+async fn idle_settings_storage_failure_preserves_acknowledged_options() -> Result<(), Box<dyn Error>>
+{
+    let mut fixture = Fixture::new().await?;
+    let mut serve = fixture.start(false, "openai/gpt-oss-120b").await?;
+    let session = serve.session_id().to_owned();
+    prompt(&mut serve, &session, "persist original settings").await?;
+    fixture.request().await?;
+    let blocked_path = fixture
+        .root
+        .join("acp-llm-adapter/sessions")
+        .join(&session)
+        .join("meta.json.tmp");
+    std::fs::create_dir(&blocked_path)?;
+    let response = serve
+        .request(
+            "session/set_mode",
+            &json!({"sessionId":session,"modeId":"plan"}),
+        )
+        .await?;
+    assert_eq!(
+        response.pointer("/error/data"),
+        Some(&json!("session storage failed"))
+    );
+    for (id, value) in [
+        ("mode", "yolo"),
+        ("model", "openai/gpt-oss-20b"),
+        ("reasoning_effort", "high"),
+        ("max_tokens", "4096"),
+    ] {
+        let response = set_config(&mut serve, &session, id, value).await?;
+        assert_eq!(
+            response.pointer("/error/data"),
+            Some(&json!("session storage failed")),
+            "{response}"
+        );
+    }
+    std::fs::remove_dir(blocked_path)?;
+    let response = set_config(&mut serve, &session, "max_tokens", "default").await?;
+    let options = response
+        .pointer("/result/configOptions")
+        .and_then(Value::as_array)
+        .ok_or("missing options")?;
+    for (id, expected) in [
+        ("mode", "ask"),
+        ("model", "openai/gpt-oss-120b"),
+        ("reasoning_effort", "default"),
+        ("max_tokens", "default"),
+    ] {
+        let option = options
+            .iter()
+            .find(|option| option.get("id") == Some(&json!(id)))
+            .ok_or("missing option")?;
+        assert_eq!(option.get("currentValue"), Some(&json!(expected)));
+    }
+    prompt(&mut serve, &session, "usable after storage recovery").await?;
+    let request = fixture.request().await?;
+    assert_eq!(request.get("model"), Some(&json!("openai/gpt-oss-120b")));
+    assert!(request.get("reasoning_effort").is_none());
+    assert!(request.get("max_tokens").is_none());
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn oversized_current_prompt_is_rejected_without_provider_work_and_session_recovers()
 -> Result<(), Box<dyn Error>> {
     let mut fixture = Fixture::new().await?;
@@ -747,6 +812,85 @@ async fn restored_effort_is_validated_before_options_and_provider_requests()
             serve.disconnect();
             assert!(serve.wait(Duration::from_secs(5)).await?.success());
         }
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn idle_settings_survive_close_and_process_restart_without_a_followup_prompt()
+-> Result<(), Box<dyn Error>> {
+    for restore_method in ["session/load", "session/resume"] {
+        let mut fixture = Fixture::new().await?;
+        let mut serve = fixture.start(false, "openai/gpt-oss-120b").await?;
+        let session = serve.session_id().to_owned();
+        set_config(&mut serve, &session, "mode", "yolo").await?;
+        prompt(&mut serve, &session, "save automatic approval").await?;
+        fixture.request().await?;
+        let response = if restore_method == "session/load" {
+            serve
+                .request(
+                    "session/set_mode",
+                    &json!({"sessionId":session,"modeId":"plan"}),
+                )
+                .await?
+        } else {
+            set_config(&mut serve, &session, "mode", "plan").await?
+        };
+        assert!(response.get("result").is_some(), "{response}");
+        for (option, value) in [
+            ("model", "openai/gpt-oss-20b"),
+            ("reasoning_effort", "high"),
+            ("max_tokens", "4096"),
+        ] {
+            let response = set_config(&mut serve, &session, option, value).await?;
+            assert!(response.get("result").is_some(), "{response}");
+        }
+        let closed = serve
+            .request("session/close", &json!({"sessionId":session}))
+            .await?;
+        assert!(closed.get("result").is_some(), "{closed}");
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+
+        let mut serve = fixture.start(false, "openai/gpt-oss-120b").await?;
+        let response = serve
+            .request(
+                restore_method,
+                &json!({"sessionId":session,"cwd":fixture.root,"mcpServers":[]}),
+            )
+            .await?;
+        assert_eq!(
+            response.pointer("/result/modes/currentModeId"),
+            Some(&json!("plan")),
+            "{response}"
+        );
+        let options = response
+            .pointer("/result/configOptions")
+            .and_then(Value::as_array)
+            .ok_or("missing restored settings")?;
+        for (id, expected) in [
+            ("model", "openai/gpt-oss-20b"),
+            ("reasoning_effort", "high"),
+            ("max_tokens", "4096"),
+        ] {
+            let option = options
+                .iter()
+                .find(|option| option.get("id") == Some(&json!(id)))
+                .ok_or("missing restored option")?;
+            assert_eq!(
+                option.get("currentValue"),
+                Some(&json!(expected)),
+                "{restore_method}: {id}"
+            );
+        }
+        prompt(&mut serve, &session, "use restored settings").await?;
+        let request = fixture.request().await?;
+        assert_eq!(request.get("model"), Some(&json!("openai/gpt-oss-20b")));
+        assert_eq!(request.get("reasoning_effort"), Some(&json!("high")));
+        assert_eq!(request.get("max_tokens"), Some(&json!(4096)));
+        assert_instruction(&request, true)?;
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
     }
     Ok(())
 }

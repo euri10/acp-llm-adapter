@@ -31,7 +31,9 @@ owned stream and cancels its token, with no extra task. Cancellation establishes
 neither upstream billing nor refunds. No usage event means unknown usage.
 Helpers persist neither raw history nor source-derived titles and cannot be
 restored as ordinary persisted Sessions. Explicit protocol logging uses the
-existing logging/redaction policy.
+existing logging/redaction policy. When logging is enabled, `session/new._meta`
+includes `logJsonlPath` alongside the acknowledged limits, and `session/list`
+includes the same log path. Neither response advertises helper `historyJsonlPath`.
 
 Editors own Provider disclosure authority, qualification, the whole-job/parent
 allowance, answer/reference validation and adapter-process disposal. This is

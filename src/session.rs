@@ -425,7 +425,6 @@ pub(crate) struct TurnSetup {
     pub(crate) selected_content: Option<crate::selected_content::Limits>,
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) tool_context: ToolContext,
-    pub(crate) behavior: SessionBehavior,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
     pub(crate) max_tokens: Option<u32>,
