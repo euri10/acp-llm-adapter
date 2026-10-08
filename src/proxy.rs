@@ -19,11 +19,10 @@
 //! into `tee` without `pipefail`, so a crashed agent reported a clean exit.
 //! Both are fixed here.
 
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -40,11 +39,6 @@ pub const KIND_STDERR: &str = "stderr";
 pub const KIND_EXIT: &str = "exit";
 /// Record kind describing how the proxy was invoked.
 pub const KIND_LAUNCH: &str = "launch";
-
-/// ACP method that creates a session.
-const METHOD_SESSION_NEW: &str = "session/new";
-/// ACP method that reopens an existing session.
-const METHOD_SESSION_LOAD: &str = "session/load";
 
 /// Default number of records that may be queued before records are dropped.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 4096;
@@ -181,31 +175,24 @@ async fn pump_child(
         .take()
         .ok_or(ProxyError::MissingStream("stderr"))?;
 
-    // One tracker spans both frame directions: a session/new response carries
-    // no method name, so it can only be attributed by correlating it with the
-    // request that went the other way.
-    let tracker = SessionTracker::new(connection.clone());
-
     // Client to agent. This one may never finish on its own — a client can hold
     // stdin open for the life of the session — so it is not awaited below.
     let mut upstream = tokio::spawn({
-        let tracker = tracker.clone();
         pump(
             tokio::io::stdin(),
             child_stdin,
             connection.clone(),
-            move |line| tracker.record_for_frame(Direction::ClientToAgent, line),
+            |line| record_for(Direction::ClientToAgent, KIND_FRAME, line),
         )
     });
 
     // Descendants can inherit these pipes; reclaim them before draining EOF.
     let mut downstream = tokio::spawn({
-        let tracker = tracker.clone();
         pump(
             child_stdout,
             tokio::io::stdout(),
             connection.clone(),
-            move |line| tracker.record_for_frame(Direction::AgentToClient, line),
+            |line| record_for(Direction::AgentToClient, KIND_FRAME, line),
         )
     });
     let mut diagnostics = tokio::spawn(pump(
@@ -275,13 +262,13 @@ where
         }
         let chunk = buffer.get(..read).unwrap_or_default();
 
-        // Forwarding happens first and verbatim; logging observes a copy.
-        writer.write_all(chunk).await?;
-        writer.flush().await?;
-
+        // Attribute requests before forwarding: the other peer may reply as
+        // soon as it reads them. The original bytes still pass through verbatim.
         for line in splitter.push(chunk) {
             log.log(make_record(&line));
         }
+        writer.write_all(chunk).await?;
+        writer.flush().await?;
     }
 
     if let Some(tail) = splitter.finish() {
@@ -319,147 +306,6 @@ fn exit_code(status: ExitStatus) -> i32 {
     }
 
     1
-}
-
-/// Watches frames for the session ids that name log files.
-///
-/// Shared by both frame directions: a JSON-RPC response carries no method
-/// name, so a `session/new` result is only recognisable by correlating it with
-/// the request id that went the other way.
-#[derive(Debug, Clone)]
-struct SessionTracker {
-    sniffer: Arc<Mutex<SessionSniffer>>,
-    connection: ConnectionLog,
-}
-
-impl SessionTracker {
-    fn new(connection: ConnectionLog) -> Self {
-        Self {
-            sniffer: Arc::new(Mutex::new(SessionSniffer::default())),
-            connection,
-        }
-    }
-
-    /// Build the record for one frame line, attributing it to a session.
-    ///
-    /// Parsing happens on a copy of the stream; the forwarded bytes have
-    /// already been written by the time this runs.
-    fn record_for_frame(&self, direction: Direction, line: &[u8]) -> LogRecord {
-        let mut record = record_for(direction, KIND_FRAME, line);
-
-        // A line that is not JSON is still worth logging, it just tells us
-        // nothing about sessions.
-        let sniffed = {
-            let mut sniffer = self
-                .sniffer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            sniffer.observe(direction, &record.payload)
-        };
-
-        if let Some(established) = sniffed.established.as_deref() {
-            // A malformed id is rejected here rather than reaching the
-            // filesystem; the frame itself is still logged.
-            if let Err(error) = self.connection.bind_session(established) {
-                tracing::warn!(%error, "wrapped agent returned an unusable session id");
-            }
-        }
-        if let Some(session_id) = sniffed.session_id {
-            record.session_id = Some(session_id);
-        }
-
-        record
-    }
-}
-
-/// What observing one frame revealed.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Sniffed {
-    /// Session this particular frame belongs to.
-    session_id: Option<String>,
-    /// A session that has just come into existence.
-    established: Option<String>,
-}
-
-/// Correlates JSON-RPC traffic well enough to attribute frames to sessions.
-#[derive(Debug, Default)]
-struct SessionSniffer {
-    /// Request ids of in-flight `session/new` calls.
-    pending_new: HashSet<String>,
-}
-
-impl SessionSniffer {
-    fn observe(&mut self, direction: Direction, frame: &serde_json::Value) -> Sniffed {
-        match direction {
-            Direction::ClientToAgent => self.observe_request(frame),
-            Direction::AgentToClient => self.observe_response(frame),
-            Direction::Internal => Sniffed::default(),
-        }
-    }
-
-    /// Client to agent: note session creations, and read explicit ids.
-    fn observe_request(&mut self, frame: &serde_json::Value) -> Sniffed {
-        let method = frame.get("method").and_then(serde_json::Value::as_str);
-        let explicit = params_session_id(frame);
-
-        if method == Some(METHOD_SESSION_NEW)
-            && let Some(id) = request_id(frame)
-        {
-            self.pending_new.insert(id);
-        }
-
-        Sniffed {
-            // Loading a session names it up front, so it binds without waiting
-            // for a response.
-            established: if method == Some(METHOD_SESSION_LOAD) {
-                explicit.clone()
-            } else {
-                None
-            },
-            session_id: explicit,
-        }
-    }
-
-    /// Agent to client: match a pending `session/new`, else read explicit ids.
-    fn observe_response(&mut self, frame: &serde_json::Value) -> Sniffed {
-        if let Some(id) = request_id(frame)
-            && self.pending_new.remove(&id)
-        {
-            let created = frame
-                .get("result")
-                .and_then(|result| result.get("sessionId"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-
-            return Sniffed {
-                session_id: created.clone(),
-                established: created,
-            };
-        }
-
-        Sniffed {
-            session_id: params_session_id(frame),
-            established: None,
-        }
-    }
-}
-
-/// Read a JSON-RPC request id as a string, whatever its wire type.
-fn request_id(frame: &serde_json::Value) -> Option<String> {
-    match frame.get("id")? {
-        serde_json::Value::String(id) => Some(id.clone()),
-        serde_json::Value::Number(id) => Some(id.to_string()),
-        _ => None,
-    }
-}
-
-/// Read `params.sessionId`, which session-scoped calls and notifications carry.
-fn params_session_id(frame: &serde_json::Value) -> Option<String> {
-    frame
-        .get("params")?
-        .get("sessionId")?
-        .as_str()
-        .map(str::to_string)
 }
 
 /// Splits a byte stream into newline-terminated lines across read boundaries.

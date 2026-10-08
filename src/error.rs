@@ -143,6 +143,7 @@ fn validation_message(detail: &str, fallback: &'static str) -> &'static str {
         "unsupported embedded resource prompt block",
         "only text, resource link, and text resource prompt blocks are supported",
         "prompt must include non-empty text",
+        "current prompt exceeds request size limit",
         "session/load requires filesystem persistence",
         "selected-content prompts require text snapshots",
         "selected-content deadline exceeded",

@@ -255,8 +255,10 @@ impl TerminalRequester for FakeTerminalRequester {
 
 #[derive(Clone, Default)]
 pub(crate) struct CancelTracker {
+    pub(crate) creates: Arc<AtomicUsize>,
     pub(crate) kills: Arc<AtomicUsize>,
     pub(crate) releases: Arc<AtomicUsize>,
+    pub(crate) cancel_on_wait: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl TerminalRequester for CancelTracker {
@@ -264,7 +266,10 @@ impl TerminalRequester for CancelTracker {
         &self,
         _request: CreateTerminalRequest,
     ) -> BoxFuture<'_, Result<CreateTerminalResponse, agent_client_protocol::Error>> {
-        Box::pin(async move { Ok(CreateTerminalResponse::new(TerminalId::new("term-cancel"))) })
+        Box::pin(async move {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok(CreateTerminalResponse::new(TerminalId::new("term-cancel")))
+        })
     }
 
     fn terminal_output(
@@ -278,7 +283,12 @@ impl TerminalRequester for CancelTracker {
         &self,
         _request: WaitForTerminalExitRequest,
     ) -> BoxFuture<'_, Result<WaitForTerminalExitResponse, agent_client_protocol::Error>> {
-        Box::pin(std::future::pending())
+        Box::pin(async move {
+            if let Some(token) = &self.cancel_on_wait {
+                token.cancel();
+            }
+            std::future::pending().await
+        })
     }
 
     fn release_terminal(

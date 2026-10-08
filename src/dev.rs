@@ -8,7 +8,6 @@
 #![allow(clippy::print_stdout)]
 
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use acp_llm_adapter::llm::{
@@ -23,14 +22,29 @@ use agent_client_protocol::schema::v1::{
     StopReason,
 };
 use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{AcpAgent, Client, ConnectTo, SessionMessage};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo, SessionMessage};
 use clap::ValueEnum;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::{PermissionRequester, handle_new_session_request};
-use crate::session::{AdapterState, PermissionDecision, SessionStore, request_tool_permission};
+use crate::session::PermissionDecision;
+use crate::session_store::{AdapterState, SessionStore};
+/// Return the model the adapter should default to at startup.
+///
+/// Checks `LLM_MODEL` first, then falls back to `fallback_model`.
+pub(crate) fn initial_model(fallback_model: impl Into<String>) -> String {
+    if let Ok(value) = std::env::var(ChatConfig::ENV_MODEL) {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    fallback_model.into()
+}
+
+use crate::request_tool_permission;
 use crate::tools::ToolContext;
 
 /// Provider backend selection.
@@ -155,28 +169,8 @@ fn trimmed_env(key: &str) -> Option<String> {
 }
 
 /// Build a dev agent pointing back at this adapter executable.
-///
-/// # Errors
-///
-/// Returns an ACP error if the agent config cannot be parsed.
-pub(crate) fn build_dev_agent(
-    executable: &Path,
-    backend: Backend,
-) -> Result<AcpAgent, agent_client_protocol::Error> {
-    let command = executable.to_string_lossy();
-    let agent_config = serde_json::json!({
-        "type": "stdio",
-        "name": "acp-llm-adapter-dev",
-        "command": command,
-        "args": [
-            "serve",
-            "--backend",
-            backend.as_str(),
-        ],
-        "env": [],
-    });
-
-    AcpAgent::from_str(&agent_config.to_string())
+pub(crate) fn build_dev_agent(executable: &Path, backend: Backend) -> AcpAgent {
+    AcpAgent::new(AcpAgentConfig::new(executable).args(["serve", "--backend", backend.as_str()]))
 }
 
 /// Run a smoke test end-to-end: init → new session → prompt → stop reason.
@@ -212,16 +206,8 @@ pub(crate) async fn run_smoke_flow(
                 .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
                 .block_task()
                 .await?;
-            let new_session_response = cx
-                .send_request(NewSessionRequest::new(std::env::current_dir().map_err(
-                    |error| {
-                        agent_client_protocol::Error::internal_error()
-                            .data(format!("failed to get current directory: {error}"))
-                    },
-                )?))
-                .block_task()
-                .await?;
-            let mut session = cx.attach_session(new_session_response.clone(), Vec::new())?;
+            let mut session = cx.build_session_cwd()?.block_task().start_session().await?;
+            let new_session_response = session.response();
             session.send_prompt(prompt.as_str())?;
 
             let mut updates = Vec::new();
@@ -411,7 +397,7 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
     let store = SessionStore::new(Arc::new(std::sync::Mutex::new(AdapterState::default())));
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::env::current_dir().map_err(|error| {
             agent_client_protocol::Error::internal_error()
                 .data(format!("failed to get current directory: {error}"))
@@ -428,8 +414,9 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
         &store,
         &context,
         &call,
-        agent_client_protocol::schema::v1::ToolKind::Edit,
+        crate::tools::ToolKind::Edit,
         &MockPermissionRequester,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await?;
 
@@ -438,7 +425,7 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
             .data("permission gate smoke check did not allow always"));
     }
 
-    if !store.is_always_allowed(&session.session_id, "write_file")? {
+    if !store.is_always_allowed(&session.session_id.0, "write_file")? {
         return Err(agent_client_protocol::Error::internal_error()
             .data("permission gate smoke check did not cache allow_always"));
     }
@@ -468,39 +455,29 @@ mod tests {
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
-        McpServer, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
-        RequestPermissionRequest, SessionId, StopReason, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields, ToolKind,
+        PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+        SessionId, StopReason, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
     use futures_util::StreamExt;
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
 
-    fn test_store() -> crate::session::SessionStore {
-        crate::session::SessionStore::new(Arc::new(Mutex::new(
-            crate::session::AdapterState::default(),
+    fn test_store() -> crate::session_store::SessionStore {
+        crate::session_store::SessionStore::new(Arc::new(Mutex::new(
+            crate::session_store::AdapterState::default(),
         )))
     }
 
     #[test_log::test]
-    fn build_dev_agent_uses_backend_and_executable_path() -> Result<(), agent_client_protocol::Error>
-    {
-        let agent = build_dev_agent(std::path::Path::new("/tmp/acp-llm-adapter"), Backend::Mock)?;
-
-        let McpServer::Stdio(stdio) = agent.server() else {
-            return Err(
-                agent_client_protocol::Error::internal_error().data("expected stdio transport")
-            );
-        };
+    fn build_dev_agent_uses_backend_and_executable_path() {
+        let agent = build_dev_agent(std::path::Path::new("/tmp/acp-llm-adapter"), Backend::Mock);
 
         assert_eq!(
-            stdio.command,
-            std::path::PathBuf::from("/tmp/acp-llm-adapter")
+            agent.config().command(),
+            std::path::Path::new("/tmp/acp-llm-adapter")
         );
-        assert_eq!(stdio.args, vec!["serve", "--backend", "mock"]);
-        assert!(stdio.env.is_empty());
-
-        Ok(())
+        assert_eq!(agent.config().arguments(), ["serve", "--backend", "mock"]);
+        assert!(agent.config().environment().is_empty());
     }
 
     #[test_log::test(tokio::test)]
@@ -795,23 +772,20 @@ mod tests {
     }
 
     #[test_log::test]
-    fn build_dev_agent_uses_deepseek_backend_args() -> Result<(), agent_client_protocol::Error> {
+    fn build_dev_agent_uses_deepseek_backend_args() {
         let agent = build_dev_agent(
             std::path::Path::new("/tmp/acp-llm-adapter"),
             Backend::DeepSeek,
-        )?;
-
-        let McpServer::Stdio(stdio) = agent.server() else {
-            return Err(
-                agent_client_protocol::Error::internal_error().data("expected stdio transport")
-            );
-        };
-        assert_eq!(
-            stdio.command,
-            std::path::PathBuf::from("/tmp/acp-llm-adapter")
         );
-        assert_eq!(stdio.args, vec!["serve", "--backend", "deepseek"]);
-        Ok(())
+
+        assert_eq!(
+            agent.config().command(),
+            std::path::Path::new("/tmp/acp-llm-adapter")
+        );
+        assert_eq!(
+            agent.config().arguments(),
+            ["serve", "--backend", "deepseek"]
+        );
     }
 
     #[test_log::test(tokio::test)]

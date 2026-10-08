@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
-    HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio, ToolKind,
+    HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
@@ -21,6 +21,7 @@ use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 
 use crate::SessionStore;
+use crate::tools::ToolKind;
 use crate::tools::{ToolContext, ToolExecution, require_tool_permission};
 use acp_llm_adapter::error::AdapterError;
 
@@ -110,7 +111,7 @@ pub(crate) async fn mcp_tool_execution(
     let approval = tokio::select! {
         biased;
         () = cancellation.cancelled() => return ToolExecution::failed("MCP tool call cancelled"),
-        result = require_tool_permission(store, context, call, MCP_TOOL_KIND, requester) => result,
+        result = require_tool_permission(store, context, call, MCP_TOOL_KIND, requester, cancellation) => result,
     };
     if let Err(error) = approval {
         return ToolExecution::failed(error);
@@ -307,30 +308,44 @@ pub(crate) async fn connect_mcp_http_session(
     mcp_session_from_service(&server.name, service).await
 }
 
-/// Connect a single SSE MCP server and collect its advertised tools.
+/// Connect a legacy HTTP+SSE MCP server and collect its advertised tools.
 ///
-/// This uses the rmcp streamable HTTP client transport for session startup and
-/// tool RPC, which is compatible with ACP-declared SSE MCP server entries.
+/// Opens the event stream, validates its message endpoint, then uses the MCP
+/// SDK over separate GET/POST channels. Setup and tool discovery are bounded.
 ///
 /// # Errors
 ///
-/// Returns an ACP error when headers are invalid, initialization fails, or tool
-/// discovery fails.
+/// Returns an adapter error for invalid configuration, unsafe endpoints,
+/// initialization/discovery failures, or setup exceeding five seconds.
 pub(crate) async fn connect_mcp_sse_session(
     server: &McpServerSse,
 ) -> Result<McpSession, AdapterError> {
     let custom_headers = mcp_http_headers(&server.headers, &server.name)?;
-    let config = StreamableHttpClientTransportConfig::with_uri(server.url.clone())
-        .custom_headers(custom_headers);
-    let transport = StreamableHttpClientTransport::from_config(config);
-    let service = ().serve(transport).await.map_err(|error| {
-        AdapterError::InvalidParams(format!(
-            "failed to initialize MCP server '{}': {error}",
-            server.name
-        ))
-    })?;
-
-    mcp_session_from_service(&server.name, service).await
+    let setup = async {
+        let transport = sse::SseTransport::connect(&server.url, custom_headers)
+            .await
+            .map_err(|error| {
+                AdapterError::InvalidParams(format!(
+                    "failed to initialize MCP server '{}': {error}",
+                    server.name
+                ))
+            })?;
+        let service = ().serve(transport).await.map_err(|error| {
+            AdapterError::InvalidParams(format!(
+                "failed to initialize MCP server '{}': {error}",
+                server.name
+            ))
+        })?;
+        mcp_session_from_service(&server.name, service).await
+    };
+    tokio::time::timeout(sse::SETUP_LIMIT, setup)
+        .await
+        .map_err(|_| {
+            AdapterError::InvalidParams(format!(
+                "failed to initialize MCP server '{}': setup timed out",
+                server.name
+            ))
+        })?
 }
 
 async fn mcp_session_from_service(
@@ -454,3 +469,5 @@ pub(crate) fn sanitize_tool_name_part(value: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+mod sse;

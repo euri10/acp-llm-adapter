@@ -19,7 +19,7 @@ use agent_client_protocol::schema::v1::{
     SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
     SessionDeleteCapabilities, SessionId, SessionListCapabilities, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent_client_protocol::{Agent, ConnectTo};
@@ -30,13 +30,15 @@ use crate::{
     ADAPTER_NAME, ADAPTER_VERSION, AdapterState, FilesystemSessionStore, McpSession,
     ReasoningEffort, SESSION_CONFIG_MAX_TOKENS_ID, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
     SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, SessionStore,
-    adapter_available_commands, connect_mcp_sessions, default_session_modes,
-    max_tokens_from_value_id, session_modes, session_notification, tool_raw_input,
-    validate_session_model,
+    adapter_available_commands, connect_mcp_sessions, max_tokens_from_value_id,
+    session_notification, tool_raw_input, validate_session_model,
 };
 
 pub(crate) mod requesters;
 pub(crate) use requesters::*;
+pub(crate) mod session_options;
+pub(crate) mod turn_events;
+use session_options::{default_session_modes, session_modes};
 
 #[cfg(test)]
 pub(crate) async fn serve_with_transport_and_state_dir(
@@ -202,23 +204,31 @@ async fn serve_with_transport_impl(
         )
         .on_receive_request(
             async move |request: SetSessionModeRequest, responder, cx| {
+                let store = set_mode_store.clone();
                 let connection = cx.clone();
-                responder.respond(handle_set_session_mode_request_notifying(
-                    &set_mode_store,
-                    &request,
-                    |notification| connection.send_notification(notification),
-                )?)
+                let response = blocking::unblock(move || {
+                    handle_set_session_mode_request_notifying(&store, &request, |notification| {
+                        connection.send_notification(notification)
+                    })
+                })
+                .await;
+                responder.respond_with_result(response)
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: SetSessionConfigOptionRequest, responder, cx| {
+                let store = set_config_store.clone();
                 let connection = cx.clone();
-                responder.respond(handle_set_session_config_option_request_notifying(
-                    &set_config_store,
-                    &request,
-                    |notification| connection.send_notification(notification),
-                )?)
+                let response = blocking::unblock(move || {
+                    handle_set_session_config_option_request_notifying(
+                        &store,
+                        &request,
+                        |notification| connection.send_notification(notification),
+                    )
+                })
+                .await;
+                responder.respond_with_result(response)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -258,11 +268,16 @@ async fn serve_with_transport_impl(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: ListSessionsRequest, responder, _cx| {
-                responder.respond(handle_list_sessions_request(
-                    &list_sessions_store,
-                    &request,
-                )?)
+            async move |request: ListSessionsRequest, responder, cx| {
+                let store = list_sessions_store.clone();
+                cx.spawn(async move {
+                    let response =
+                        blocking::unblock(move || handle_list_sessions_request(&store, &request))
+                            .await;
+                    responder.respond_with_result(response)?;
+                    Ok(())
+                })?;
+                Ok(())
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -276,11 +291,16 @@ async fn serve_with_transport_impl(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: DeleteSessionRequest, responder, _cx| {
-                responder.respond(handle_delete_session_request(
-                    &delete_session_store,
-                    &request,
-                )?)
+            async move |request: DeleteSessionRequest, responder, cx| {
+                let store = delete_session_store.clone();
+                cx.spawn(async move {
+                    let response =
+                        blocking::unblock(move || handle_delete_session_request(&store, &request))
+                            .await;
+                    responder.respond_with_result(response)?;
+                    Ok(())
+                })?;
+                Ok(())
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -292,7 +312,7 @@ async fn serve_with_transport_impl(
         )
         .on_receive_notification(
             async move |notification: CancelNotification, _cx| {
-                cancel_store.cancel_active_turn(&notification.session_id)?;
+                cancel_store.cancel_active_turn(&notification.session_id.0)?;
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -308,7 +328,7 @@ pub(crate) fn handle_initialize_request(
     store: &SessionStore,
     request: InitializeRequest,
 ) -> Result<InitializeResponse, agent_client_protocol::Error> {
-    store.record_client_capabilities(request.client_capabilities)?;
+    store.record_client_capabilities(request.client_capabilities.into())?;
     Ok(build_initialize_response(request.protocol_version))
 }
 
@@ -328,12 +348,27 @@ pub(crate) fn handle_list_sessions_request(
     );
     for session in &sessions {
         tracing::debug!(
-            session_id = %session.session_id.0,
+            session_id = %session.session_id,
             cwd = %session.cwd.display(),
             "session returned"
         );
     }
-    Ok(ListSessionsResponse::new(sessions))
+    Ok(ListSessionsResponse::new(
+        sessions
+            .into_iter()
+            .map(|summary| {
+                let mut info = agent_client_protocol::schema::v1::SessionInfo::new(
+                    summary.session_id,
+                    summary.cwd,
+                )
+                .additional_directories(summary.additional_directories);
+                info.title = summary.title;
+                info.updated_at = summary.updated_at;
+                info.meta = summary.meta;
+                info
+            })
+            .collect(),
+    ))
 }
 
 #[tracing::instrument(skip(store, request), fields(session_id = %request.session_id))]
@@ -341,7 +376,7 @@ pub(crate) fn handle_close_session_request(
     store: &SessionStore,
     request: &CloseSessionRequest,
 ) -> Result<CloseSessionResponse, agent_client_protocol::Error> {
-    let existed = store.remove_session(&request.session_id)?;
+    let existed = store.remove_session(&request.session_id.0)?;
     if !existed {
         return Err(agent_client_protocol::Error::invalid_params().data("unknown session id"));
     }
@@ -354,7 +389,7 @@ pub(crate) fn handle_delete_session_request(
     store: &SessionStore,
     request: &DeleteSessionRequest,
 ) -> Result<DeleteSessionResponse, agent_client_protocol::Error> {
-    let existed = store.delete_session(&request.session_id)?;
+    let existed = store.delete_session(&request.session_id.0)?;
     if !existed {
         return Err(agent_client_protocol::Error::invalid_params().data("unknown session id"));
     }
@@ -404,9 +439,9 @@ pub(crate) async fn handle_load_session_request(
     replay_session_history(&session_id, &history, &mut notify)?;
 
     let mut response = LoadSessionResponse::new()
-        .modes(session_modes(store.session_behavior(&session_id)?))
-        .config_options(store.session_config_options(&session_id)?);
-    if let Some(meta) = store.session_meta(&session_id) {
+        .modes(session_modes(store.session_behavior(&session_id.0)?))
+        .config_options(store.session_config_options(&session_id.0)?);
+    if let Some(meta) = store.session_meta(&session_id.0)? {
         response = response.meta(meta);
     }
     Ok(response)
@@ -422,9 +457,9 @@ pub(crate) async fn handle_resume_session_request(
         restore_persisted_session(store, &request.session_id, &request.cwd).await?;
 
     let mut response = ResumeSessionResponse::new()
-        .modes(session_modes(store.session_behavior(&session_id)?))
-        .config_options(store.session_config_options(&session_id)?);
-    if let Some(meta) = store.session_meta(&session_id) {
+        .modes(session_modes(store.session_behavior(&session_id.0)?))
+        .config_options(store.session_config_options(&session_id.0)?);
+    if let Some(meta) = store.session_meta(&session_id.0)? {
         response = response.meta(meta);
     }
     Ok(response)
@@ -435,19 +470,35 @@ async fn restore_persisted_session(
     requested_session_id: &SessionId,
     cwd: &std::path::Path,
 ) -> Result<(SessionId, Vec<ChatMessage>), agent_client_protocol::Error> {
-    let persisted = store.load_persisted_record(requested_session_id)?;
+    let persisted = {
+        let store = store.clone();
+        let id = requested_session_id.0.to_string();
+        blocking::unblock(move || store.load_persisted_record(&id)).await?
+    };
     if persisted.meta.cwd != cwd {
         return Err(agent_client_protocol::Error::invalid_params()
             .data("session was persisted for cwd different from the requested cwd"));
     }
 
-    let mcp_sessions = connect_mcp_sessions(&persisted.meta.mcp_servers).await?;
+    let servers = persisted
+        .meta
+        .mcp_servers
+        .iter()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AdapterError::from)?;
+    let mcp_sessions = connect_mcp_sessions(&servers).await?;
     let session_id = SessionId::new(persisted.meta.session_id.clone());
     if session_id != *requested_session_id {
         return Err(agent_client_protocol::Error::invalid_params()
             .data("persisted session id does not match requested session id"));
     }
     let history = persisted.history;
+    let reasoning_effort = persisted
+        .meta
+        .reasoning_effort
+        .for_model(&persisted.meta.model);
 
     // Backward compat: old persisted sessions may not have title/updated_at.
     let title = persisted
@@ -462,8 +513,8 @@ async fn restore_persisted_session(
         .clone()
         .unwrap_or_else(crate::iso_timestamp_now);
 
-    store.insert_session(
-        session_id.clone(),
+    store.insert_session_with_resources(
+        session_id.0.to_string(),
         SessionRecord {
             selected_content: None,
             selected_content_used: false,
@@ -473,16 +524,16 @@ async fn restore_persisted_session(
             active_turn: None,
             mode: persisted.meta.mode,
             model: persisted.meta.model,
-            reasoning_effort: persisted.meta.reasoning_effort,
+            reasoning_effort,
             max_tokens: persisted.meta.max_tokens,
             permission_allow_always: HashSet::new(),
             permission_reject_always: HashSet::new(),
-            mcp_servers: persisted.meta.mcp_servers,
-            mcp_sessions,
             title,
             updated_at,
             cost_micros: persisted.meta.cost_micros,
         },
+        persisted.meta.mcp_servers,
+        mcp_sessions,
     )?;
 
     Ok((session_id, history))
@@ -499,8 +550,8 @@ fn insert_session_record(
     let default_model = store.default_model()?;
     let now = crate::iso_timestamp_now();
     let sid: SessionId = session_id.clone().into();
-    store.insert_session(
-        sid.clone(),
+    store.insert_session_with_resources(
+        sid.0.to_string(),
         SessionRecord {
             selected_content,
             selected_content_used: false,
@@ -510,31 +561,37 @@ fn insert_session_record(
             active_turn: None,
             mode: SessionBehavior::Ask,
             model: default_model,
-            reasoning_effort: ReasoningEffort::High,
+            reasoning_effort: ReasoningEffort::Default,
             max_tokens: None,
             permission_allow_always: HashSet::new(),
             permission_reject_always: HashSet::new(),
-            mcp_servers: request.mcp_servers.clone(),
-            mcp_sessions,
             title: String::new(),
             updated_at: now,
             cost_micros: 0,
         },
+        request
+            .mcp_servers
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(AdapterError::from)?,
+        mcp_sessions,
     )?;
 
-    store.lookup_session(&sid)?;
+    store.lookup_session(&sid.0)?;
 
     let mut response = NewSessionResponse::new(session_id)
         .modes(default_session_modes())
-        .config_options(store.session_config_options(&sid)?);
-    if let Some(meta) = store.session_meta(&sid) {
+        .config_options(store.session_config_options(&sid.0)?);
+    if let Some(meta) = store.session_meta(&sid.0)? {
         response = response.meta(meta);
     }
     if let Some(limits) = selected_content {
-        response = response.meta(serde_json::Map::from_iter([(
+        let meta = response.meta.get_or_insert_with(serde_json::Map::new);
+        meta.insert(
             crate::selected_content::META_KEY.to_string(),
             serde_json::to_value(limits).map_err(AdapterError::from)?,
-        )]));
+        );
     }
     Ok(response)
 }
@@ -652,11 +709,11 @@ pub(crate) fn handle_set_session_mode_request_notifying(
     request: &SetSessionModeRequest,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<SetSessionModeResponse, agent_client_protocol::Error> {
-    let Some(mode) = SessionBehavior::from_mode_id(&request.mode_id) else {
+    let Some(mode) = SessionBehavior::from_mode_id_str(&request.mode_id.0) else {
         return Err(agent_client_protocol::Error::invalid_params().data("unsupported session mode"));
     };
 
-    store.set_mode(&request.session_id, mode)?;
+    store.set_mode(&request.session_id.0, mode)?;
     notify(session_notification(
         request.session_id.clone(),
         SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(request.mode_id.clone())),
@@ -683,32 +740,32 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
     match request.config_id.0.as_ref() {
         SESSION_CONFIG_MODE_ID => {
             let mode_id = agent_client_protocol::schema::v1::SessionModeId::new(value.0.clone());
-            let Some(mode) = SessionBehavior::from_mode_id(&mode_id) else {
+            let Some(mode) = SessionBehavior::from_mode_id_str(&mode_id.0) else {
                 return Err(
                     agent_client_protocol::Error::invalid_params().data("unsupported session mode")
                 );
             };
-            store.set_mode(&request.session_id, mode)?;
+            store.set_mode(&request.session_id.0, mode)?;
         }
         SESSION_CONFIG_MODEL_ID => {
             let model = value.0.as_ref();
             let available_models = store.available_models()?;
-            store.with_session(&request.session_id, |session| {
+            store.with_session(&request.session_id.0, |session| {
                 validate_session_model(session, model, &available_models)?;
                 Ok(())
             })?;
-            store.set_model(&request.session_id, model.to_string())?;
+            store.set_model(&request.session_id.0, model.to_string())?;
         }
         SESSION_CONFIG_REASONING_EFFORT_ID => {
-            let Some(effort) = ReasoningEffort::from_value_id(value) else {
+            let Some(effort) = ReasoningEffort::from_value_id(&value.0) else {
                 return Err(agent_client_protocol::Error::invalid_params()
                     .data("unsupported reasoning effort"));
             };
-            store.set_reasoning_effort(&request.session_id, effort)?;
+            store.set_reasoning_effort(&request.session_id.0, effort)?;
         }
         SESSION_CONFIG_MAX_TOKENS_ID => {
-            let max_tokens = max_tokens_from_value_id(value)?;
-            store.set_max_tokens(&request.session_id, max_tokens)?;
+            let max_tokens = max_tokens_from_value_id(&value.0)?;
+            store.set_max_tokens(&request.session_id.0, max_tokens)?;
         }
         _ => {
             return Err(agent_client_protocol::Error::invalid_params()
@@ -716,7 +773,7 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
         }
     }
 
-    let config_options = store.session_config_options(&request.session_id)?;
+    let config_options = store.session_config_options(&request.session_id.0)?;
     notify(session_notification(
         request.session_id.clone(),
         SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options.clone())),
@@ -733,6 +790,35 @@ pub(crate) fn config_value_id(
     })
 }
 
+/// Validate editor content and translate it before admitting a turn.
+pub(crate) fn translate_prompt(
+    request: &PromptRequest,
+    selected: bool,
+) -> Result<crate::turn::PromptInput, AdapterError> {
+    if selected
+        && request
+            .prompt
+            .iter()
+            .any(|block| !matches!(block, ContentBlock::Text(_)))
+    {
+        return Err(AdapterError::InvalidParams(
+            "selected-content prompts require text snapshots".into(),
+        ));
+    }
+    let title = request.prompt.iter().rev().find_map(|block| {
+        if let ContentBlock::Text(text) = block {
+            (!text.text.trim().is_empty()).then(|| text.text.clone())
+        } else {
+            None
+        }
+    });
+    Ok(crate::turn::PromptInput {
+        session_id: request.session_id.0.to_string(),
+        text: crate::text_from_prompt(&request.prompt)?,
+        title,
+    })
+}
+
 pub(crate) async fn handle_prompt_request(
     store: &SessionStore,
     llm_client: &dyn LlmClient,
@@ -740,19 +826,40 @@ pub(crate) async fn handle_prompt_request(
     connection: Option<&dyn ToolCallRequester>,
     request: PromptRequest,
     max_turn_requests: NonZeroUsize,
-    notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+    mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
-    crate::turn::handle_prompt_request(
+    if matches!(request.prompt.as_slice(), [ContentBlock::Text(text)] if text.text.trim() == "/clear")
+        && store
+            .selected_content_limits(&request.session_id.0)?
+            .is_none()
+    {
+        store.clear_history(&request.session_id.0).await?;
+        notify(session_notification(
+            request.session_id,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                "Conversation history cleared.".into(),
+            )),
+        ))?;
+        return Ok(PromptResponse::new(StopReason::EndTurn));
+    }
+    let input = translate_prompt(
+        &request,
+        store
+            .selected_content_limits(&request.session_id.0)?
+            .is_some(),
+    )?;
+    let executor = EditorTools(connection);
+    let result = crate::turn::handle_prompt_request(
         store,
         llm_client,
         tool_registry,
-        connection,
-        request,
+        Some(&executor),
+        input,
         max_turn_requests,
-        notify,
+        |event| turn_events::encode_event(store, &request.session_id, event, &mut notify),
     )
-    .await
-    .map_err(Into::into)
+    .await?;
+    Ok(turn_events::encode_result(result))
 }
 
 pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> InitializeResponse {
