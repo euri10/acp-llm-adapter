@@ -36,6 +36,16 @@
 //! record — written before records existed, or by a foreign process — is never
 //! evicted: unknown retention intent means keep.
 //!
+//! # Redaction
+//!
+//! Wire frames and tracing events use one recursive field policy. ACP content,
+//! tool inputs/results, free-text descriptions, and credential-bearing
+//! configuration are replaced with `[REDACTED]`. Opaque text (including malformed
+//! frames and captured stderr) is also redacted. Protocol identifiers, status,
+//! and numeric diagnostics remain available. Unknown string fields are redacted
+//! too, so new content fields do not silently bypass the policy.
+//! [`crate::logsink::ENV_UNREDACTED`] opts out.
+//!
 //! # Backpressure
 //!
 //! Writing never blocks the caller. Records go onto a bounded queue drained by
@@ -49,7 +59,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -57,6 +67,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::timestamp::iso_timestamp_millis_now;
+
+mod routing;
 
 const CONNECTIONS_DIR: &str = "connections";
 const SESSIONS_DIR: &str = "sessions";
@@ -76,7 +88,7 @@ pub const ENV_MAX_BYTES: &str = "ACP_LOG_MAX_BYTES";
 pub const ENV_MAX_AGE_DAYS: &str = "ACP_LOG_MAX_AGE_DAYS";
 /// Environment variable disabling redaction of sensitive log fields.
 ///
-/// Off by default: logs redact prompts, messages, and tool arguments. Set to
+/// Off by default: logs redact content, configuration secrets, and opaque text. Set to
 /// any value other than empty or `0` to write those fields in the clear, for
 /// local debugging where the real content is what you're chasing.
 pub const ENV_UNREDACTED: &str = "ACP_LOG_UNREDACTED";
@@ -260,16 +272,15 @@ impl LogRecord {
     /// Build a record from a raw wire line.
     ///
     /// ACP over stdio is NDJSON, so a line is normally a JSON-RPC object and is
-    /// stored as structured JSON. A line that does not parse is stored verbatim
-    /// as a string rather than discarded — malformed traffic is exactly what a
-    /// debugging log exists to capture.
+    /// stored as structured JSON. A line that does not parse remains a string
+    /// record with redacted content; [`crate::logsink::ENV_UNREDACTED`] preserves it verbatim.
     #[must_use]
     pub fn frame(direction: Direction, raw: &str) -> Self {
         let payload = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
         Self::new(direction, KIND_FRAME, payload)
     }
 
-    /// Build a record whose body is plain text, such as captured stderr.
+    /// Build a string record, such as captured stderr, subject to redaction.
     pub fn text(direction: Direction, kind: impl Into<String>, text: impl Into<String>) -> Self {
         Self::new(direction, kind, Value::String(text.into()))
     }
@@ -432,6 +443,7 @@ impl LogSink {
             sink: Arc::clone(self),
             connection_id,
             session_id: Arc::new(RwLock::new(None)),
+            sniffer: Arc::new(Mutex::new(routing::SessionSniffer::default())),
         })
     }
 
@@ -722,12 +734,16 @@ fn redaction_enabled_fn(mut lookup: impl FnMut(&str) -> Option<String>) -> bool 
 
 fn redact_value(value: Value) -> Value {
     match value {
+        Value::String(_) => Value::String("[REDACTED]".to_string()),
         Value::Array(values) => Value::Array(values.into_iter().map(redact_value).collect()),
         Value::Object(mut object) => {
             for (key, value) in &mut object {
-                if is_sensitive_key(key) {
+                let normalized = key.replace('_', "").to_ascii_lowercase();
+                if is_sensitive_key(&normalized)
+                    || (value.is_string() && !is_diagnostic_key(&normalized))
+                {
                     *value = Value::String("[REDACTED]".to_string());
-                } else {
+                } else if value.is_object() || value.is_array() {
                     let current = std::mem::take(value);
                     *value = redact_value(current);
                 }
@@ -739,9 +755,77 @@ fn redact_value(value: Value) -> Value {
 }
 
 fn is_sensitive_key(key: &str) -> bool {
+    // ACP uses camelCase while tracing fields commonly use snake_case. Opaque
+    // containers must be removed as a whole: tool results and extensions can
+    // hold content under arbitrary keys, including otherwise diagnostic ones.
     matches!(
         key,
-        "arguments" | "content" | "input" | "messages" | "prompt" | "text"
+        "arguments"
+            | "args"
+            | "command"
+            | "content"
+            | "input"
+            | "rawinput"
+            | "rawoutput"
+            | "output"
+            | "stdout"
+            | "stderr"
+            | "messages"
+            | "message"
+            | "prompt"
+            | "text"
+            | "oldtext"
+            | "newtext"
+            | "title"
+            | "description"
+            | "data"
+            | "blob"
+            | "env"
+            | "environment"
+            | "headers"
+            | "url"
+            | "uri"
+            | "meta"
+            | "currentvalue"
+            | "value"
+            | "apikey"
+            | "accesstoken"
+            | "token"
+            | "password"
+            | "secret"
+            | "authorization"
+            | "credentials"
+    )
+}
+
+fn is_diagnostic_key(key: &str) -> bool {
+    matches!(
+        key,
+        "jsonrpc"
+            | "id"
+            | "method"
+            | "sessionid"
+            | "toolcallid"
+            | "optionid"
+            | "configid"
+            | "valueid"
+            | "modeid"
+            | "modelid"
+            | "sessionupdate"
+            | "status"
+            | "kind"
+            | "type"
+            | "role"
+            | "outcome"
+            | "stopreason"
+            | "level"
+            | "target"
+            | "model"
+            | "backend"
+            | "program"
+            | "path"
+            | "cwd"
+            | "signal"
     )
 }
 
@@ -761,6 +845,7 @@ pub struct ConnectionLog {
     sink: Arc<LogSink>,
     connection_id: String,
     session_id: Arc<RwLock<Option<String>>>,
+    sniffer: Arc<Mutex<routing::SessionSniffer>>,
 }
 
 impl ConnectionLog {
@@ -780,9 +865,28 @@ impl ConnectionLog {
     ///
     /// A record carrying its own session id goes to that session, which is what
     /// lets one connection serving several sessions keep them in separate
-    /// files. Otherwise the record inherits the connection's binding, and falls
-    /// back to the connection file when there is none.
-    pub fn log(&self, record: LogRecord) {
+    /// files. Wire frames use their explicit session or the matching request's
+    /// session, with independent request IDs for each direction. Unscoped wire
+    /// frames stay in the connection file. Other records inherit the connection's
+    /// binding and fall back to the connection file when there is none.
+    pub fn log(&self, mut record: LogRecord) {
+        if record.kind == KIND_FRAME {
+            let sniffed = self
+                .sniffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(record.direction, &record.payload);
+            if let Some(session_id) = sniffed.established
+                && let Err(error) = self.bind_session(&session_id)
+            {
+                tracing::warn!(%error, "ACP frame returned an unusable session id");
+            }
+            record.session_id = record.session_id.or(sniffed.session_id);
+            if record.session_id.is_none() {
+                self.log_fallback(record);
+                return;
+            }
+        }
         // A session id lifted off the wire is untrusted input. Routing on one
         // that is not a safe path component would let a hostile agent choose
         // where this process writes, so such a record is kept but filed under
@@ -827,8 +931,12 @@ impl ConnectionLog {
 
         self.sink.enqueue(
             Destination::Connection(self.connection_id.clone()),
-            LogRecord::text(Direction::Internal, KIND_SESSION_BOUND, session_id)
-                .with_session(session_id),
+            LogRecord::new(
+                Direction::Internal,
+                KIND_SESSION_BOUND,
+                serde_json::json!({"sessionId": session_id}),
+            )
+            .with_session(session_id),
         );
 
         let mut guard = self

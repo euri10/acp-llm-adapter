@@ -160,6 +160,17 @@ confirmation.
   default. Use constant-time comparison for secrets.
 - Tool execution is the blast radius: permission gating and path confinement are
   correctness requirements, not conveniences.
+- Built-in file tools (`read_file`, `write_file`, `edit_file`, `list_dir`, `glob`,
+  `grep`) are confined to `cwd` plus explicitly approved `additionalDirectories`.
+  Resolve traversal and symlinks before checking roots; approval modes never
+  expand them. Local I/O must retain directory-relative confinement at access
+  time, including after permission waits. Editor filesystem requests must be
+  validated before delegation; the trusted editor must enforce the same roots
+  at actual access. Unverifiable paths fail closed. Searches remain cwd-scoped
+  and cannot load parent/global ignore files outside that root.
+- `run_command` remains permission-gated host execution, not an OS filesystem
+  sandbox. Its `cwd` is a starting directory, not a confinement mechanism. MCP
+  tools keep their separate permission contract; file roots do not sandbox MCP.
 - Keep the dependency tree minimal and prefer well-maintained crates with no
   duplicate functionality. A new dependency requires a demonstrated gap; run
   `cargo audit` before adding one. Never vendor a dependency for convenience.

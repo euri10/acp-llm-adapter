@@ -5,9 +5,8 @@ use super::{
     mcp_tool_mappings, mcp_tool_result_text,
 };
 use crate::acp::{handle_new_session_request, handle_set_session_mode_request};
-use crate::session::{
-    PERMISSION_ALLOW_ONCE_OPTION_ID, PermissionDecision, request_tool_permission,
-};
+use crate::request_tool_permission;
+use crate::session::{PERMISSION_ALLOW_ONCE_OPTION_ID, PermissionDecision};
 use crate::tools::{AdapterToolRegistry, ToolContext, ToolRegistry};
 use crate::{PermissionRequester, test_store};
 use acp_llm_adapter::llm::ToolCall as ChatToolCall;
@@ -18,8 +17,8 @@ use agent_client_protocol::schema::v1::{
 };
 use futures_util::future::BoxFuture;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock as McpContent, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool as McpTool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock as McpContent,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool as McpTool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
@@ -29,32 +28,37 @@ use rmcp::{ServerHandler, ServiceExt};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const RUN_STDIO_FIXTURE_ENV: &str = "ACP_LLM_ADAPTER_RUN_MCP_FIXTURE";
+
+#[path = "../../tests/mcp_sse_fixture/mod.rs"]
+mod mcp_sse_fixture;
+
+use mcp_sse_fixture::{Behavior, LegacyServer, TOKEN};
 
 #[derive(Debug, Clone)]
 struct EchoMcpServer;
 
 impl ServerHandler for EchoMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let message = request
             .arguments
             .as_ref()
             .and_then(|arguments| arguments.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        Ok(CallToolResult::success(vec![McpContent::text(format!(
-            "echo: {message}"
-        ))]))
+        Ok(CallToolResult::success(vec![McpContent::text(format!("echo: {message}"))]).into())
     }
 
     async fn list_tools(
@@ -254,27 +258,15 @@ fn mcp_tool_mappings_prefix_and_preserve_schema() {
 }
 
 #[test_log::test(tokio::test)]
-async fn adapter_registry_exposes_and_executes_session_mcp_tools()
+async fn adapter_registry_exposes_mcp_tools_but_requires_permission_connection()
 -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let mcp_session = connected_echo_mcp_session().await?;
-    {
-        let mut guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&response.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing session")
-            })?;
-        session.mcp_sessions.push(mcp_session);
-    }
+    store.insert_mcp_session(&response.session_id.0, mcp_session)?;
 
     let context = ToolContext {
-        session_id: response.session_id.clone(),
+        session_id: response.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -301,8 +293,8 @@ async fn adapter_registry_exposes_and_executes_session_mcp_tools()
         )
         .await;
 
-    assert!(result.success);
-    assert_eq!(result.content, "echo: hello");
+    assert!(!result.success);
+    assert!(result.content.contains("requires a client connection"));
 
     Ok(())
 }
@@ -317,7 +309,7 @@ async fn mcp_tools_use_explicit_execute_permission_kind() -> Result<(), agent_cl
         &SetSessionModeRequest::new(session.session_id.clone(), "accept-edits"),
     )?;
     let context = ToolContext {
-        session_id: session.session_id,
+        session_id: session.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -333,9 +325,15 @@ async fn mcp_tools_use_explicit_execute_permission_kind() -> Result<(), agent_cl
         )),
     )]);
 
-    let decision =
-        request_tool_permission(&store, &context, &call, super::mcp_tool_kind(), &requester)
-            .await?;
+    let decision = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        super::mcp_tool_kind(),
+        &requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
 
     assert_eq!(decision, PermissionDecision::AllowOnce);
     let requests = requester.requests();
@@ -408,11 +406,16 @@ fn mcp_tool_result_text_returns_empty_for_no_content() {
 }
 
 #[test_log::test(tokio::test)]
-async fn connect_mcp_sessions_connects_sse_fake_server() -> Result<(), agent_client_protocol::Error>
+async fn connect_mcp_sessions_connects_legacy_sse_server() -> Result<(), Box<dyn std::error::Error>>
 {
-    let (url, cancellation) = spawn_http_echo_mcp_server().await?;
-    let sessions =
-        connect_mcp_sessions(&[McpServer::Sse(McpServerSse::new("Remote SSE Echo", url))]).await?;
+    let server = mcp_sse_fixture::LegacyServer::start(None).await?;
+    let sessions = connect_mcp_sessions(&[McpServer::Sse(
+        McpServerSse::new("Remote SSE Echo", &server.url).headers(vec![HttpHeader::new(
+            "Authorization",
+            mcp_sse_fixture::TOKEN,
+        )]),
+    )])
+    .await?;
 
     assert_eq!(sessions.len(), 1);
     assert_eq!(
@@ -425,7 +428,7 @@ async fn connect_mcp_sessions_connects_sse_fake_server() -> Result<(), agent_cli
             .iter()
             .any(|mapping| mapping.exposed_name == "mcp__remote_sse_echo__echo")
     }));
-    cancellation.cancel();
+    drop(sessions);
     Ok(())
 }
 
@@ -520,13 +523,20 @@ async fn mcp_tool_execution_unknown_tool() -> Result<(), agent_client_protocol::
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-unknown", "mcp__nonexistent__tool", "{}");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("unknown MCP tool"));
     Ok(())
@@ -697,12 +707,18 @@ async fn mcp_sse_session_reports_initialization_failure() {
 }
 
 #[test_log::test(tokio::test)]
-async fn mcp_sse_session_discovers_and_executes_fake_server()
--> Result<(), agent_client_protocol::Error> {
-    let (url, cancellation) = spawn_http_echo_mcp_server().await?;
-    let sse = McpServerSse::new("Remote SSE Echo", url)
-        .headers(vec![HttpHeader::new("X-Test-Trace", "trace")]);
-    let session = connect_mcp_sse_session(&sse).await?;
+async fn mcp_sse_session_discovers_and_executes_legacy_server()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = mcp_sse_fixture::LegacyServer::start(None).await?;
+    let sse = McpServerSse::new("Remote SSE Echo", &server.url).headers(vec![HttpHeader::new(
+        "Authorization",
+        mcp_sse_fixture::TOKEN,
+    )]);
+    let session = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        connect_mcp_sse_session(&sse),
+    )
+    .await??;
 
     assert_eq!(session.name, "Remote SSE Echo");
     assert!(
@@ -728,7 +744,64 @@ async fn mcp_sse_session_discovers_and_executes_fake_server()
         mcp_tool_result_text(&result.content),
         "echo: hello over sse"
     );
-    cancellation.cancel();
+    assert_eq!(
+        server
+            .observed
+            .gets
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        server
+            .observed
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    drop(session);
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn legacy_sse_setup_failures_release_the_event_stream()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (endpoint, behavior) in [
+        (Some("http://other.invalid/messages"), Behavior::Normal),
+        (Some(""), Behavior::Normal),
+        (None, Behavior::MalformedMessage),
+        (None, Behavior::RedirectPost),
+        (None, Behavior::RedirectGet),
+        (None, Behavior::MissingEndpoint),
+        (None, Behavior::SilentInitialize),
+        (None, Behavior::SilentToolsList),
+    ] {
+        let server = LegacyServer::with_behavior(endpoint, behavior).await?;
+        let sse = McpServerSse::new("legacy", &server.url)
+            .headers(vec![HttpHeader::new("Authorization", TOKEN)]);
+        let result =
+            tokio::time::timeout(Duration::from_secs(7), connect_mcp_sse_session(&sse)).await?;
+        assert!(result.is_err(), "unsafe or failed setup was accepted");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while server.observed.active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            server.observed.gets.load(Ordering::SeqCst),
+            1,
+            "unexpected SSE replay"
+        );
+        assert_eq!(server.observed.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            server.observed.redirects.load(Ordering::SeqCst),
+            0,
+            "credentials followed a redirect"
+        );
+        if endpoint.is_some() {
+            assert_eq!(server.observed.posts.load(Ordering::SeqCst), 0);
+        }
+    }
     Ok(())
 }
 
@@ -815,7 +888,7 @@ fn is_mcp_tool_name_matches_prefixed_only() {
 
 #[test]
 fn mcp_tool_kind_is_execute() {
-    assert_eq!(super::mcp_tool_kind(), ToolKind::Execute);
+    assert_eq!(super::mcp_tool_kind(), crate::tools::ToolKind::Execute);
 }
 
 #[test]
@@ -885,28 +958,23 @@ async fn mcp_tool_execution_bad_arguments_for_registered_tool()
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let mcp_session = connected_echo_mcp_session().await?;
-    {
-        let mut guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&response.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing session")
-            })?;
-        session.mcp_sessions.push(mcp_session);
-    }
+    store.insert_mcp_session(&response.session_id.0, mcp_session)?;
 
     let context = ToolContext {
-        session_id: response.session_id.clone(),
+        session_id: response.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-bad-args", "mcp__echo_server__echo", "[1,2,3]");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("arguments must be a JSON object"));
     Ok(())
@@ -916,15 +984,15 @@ async fn mcp_tool_execution_bad_arguments_for_registered_tool()
 struct FailingMcpServer;
 
 impl ServerHandler for FailingMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
         &self,
         _request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         Err(rmcp::ErrorData::internal_error(
             "simulated tool failure",
             None,
@@ -985,28 +1053,28 @@ async fn mcp_tool_execution_peer_call_tool_error() -> Result<(), agent_client_pr
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let mcp_session = connected_failing_mcp_session().await?;
-    {
-        let mut guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&response.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing session")
-            })?;
-        session.mcp_sessions.push(mcp_session);
-    }
+    store.insert_mcp_session(&response.session_id.0, mcp_session)?;
 
     let context = ToolContext {
-        session_id: response.session_id.clone(),
+        session_id: response.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-failing", "mcp__failing_server__failer", "{}");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            PERMISSION_ALLOW_ONCE_OPTION_ID,
+        )),
+    )]);
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(
         result
@@ -1020,18 +1088,18 @@ async fn mcp_tool_execution_peer_call_tool_error() -> Result<(), agent_client_pr
 struct ErrorFlagMcpServer;
 
 impl ServerHandler for ErrorFlagMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
         &self,
         _request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let mut result = CallToolResult::error(vec![McpContent::text("err output")]);
         result.is_error = Some(true);
-        Ok(result)
+        Ok(result.into())
     }
 
     async fn list_tools(
@@ -1088,28 +1156,28 @@ async fn mcp_tool_execution_is_error_flag() -> Result<(), agent_client_protocol:
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let mcp_session = connected_error_flag_mcp_session().await?;
-    {
-        let mut guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&response.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing session")
-            })?;
-        session.mcp_sessions.push(mcp_session);
-    }
+    store.insert_mcp_session(&response.session_id.0, mcp_session)?;
 
     let context = ToolContext {
-        session_id: response.session_id.clone(),
+        session_id: response.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-errflag", "mcp__error_flag_server__error_flag", "{}");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            PERMISSION_ALLOW_ONCE_OPTION_ID,
+        )),
+    )]);
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert_eq!(result.content, "err output");
     Ok(())
@@ -1119,13 +1187,21 @@ async fn mcp_tool_execution_is_error_flag() -> Result<(), agent_client_protocol:
 async fn mcp_tool_execution_unknown_session() {
     let store = test_store();
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("nonexistent-session"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("nonexistent-session")
+            .to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = ChatToolCall::new("mcp-unknown-session", "mcp__server__tool", "{}");
-    let result = mcp_tool_execution(&store, &call, &context).await;
+    let result = mcp_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("unknown session id"));
 }

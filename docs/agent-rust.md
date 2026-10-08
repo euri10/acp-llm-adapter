@@ -6,12 +6,16 @@ together with [testing](agent-testing.md).
 
 ## Toolchain and manifests
 
-- Stable toolchain only, matching `RUST_VERSION` in CI and `rust-version` in
-  `Cargo.toml` (currently 1.95, edition 2024). Default rustfmt; the edition stays
-  explicit in the manifest.
+- Stable toolchain only. Development and CI use `RUST_VERSION`, matching
+  `rust-version` in `Cargo.toml` (currently 1.95, edition 2024). The release-plz
+  workflow uses Rust 1.99 for release automation; this does not raise the MSRV
+  tested by CI. Default rustfmt; the edition stays explicit in the manifest.
 - Declare an MSRV only when it is actually tested. Do not claim compatibility
   from an untested `rust-version` field.
-- Dependencies are pinned deliberately and updated by Renovate. A major bump on
+- Dependencies are pinned deliberately and updated by Dependabot, with daily
+  Cargo and GitHub Actions checks in `.github/dependabot.yml`. Cargo uses the
+  default `auto` versioning strategy; it does not support `increase`. `renovate.json`
+  disables the previous updater. A major bump on
   a protocol crate (`agent-client-protocol`, `rmcp`) is a deliberate change with
   a full regression pass, not a routine update.
 

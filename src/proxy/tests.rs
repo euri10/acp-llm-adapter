@@ -95,10 +95,9 @@ fn a_frame_line_becomes_structured_json() {
 fn a_stderr_line_stays_plain_text() {
     let record = record_for(Direction::Internal, KIND_STDERR, b"warning: something");
 
-    assert_eq!(
-        record.payload.as_str(),
-        Some("warning: something"),
-        "stderr is not JSON and must not be coerced into it"
+    assert!(
+        record.payload.is_string(),
+        "stderr stays a string record even when redacted"
     );
     assert_eq!(record.kind, KIND_STDERR);
 }
@@ -111,146 +110,7 @@ fn invalid_utf8_does_not_lose_the_line() {
         record
             .payload
             .as_str()
-            .is_some_and(|text| text.ends_with("ok")),
-        "undecodable bytes are replaced, not dropped"
+            .is_some_and(|text| text == "[REDACTED]" || text == "\u{fffd}\u{fffd}ok"),
+        "undecodable text is redacted or decoded with replacement characters"
     );
-}
-
-// ── session sniffing ────────────────────────────────────────
-
-use super::{METHOD_SESSION_LOAD, METHOD_SESSION_NEW, SessionSniffer, Sniffed};
-use serde_json::json;
-
-#[test]
-fn a_session_new_response_is_matched_to_its_request() {
-    let mut sniffer = SessionSniffer::default();
-
-    let request = sniffer.observe(
-        Direction::ClientToAgent,
-        &json!({"jsonrpc": "2.0", "id": 2, "method": METHOD_SESSION_NEW, "params": {}}),
-    );
-    let response = sniffer.observe(
-        Direction::AgentToClient,
-        &json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "session-abc"}}),
-    );
-
-    assert_eq!(
-        request,
-        Sniffed::default(),
-        "the request creates nothing yet"
-    );
-    assert_eq!(
-        response,
-        Sniffed {
-            session_id: Some("session-abc".to_string()),
-            established: Some("session-abc".to_string()),
-        },
-        "a response carries no method name, so only the id correlation finds it"
-    );
-}
-
-#[test]
-fn an_unrelated_response_with_the_same_shape_is_ignored() {
-    let mut sniffer = SessionSniffer::default();
-
-    // No session/new request was ever seen for id 9.
-    let observed = sniffer.observe(
-        Direction::AgentToClient,
-        &json!({"jsonrpc": "2.0", "id": 9, "result": {"sessionId": "session-not-ours"}}),
-    );
-
-    assert_eq!(observed, Sniffed::default());
-}
-
-#[test]
-fn a_correlated_response_is_only_matched_once() {
-    let mut sniffer = SessionSniffer::default();
-    sniffer.observe(
-        Direction::ClientToAgent,
-        &json!({"id": 2, "method": METHOD_SESSION_NEW}),
-    );
-
-    let first = sniffer.observe(
-        Direction::AgentToClient,
-        &json!({"id": 2, "result": {"sessionId": "session-abc"}}),
-    );
-    let second = sniffer.observe(
-        Direction::AgentToClient,
-        &json!({"id": 2, "result": {"sessionId": "session-abc"}}),
-    );
-
-    assert!(first.established.is_some());
-    assert_eq!(second, Sniffed::default(), "the correlation is consumed");
-}
-
-#[test]
-fn string_request_ids_correlate_too() {
-    let mut sniffer = SessionSniffer::default();
-    sniffer.observe(
-        Direction::ClientToAgent,
-        &json!({"id": "req-1", "method": METHOD_SESSION_NEW}),
-    );
-
-    let observed = sniffer.observe(
-        Direction::AgentToClient,
-        &json!({"id": "req-1", "result": {"sessionId": "session-abc"}}),
-    );
-
-    assert_eq!(observed.established, Some("session-abc".to_string()));
-}
-
-#[test]
-fn a_notification_is_attributed_by_its_own_session_id() {
-    let mut sniffer = SessionSniffer::default();
-
-    let observed = sniffer.observe(
-        Direction::AgentToClient,
-        &json!({"method": "session/update", "params": {"sessionId": "session-xyz"}}),
-    );
-
-    assert_eq!(
-        observed,
-        Sniffed {
-            session_id: Some("session-xyz".to_string()),
-            established: None,
-        },
-        "notifications name their own session, so one process serving several \
-         sessions keeps them in separate files"
-    );
-}
-
-#[test]
-fn loading_a_session_binds_without_waiting_for_a_response() {
-    let mut sniffer = SessionSniffer::default();
-
-    let observed = sniffer.observe(
-        Direction::ClientToAgent,
-        &json!({"id": 3, "method": METHOD_SESSION_LOAD, "params": {"sessionId": "session-old"}}),
-    );
-
-    assert_eq!(observed.established, Some("session-old".to_string()));
-}
-
-#[test]
-fn a_frame_that_is_not_json_reveals_nothing_and_does_not_panic() {
-    let mut sniffer = SessionSniffer::default();
-
-    let observed = sniffer.observe(
-        Direction::AgentToClient,
-        &serde_json::Value::String("garbage on the wire".to_string()),
-    );
-
-    assert_eq!(observed, Sniffed::default());
-}
-
-#[test]
-fn stderr_is_never_sniffed_for_sessions() {
-    let mut sniffer = SessionSniffer::default();
-
-    let observed = sniffer.observe(
-        Direction::Internal,
-        &json!({"result": {"sessionId": "session-abc"}}),
-    );
-
-    assert_eq!(observed, Sniffed::default());
 }

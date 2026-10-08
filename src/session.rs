@@ -1,34 +1,17 @@
-//! Session state, permission model, and in-memory session store.
+//! Adapter-owned session data, mode policy, and tool-call accumulation.
 //!
-//! This module owns the domain types that were previously scattered through
-//! `main.rs`.  Extracting them here fixes the dependency direction: protocol
-//! handlers in [`crate::acp`] now depend on `crate::session` instead of the
-//! binary entrypoint.
+//! These values do not depend on editor schema or I/O handles. The session
+//! store owns resource lifecycles and persistence; ACP builds wire selectors.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 
 use acp_llm_adapter::llm::MessageRole;
-use acp_llm_adapter::llm::{
-    ChatConfig, ChatMessage, ModelCatalog, ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition,
-};
-use agent_client_protocol::schema::v1::{
-    ClientCapabilities, McpServer, PermissionOption, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId, SessionId,
-    SessionInfo, SessionMode, SessionModeId, SessionModeState, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
-};
+use acp_llm_adapter::llm::{ChatError, ChatMessage, ToolCall as ChatToolCall, ToolCallDelta};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::acp::PermissionRequester;
-use crate::mcp::{McpSession, McpToolTarget};
-use crate::session_store::{FilesystemSessionStore, PersistedSessionMeta, PersistedSessionRecord};
-use crate::tools::ToolContext;
-use crate::turn::tool_raw_input;
 use acp_llm_adapter::error::AdapterError;
 /// Default maximum number of tool-call/response cycles per prompt turn.
 pub(crate) const DEFAULT_MAX_TURN_REQUESTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(99);
@@ -47,14 +30,6 @@ pub(crate) const SESSION_CONFIG_MAX_TOKENS_ID: &str = "max_tokens";
 pub(crate) const REASONING_EFFORT_HIGH_ID: &str = "high";
 pub(crate) const REASONING_EFFORT_MAX_ID: &str = "max";
 pub(crate) const MAX_TOKENS_DEFAULT_ID: &str = "default";
-/// Preset `max_tokens` values offered in the session config selector.
-///
-/// The provider's chat-completions API accepts any positive integer for
-/// `max_tokens` (bounded by the model's max output), but ACP session config
-/// options only support fixed selectable values, not freeform text input.
-/// These presets cover common output-length budgets.
-const MAX_TOKENS_PRESETS: [u32; 6] = [4_096, 8_192, 16_384, 32_768, 65_536, 131_072];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionDecision {
     AllowOnce,
@@ -85,12 +60,12 @@ impl SessionBehavior {
         }
     }
 
-    pub(crate) fn mode_id(self) -> SessionModeId {
+    pub(crate) const fn mode_id(self) -> &'static str {
         match self {
-            Self::Ask => SessionModeId::new(SESSION_MODE_ASK_ID),
-            Self::AcceptEdits => SessionModeId::new(SESSION_MODE_ACCEPT_EDITS_ID),
-            Self::Plan => SessionModeId::new(SESSION_MODE_PLAN_ID),
-            Self::Yolo => SessionModeId::new(SESSION_MODE_YOLO_ID),
+            Self::Ask => SESSION_MODE_ASK_ID,
+            Self::AcceptEdits => SESSION_MODE_ACCEPT_EDITS_ID,
+            Self::Plan => SESSION_MODE_PLAN_ID,
+            Self::Yolo => SESSION_MODE_YOLO_ID,
         }
     }
 
@@ -124,16 +99,15 @@ impl SessionBehavior {
             Self::Ask | Self::AcceptEdits | Self::Yolo => true,
         }
     }
-
-    pub(crate) fn from_mode_id(mode_id: &SessionModeId) -> Option<Self> {
-        Self::from_mode_id_str(mode_id.0.as_ref())
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReasoningEffort {
     #[default]
+    Default,
+    Low,
+    Medium,
     High,
     Max,
 }
@@ -141,6 +115,9 @@ pub(crate) enum ReasoningEffort {
 impl ReasoningEffort {
     pub(crate) const fn id(self) -> &'static str {
         match self {
+            Self::Default => "default",
+            Self::Low => "low",
+            Self::Medium => "medium",
             Self::High => REASONING_EFFORT_HIGH_ID,
             Self::Max => REASONING_EFFORT_MAX_ID,
         }
@@ -148,6 +125,9 @@ impl ReasoningEffort {
 
     pub(crate) const fn name(self) -> &'static str {
         match self {
+            Self::Default => "Provider default",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
             Self::High => "High",
             Self::Max => "Max",
         }
@@ -155,111 +135,56 @@ impl ReasoningEffort {
 
     pub(crate) const fn description(self) -> &'static str {
         match self {
-            Self::High => "Default reasoning effort.",
+            Self::Default => "Use the provider's default reasoning effort.",
+            Self::Low => "Low reasoning effort.",
+            Self::Medium => "Medium reasoning effort.",
+            Self::High => "High reasoning effort.",
             Self::Max => "Maximum reasoning effort for complex agent work.",
         }
     }
 
-    pub(crate) fn from_value_id(value: &SessionConfigValueId) -> Option<Self> {
-        match value.0.as_ref() {
+    pub(crate) fn from_value_id(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
             REASONING_EFFORT_HIGH_ID => Some(Self::High),
             REASONING_EFFORT_MAX_ID => Some(Self::Max),
             _ => None,
         }
     }
-}
 
-/// Ask the client (or fall back to posture) whether a tool call is allowed.
-///
-/// # Errors
-///
-/// Returns an [`AdapterError`] when the session is unknown, the permission request
-/// cannot be sent, or the client returns an unrecognized outcome.
-pub(crate) async fn request_tool_permission(
-    store: &SessionStore,
-    context: &ToolContext,
-    call: &ChatToolCall,
-    kind: ToolKind,
-    requester: &dyn PermissionRequester,
-) -> Result<PermissionDecision, AdapterError> {
-    if store.is_always_allowed(&context.session_id, call.name())? {
-        return Ok(PermissionDecision::AllowAlways);
-    }
-
-    let behavior = store.session_behavior(&context.session_id)?;
-
-    if behavior.allows_without_prompt(kind) {
-        return Ok(PermissionDecision::AllowByMode);
-    }
-
-    let request = RequestPermissionRequest::new(
-        context.session_id.clone(),
-        ToolCallUpdate::new(
-            call.id().to_string(),
-            ToolCallUpdateFields::new()
-                .kind(kind)
-                .status(ToolCallStatus::Pending)
-                .title(crate::turn::tool_call_title(call))
-                .raw_input(tool_raw_input(call)),
-        ),
-        permission_options(),
-    );
-
-    let response = requester
-        .request_permission(request)
-        .await
-        .map_err(|e| AdapterError::Internal(e.to_string()))?;
-    let decision = match response.outcome {
-        RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
-        RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
-            PERMISSION_ALLOW_ONCE_OPTION_ID => PermissionDecision::AllowOnce,
-            PERMISSION_ALLOW_ALWAYS_OPTION_ID => PermissionDecision::AllowAlways,
-            PERMISSION_REJECT_ONCE_OPTION_ID => PermissionDecision::RejectOnce,
-            PERMISSION_REJECT_ALWAYS_OPTION_ID => PermissionDecision::RejectAlways,
-            other => {
-                return Err(AdapterError::InvalidParams(format!(
-                    "unknown permission option selected: {other}"
-                )));
+    pub(crate) fn supported_for_model(model: &str) -> &'static [Self] {
+        match model {
+            // https://console.groq.com/docs/api-reference#chat-create
+            "openai/gpt-oss-120b" | "openai/gpt-oss-20b" => {
+                &[Self::Default, Self::Low, Self::Medium, Self::High]
             }
-        },
-        _ => {
-            return Err(AdapterError::InvalidParams(
-                "unsupported permission outcome variant".to_string(),
-            ));
+            // https://api-docs.deepseek.com/api/create-chat-completion/
+            // Legacy Flash IDs remain accepted: https://api-docs.deepseek.com/
+            "deepseek-v4-pro"
+            | "deepseek-flash"
+            | "deepseek-v4-flash"
+            | "deepseek-v4-flash-vision-exp" => &[Self::Default, Self::Low, Self::High, Self::Max],
+            // GLM-4.6 does not support this parameter (Z.ai documents support
+            // starting at GLM-5.2). Unknown model contracts are not guessed.
+            // https://docs.z.ai/api-reference/llm/chat-completion
+            _ => &[Self::Default],
         }
-    };
-
-    if decision == PermissionDecision::AllowAlways {
-        store.add_always_allow(&context.session_id, call.name().to_string())?;
     }
 
-    Ok(decision)
+    pub(crate) fn for_model(self, model: &str) -> Self {
+        if Self::supported_for_model(model).contains(&self) {
+            self
+        } else {
+            Self::Default
+        }
+    }
 }
 
-fn permission_options() -> Vec<PermissionOption> {
-    vec![
-        PermissionOption::new(
-            PERMISSION_ALLOW_ONCE_OPTION_ID,
-            "Allow once",
-            PermissionOptionKind::AllowOnce,
-        ),
-        PermissionOption::new(
-            PERMISSION_ALLOW_ALWAYS_OPTION_ID,
-            "Allow always",
-            PermissionOptionKind::AllowAlways,
-        ),
-        PermissionOption::new(
-            PERMISSION_REJECT_ONCE_OPTION_ID,
-            "Reject once",
-            PermissionOptionKind::RejectOnce,
-        ),
-        PermissionOption::new(
-            PERMISSION_REJECT_ALWAYS_OPTION_ID,
-            "Reject always",
-            PermissionOptionKind::RejectAlways,
-        ),
-    ]
-}
+// Local defensive bound, not a provider capability: allow large tool batches
+// while limiting slot allocation and synchronous work driven by untrusted indices.
+const MAX_TOOL_CALLS_PER_COMPLETION: usize = 128;
 
 #[derive(Debug, Default)]
 pub(crate) struct PendingToolCalls {
@@ -267,8 +192,20 @@ pub(crate) struct PendingToolCalls {
 }
 
 impl PendingToolCalls {
-    pub(crate) fn push(&mut self, delta: &ToolCallDelta) {
+    /// Accumulate a fragment after validating its slot index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-provider-response error without changing pending calls
+    /// when the index exceeds the local per-completion bound.
+    pub(crate) fn push(&mut self, delta: &ToolCallDelta) -> Result<(), AdapterError> {
         let index = delta.index();
+        if index >= MAX_TOOL_CALLS_PER_COMPLETION {
+            return Err(ChatError::InvalidResponse(format!(
+                "tool call index {index} exceeds the per-completion limit of {MAX_TOOL_CALLS_PER_COMPLETION} calls"
+            ))
+            .into());
+        }
         while self.calls.len() <= index {
             self.calls.push(PendingToolCall::default());
         }
@@ -284,6 +221,7 @@ impl PendingToolCalls {
                 call.arguments.push_str(arguments);
             }
         }
+        Ok(())
     }
 
     pub(crate) fn finish(self) -> Result<Vec<ChatToolCall>, AdapterError> {
@@ -317,158 +255,19 @@ impl PendingToolCall {
     }
 }
 
-pub(crate) fn session_modes(current_mode: SessionBehavior) -> SessionModeState {
-    SessionModeState::new(
-        current_mode.mode_id(),
-        vec![
-            SessionMode::new(SessionBehavior::Ask.mode_id(), SessionBehavior::Ask.name()),
-            SessionMode::new(
-                SessionBehavior::AcceptEdits.mode_id(),
-                SessionBehavior::AcceptEdits.name(),
-            ),
-            SessionMode::new(
-                SessionBehavior::Plan.mode_id(),
-                SessionBehavior::Plan.name(),
-            ),
-            SessionMode::new(
-                SessionBehavior::Yolo.mode_id(),
-                SessionBehavior::Yolo.name(),
-            ),
-        ],
-    )
-}
-
-pub(crate) fn default_session_modes() -> SessionModeState {
-    session_modes(SessionBehavior::Ask)
-}
-
-pub(crate) fn session_config_options(
-    session: &SessionRecord,
-    available_models: &[String],
-) -> Vec<SessionConfigOption> {
-    vec![
-        SessionConfigOption::select(
-            SESSION_CONFIG_MODE_ID,
-            "Session Mode",
-            session.mode.mode_id().0,
-            session_mode_select_options(),
-        )
-        .category(SessionConfigOptionCategory::Mode)
-        .description("Choose how the adapter behaves for tools and planning."),
-        SessionConfigOption::select(
-            SESSION_CONFIG_MODEL_ID,
-            "Model",
-            session.model.clone(),
-            model_select_options(session.model.as_str(), available_models),
-        )
-        .category(SessionConfigOptionCategory::Model)
-        .description("Choose which model the adapter should use."),
-        SessionConfigOption::select(
-            SESSION_CONFIG_REASONING_EFFORT_ID,
-            "Reasoning Effort",
-            session.reasoning_effort.id(),
-            reasoning_effort_select_options(),
-        )
-        .category(SessionConfigOptionCategory::ThoughtLevel)
-        .description("Choose how much thinking effort to request."),
-        SessionConfigOption::select(
-            SESSION_CONFIG_MAX_TOKENS_ID,
-            "Max Output Tokens",
-            max_tokens_value_id(session.max_tokens),
-            max_tokens_select_options(),
-        )
-        .description("Cap the number of tokens the model may generate in a response."),
-    ]
-}
-
-fn session_mode_select_options() -> Vec<SessionConfigSelectOption> {
-    session_modes(SessionBehavior::Ask)
-        .available_modes
-        .into_iter()
-        .map(|mode| SessionConfigSelectOption::new(mode.id.0, mode.name))
-        .collect()
-}
-
-/// Build the selectable model list from the dynamically-discovered model IDs.
-///
-/// If `current_model` is not already in the known list, it is prepended so the
-/// current selection is always displayed.
-pub(crate) fn model_select_options(
-    current_model: &str,
-    available_models: &[String],
-) -> Vec<SessionConfigSelectOption> {
-    let mut options: Vec<SessionConfigSelectOption> = Vec::new();
-
-    if !is_known_model(current_model, available_models) {
-        options.push(
-            SessionConfigSelectOption::new(current_model.to_string(), current_model.to_string())
-                .description("Current model from LLM_MODEL."),
-        );
-    }
-
-    for model_id in available_models {
-        // Avoid duplicating the custom entry we may have prepended.
-        if model_id == current_model && options.iter().any(|o| o.value.0.as_ref() == model_id) {
-            continue;
-        }
-        options.push(
-            SessionConfigSelectOption::new(model_id.clone(), model_id.clone())
-                .description("Available model."),
-        );
-    }
-
-    options
-}
-
-fn reasoning_effort_select_options() -> Vec<SessionConfigSelectOption> {
-    [ReasoningEffort::High, ReasoningEffort::Max]
-        .into_iter()
-        .map(|effort| {
-            SessionConfigSelectOption::new(effort.id(), effort.name())
-                .description(effort.description())
-        })
-        .collect()
-}
-
-/// Selectable `max_tokens` values, plus a `default` entry meaning "unset -
-/// let the provider use its own default output length".
-fn max_tokens_select_options() -> Vec<SessionConfigSelectOption> {
-    let mut options = vec![
-        SessionConfigSelectOption::new(MAX_TOKENS_DEFAULT_ID, "Default")
-            .description("Use the provider's own default output length."),
-    ];
-    options.extend(
-        MAX_TOKENS_PRESETS
-            .into_iter()
-            .map(|tokens| SessionConfigSelectOption::new(tokens.to_string(), format!("{tokens}"))),
-    );
-    options
-}
-
-/// Map a session's `max_tokens` setting to its session-config value id.
-fn max_tokens_value_id(max_tokens: Option<u32>) -> String {
-    max_tokens.map_or_else(
-        || MAX_TOKENS_DEFAULT_ID.to_string(),
-        |tokens| tokens.to_string(),
-    )
-}
-
 /// Parse a session-config value id back into a `max_tokens` setting.
 ///
 /// Returns `Ok(None)` for the `default` id (unset the override) and
 /// `Ok(Some(tokens))` for a positive integer id. Rejects anything else.
-pub(crate) fn max_tokens_from_value_id(
-    value: &SessionConfigValueId,
-) -> Result<Option<u32>, AdapterError> {
-    if value.0.as_ref() == MAX_TOKENS_DEFAULT_ID {
+pub(crate) fn max_tokens_from_value_id(value: &str) -> Result<Option<u32>, AdapterError> {
+    if value == MAX_TOKENS_DEFAULT_ID {
         return Ok(None);
     }
 
-    match value.0.parse::<u32>() {
+    match value.parse::<u32>() {
         Ok(tokens) if tokens > 0 => Ok(Some(tokens)),
         _ => Err(AdapterError::InvalidParams(format!(
-            "unsupported max_tokens value: {}",
-            value.0
+            "unsupported max_tokens value: {value}"
         ))),
     }
 }
@@ -491,61 +290,68 @@ fn is_known_model(model: &str, available_models: &[String]) -> bool {
     available_models.iter().any(|m| m == model)
 }
 
-/// Return the model the adapter should default to at startup.
-///
-/// Checks `LLM_MODEL` first, then falls back to `fallback_model`.
-pub(crate) fn initial_model(fallback_model: impl Into<String>) -> String {
-    if let Ok(value) = std::env::var(ChatConfig::ENV_MODEL) {
-        let trimmed = value.trim().to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
-    }
-    fallback_model.into()
+/// Categories used by permission and planning policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolKind {
+    Read,
+    Search,
+    Edit,
+    Execute,
+    Think,
+    Fetch,
+    Other,
 }
 
-#[derive(Debug)]
-pub(crate) struct AdapterState {
-    pub(crate) default_model: String,
-    /// Model IDs available for selection. Set at startup via
-    /// `ChatClient::fetch_available_models` or initialised to
-    /// `[default_model]` as a fallback.
-    pub(crate) model_catalog: ModelCatalog,
+/// Context shared by tool policy and execution, without editor wire types.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolContext {
+    pub(crate) session_id: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) additional_directories: Vec<PathBuf>,
     pub(crate) client_capabilities: Option<ClientCapabilities>,
-    pub(crate) sessions: HashMap<SessionId, SessionRecord>,
 }
 
-impl AdapterState {
-    pub(crate) fn new(default_model: impl Into<String>) -> Self {
-        let model = default_model.into();
-        let available_models = vec![model.clone()];
+/// Editor features consumed by built-in tools, independent of the ACP schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ClientCapabilities {
+    pub(crate) read_text_file: bool,
+    pub(crate) write_text_file: bool,
+    pub(crate) terminal: bool,
+}
+
+/// Listable session metadata; the ACP edge builds the wire response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionSummary {
+    pub(crate) session_id: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) additional_directories: Vec<PathBuf>,
+    pub(crate) title: Option<String>,
+    pub(crate) updated_at: Option<String>,
+    pub(crate) meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl SessionSummary {
+    pub(crate) fn new(session_id: String, cwd: PathBuf) -> Self {
         Self {
-            default_model: model,
-            model_catalog: ModelCatalog {
-                ids: available_models,
-                ..ModelCatalog::default()
-            },
-            client_capabilities: None,
-            sessions: HashMap::new(),
+            session_id,
+            cwd,
+            additional_directories: Vec::new(),
+            title: None,
+            updated_at: None,
+            meta: None,
         }
     }
-
-    /// Replace the known model list with the result of dynamic discovery.
-    ///
-    /// The first element must be the current `default_model` so the UI
-    /// selector defaults correctly.
-    #[allow(dead_code)] // wired in Phase 5 (model fetch at startup)
-    pub(crate) fn set_available_models(&mut self, models: Vec<String>) {
-        self.model_catalog = ModelCatalog {
-            ids: models,
-            ..ModelCatalog::default()
-        };
+    pub(crate) fn additional_directories(mut self, paths: Vec<PathBuf>) -> Self {
+        self.additional_directories = paths;
+        self
     }
-}
-
-impl Default for AdapterState {
-    fn default() -> Self {
-        Self::new(ChatConfig::DEFAULT_MODEL)
+    pub(crate) fn title(mut self, title: String) -> Self {
+        self.title = Some(title);
+        self
+    }
+    pub(crate) fn updated_at(mut self, updated_at: String) -> Self {
+        self.updated_at = Some(updated_at);
+        self
     }
 }
 
@@ -568,7 +374,7 @@ pub(crate) fn derive_session_title(history: &[ChatMessage]) -> String {
         )
 }
 
-fn format_session_title(content: &str) -> String {
+pub(crate) fn format_session_title(content: &str) -> String {
     const MAX_TITLE_LEN: usize = 80;
 
     let text: String = content
@@ -588,6 +394,8 @@ fn format_session_title(content: &str) -> String {
 
 #[derive(Debug)]
 pub(crate) struct SessionRecord {
+    pub(crate) selected_content: Option<crate::selected_content::Limits>,
+    pub(crate) selected_content_used: bool,
     pub(crate) cwd: PathBuf,
     pub(crate) additional_directories: Vec<PathBuf>,
     pub(crate) history: Vec<ChatMessage>,
@@ -599,8 +407,7 @@ pub(crate) struct SessionRecord {
     /// the model's own default (the parameter is omitted from the request).
     pub(crate) max_tokens: Option<u32>,
     pub(crate) permission_allow_always: HashSet<String>,
-    pub(crate) mcp_servers: Vec<McpServer>,
-    pub(crate) mcp_sessions: Vec<McpSession>,
+    pub(crate) permission_reject_always: HashSet<String>,
     /// Human-readable session title, derived from the first user message.
     pub(crate) title: String,
     /// ISO 8601 timestamp of the last activity.
@@ -609,28 +416,15 @@ pub(crate) struct SessionRecord {
     pub(crate) cost_micros: u64,
 }
 
-/// Narrow boundary around shared adapter state.
-///
-/// `SessionStore` wraps the internal `Arc<Mutex<AdapterState>>` and exposes
-/// targeted methods for session lifecycle, config, permission cache, and
-/// active-turn management. Application code uses `SessionStore` directly
-/// instead of passing raw `Arc<Mutex<AdapterState>>` through every layer.
-#[derive(Debug, Clone)]
-pub(crate) struct SessionStore {
-    pub(crate) state: Arc<Mutex<AdapterState>>,
-    persistence: Option<FilesystemSessionStore>,
-    logging_enabled: bool,
-}
-
 /// Snapshot of session data needed to begin a prompt turn.
 ///
-/// Returned by [`SessionStore::begin_turn`] so the caller does not need to
+/// Returned by [`crate::session_store::SessionStore::begin_turn`] so the caller does not need to
 /// hold the lock across model streaming.
 #[derive(Debug)]
 pub(crate) struct TurnSetup {
+    pub(crate) selected_content: Option<crate::selected_content::Limits>,
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) tool_context: ToolContext,
-    pub(crate) behavior: SessionBehavior,
     pub(crate) model: String,
     pub(crate) reasoning_effort: ReasoningEffort,
     pub(crate) max_tokens: Option<u32>,
@@ -640,566 +434,6 @@ pub(crate) struct TurnSetup {
     pub(crate) title_changed: bool,
     /// ISO 8601 timestamp of the session's latest activity.
     pub(crate) updated_at: String,
-}
-
-impl SessionStore {
-    /// Wrap an existing `Arc<Mutex<AdapterState>>` in a `SessionStore`.
-    pub(crate) fn new(state: Arc<Mutex<AdapterState>>) -> Self {
-        Self {
-            state,
-            persistence: None,
-            logging_enabled: false,
-        }
-    }
-
-    /// Attach filesystem persistence to the session store.
-    pub(crate) fn with_persistence(mut self, persistence: FilesystemSessionStore) -> Self {
-        self.persistence = Some(persistence);
-        self
-    }
-
-    /// Mark structured serve logging as available for `_meta` log paths.
-    pub(crate) fn with_logging_enabled(mut self, enabled: bool) -> Self {
-        self.logging_enabled = enabled;
-        self
-    }
-
-    /// Load a persisted session record from the filesystem store.
-    pub(crate) fn load_persisted_record(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<PersistedSessionRecord, AdapterError> {
-        let Some(persistence) = &self.persistence else {
-            return Err(AdapterError::InvalidRequest(
-                "session/load requires filesystem persistence".to_string(),
-            ));
-        };
-
-        persistence
-            .load_record(session_id.0.as_ref())
-            .map_err(|e| AdapterError::Internal(e.to_string()))
-    }
-
-    /// Return the absolute path to the session's `history.jsonl` file, if
-    /// filesystem persistence is configured.
-    pub(crate) fn history_jsonl_path(&self, session_id: &SessionId) -> Option<PathBuf> {
-        self.persistence
-            .as_ref()
-            .and_then(|p| p.history_jsonl_path(session_id.0.as_ref()).ok())
-    }
-
-    /// Build a `serde_json::Map` for the `_meta` field containing the history
-    /// JSONL path, if persistence is available.
-    pub(crate) fn session_meta(
-        &self,
-        session_id: &SessionId,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let path = self.history_jsonl_path(session_id)?;
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "historyJsonlPath".to_string(),
-            serde_json::Value::String(path.to_string_lossy().to_string()),
-        );
-        if self.logging_enabled
-            && let Some(log_path) = self
-                .persistence
-                .as_ref()
-                .and_then(|p| p.log_jsonl_path(session_id.0.as_ref()).ok())
-        {
-            meta.insert(
-                "logJsonlPath".to_string(),
-                serde_json::Value::String(log_path.to_string_lossy().to_string()),
-            );
-        }
-        Some(meta)
-    }
-
-    /// Store the client capabilities reported during initialization.
-    pub(crate) fn record_client_capabilities(
-        &self,
-        client_capabilities: ClientCapabilities,
-    ) -> Result<(), AdapterError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        guard.client_capabilities = Some(client_capabilities);
-        Ok(())
-    }
-
-    /// Return a snapshot of matching sessions for the `session/list` handler.
-    pub(crate) fn list_sessions(
-        &self,
-        cwd_filter: Option<&Path>,
-    ) -> Result<Vec<SessionInfo>, AdapterError> {
-        let (mut sessions, persistence) = {
-            let guard = self
-                .state
-                .lock()
-                .map_err(|e| AdapterError::Internal(e.to_string()))?;
-            (
-                guard
-                    .sessions
-                    .iter()
-                    .filter(|(_session_id, record)| cwd_filter.is_none_or(|cwd| record.cwd == cwd))
-                    .map(|(session_id, record)| {
-                        let mut info = SessionInfo::new(session_id.clone(), record.cwd.clone())
-                            .additional_directories(record.additional_directories.clone());
-                        if !record.title.is_empty() {
-                            info = info.title(record.title.clone());
-                        }
-                        info = info.updated_at(record.updated_at.clone());
-                        info
-                    })
-                    .collect::<Vec<_>>(),
-                self.persistence.clone(),
-            )
-        };
-
-        if let Some(persistence) = persistence {
-            let persisted_list = persistence
-                .list_persisted(cwd_filter)
-                .map_err(|e| AdapterError::Internal(e.to_string()))?;
-            for persisted in persisted_list {
-                if !sessions
-                    .iter()
-                    .any(|session| session.session_id == persisted.session_id)
-                {
-                    sessions.push(persisted);
-                }
-            }
-        }
-
-        // Attach _meta with the history JSONL path for every session that has
-        // a filesystem persistence store configured.
-        if self.persistence.is_some() {
-            for session in &mut sessions {
-                if let Some(meta) = self.session_meta(&session.session_id) {
-                    // `meta` is a public field on SessionInfo; direct assignment
-                    // is allowed despite `#[non_exhaustive]` (which only restricts
-                    // struct literal construction and exhaustive matching).
-                    session.meta = Some(meta);
-                }
-            }
-        }
-
-        // Sort most-recently-updated first so that the /resume picker surfaces
-        // recent sessions at the top regardless of filesystem iteration order.
-        // Sessions without an `updated_at` timestamp sort to the end.
-        sessions.sort_by(|a, b| {
-            let a_ts = a.updated_at.as_deref().unwrap_or("");
-            let b_ts = b.updated_at.as_deref().unwrap_or("");
-            b_ts.cmp(a_ts)
-        });
-
-        Ok(sessions)
-    }
-
-    /// Remove a session by id. Returns `true` if the session existed.
-    pub(crate) fn remove_session(&self, session_id: &SessionId) -> Result<bool, AdapterError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        Ok(guard.sessions.remove(session_id).is_some())
-    }
-
-    /// Remove a session from memory and persistent storage.
-    pub(crate) fn delete_session(&self, session_id: &SessionId) -> Result<bool, AdapterError> {
-        let persistence = self.persistence.clone();
-        let deleted_from_memory = {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|e| AdapterError::Internal(e.to_string()))?;
-            if let Some(session) = guard.sessions.get(session_id)
-                && let Some(token) = &session.active_turn
-            {
-                token.cancel();
-            }
-            guard.sessions.remove(session_id).is_some()
-        };
-
-        let deleted_from_persistence = if let Some(persistence) = persistence {
-            persistence
-                .delete_session(session_id.0.as_ref())
-                .map_err(|e| AdapterError::Internal(e.to_string()))?
-        } else {
-            false
-        };
-
-        Ok(deleted_from_memory || deleted_from_persistence)
-    }
-
-    /// Insert a new session record.
-    pub(crate) fn insert_session(
-        &self,
-        session_id: SessionId,
-        record: SessionRecord,
-    ) -> Result<(), AdapterError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        guard.sessions.insert(session_id, record);
-        Ok(())
-    }
-
-    /// Return the default model identifier for new sessions.
-    pub(crate) fn default_model(&self) -> Result<String, AdapterError> {
-        let guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        Ok(guard.default_model.clone())
-    }
-
-    /// Return the list of model IDs available for selection.
-    ///
-    /// The list is populated at startup by dynamic model discovery or falls
-    /// back to `[default_model]` when discovery is unavailable.
-    pub(crate) fn available_models(&self) -> Result<Vec<String>, AdapterError> {
-        let guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        Ok(guard.model_catalog.ids.clone())
-    }
-
-    /// Install discovery metadata in test stores; production sets it at startup.
-    #[cfg(test)]
-    pub(crate) fn set_model_catalog(&self, models: ModelCatalog) -> Result<(), AdapterError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        guard.model_catalog = models;
-        Ok(())
-    }
-
-    /// Look up context metadata for the model selected for this request.
-    pub(crate) fn model_context_window(&self, model: &str) -> Result<Option<u64>, AdapterError> {
-        let guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        Ok(guard.model_catalog.context_window(model))
-    }
-
-    /// Look up a session and return a read-only reference via a callback.
-    ///
-    /// The lock is held only for the duration of the callback.
-    pub(crate) fn with_session<T>(
-        &self,
-        session_id: &SessionId,
-        f: impl FnOnce(&SessionRecord) -> Result<T, AdapterError>,
-    ) -> Result<T, AdapterError> {
-        let guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        let session = guard.sessions.get(session_id).ok_or_else(|| {
-            AdapterError::InvalidParams(format!("unknown session id: {}", session_id.0))
-        })?;
-        f(session)
-    }
-
-    /// Look up a session and invoke a callback with a mutable reference.
-    ///
-    /// The lock is held only for the duration of the callback.
-    pub(crate) fn with_session_mut<T>(
-        &self,
-        session_id: &SessionId,
-        f: impl FnOnce(&mut SessionRecord) -> Result<T, AdapterError>,
-    ) -> Result<T, AdapterError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        let session = guard.sessions.get_mut(session_id).ok_or_else(|| {
-            AdapterError::InvalidParams(format!("unknown session id: {}", session_id.0))
-        })?;
-        f(session)
-    }
-
-    /// Return the MCP tool definitions registered for a session.
-    pub(crate) fn mcp_definitions(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Vec<ToolDefinition>, AdapterError> {
-        self.with_session(session_id, |session| {
-            Ok(session
-                .mcp_sessions
-                .iter()
-                .flat_map(|mcp| mcp.tools.iter().map(|tool| tool.definition.clone()))
-                .collect())
-        })
-    }
-
-    /// Find the MCP tool target for an exposed tool name within a session.
-    pub(crate) fn find_mcp_target(
-        &self,
-        session_id: &SessionId,
-        exposed_name: &str,
-    ) -> Result<Option<McpToolTarget>, AdapterError> {
-        self.with_session(session_id, |session| {
-            Ok(session.mcp_sessions.iter().find_map(|mcp_session| {
-                mcp_session.tools.iter().find_map(|tool| {
-                    if tool.exposed_name == exposed_name {
-                        Some(McpToolTarget {
-                            server_name: mcp_session.name.clone(),
-                            original_name: tool.original_name.clone(),
-                            peer: mcp_session.peer.clone(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-            }))
-        })
-    }
-
-    /// Check whether a tool name is in the session's allow-always cache.
-    pub(crate) fn is_always_allowed(
-        &self,
-        session_id: &SessionId,
-        tool_name: &str,
-    ) -> Result<bool, AdapterError> {
-        self.with_session(session_id, |session| {
-            Ok(session.permission_allow_always.contains(tool_name))
-        })
-    }
-
-    /// Return the current session behavior (mode) for a session.
-    pub(crate) fn session_behavior(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<SessionBehavior, AdapterError> {
-        self.with_session(session_id, |session| Ok(session.mode))
-    }
-
-    /// Insert a tool name into the session's allow-always cache.
-    pub(crate) fn add_always_allow(
-        &self,
-        session_id: &SessionId,
-        tool_name: String,
-    ) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
-            session.permission_allow_always.insert(tool_name);
-            Ok(())
-        })
-    }
-
-    /// Cancel the active turn token for a session, if one exists.
-    pub(crate) fn cancel_active_turn(&self, session_id: &SessionId) -> Result<(), AdapterError> {
-        self.with_session(session_id, |session| {
-            if let Some(token) = &session.active_turn {
-                token.cancel();
-            }
-            Ok(())
-        })
-    }
-
-    /// Clear the active turn token for a session.
-    pub(crate) fn clear_active_turn(&self, session_id: &SessionId) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
-            session.active_turn = None;
-            Ok(())
-        })
-    }
-
-    /// Set the session behavior (mode) for a session.
-    pub(crate) fn set_mode(
-        &self,
-        session_id: &SessionId,
-        mode: SessionBehavior,
-    ) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
-            session.mode = mode;
-            Ok(())
-        })
-    }
-
-    /// Set the model for a session.
-    pub(crate) fn set_model(
-        &self,
-        session_id: &SessionId,
-        model: String,
-    ) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
-            session.model = model;
-            Ok(())
-        })
-    }
-
-    /// Set the reasoning effort for a session.
-    pub(crate) fn set_reasoning_effort(
-        &self,
-        session_id: &SessionId,
-        effort: ReasoningEffort,
-    ) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
-            session.reasoning_effort = effort;
-            Ok(())
-        })
-    }
-
-    /// Set the max output token cap for a session. `None` unsets the override.
-    pub(crate) fn set_max_tokens(
-        &self,
-        session_id: &SessionId,
-        max_tokens: Option<u32>,
-    ) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
-            session.max_tokens = max_tokens;
-            Ok(())
-        })
-    }
-
-    /// Prepare a session for a new prompt turn.
-    ///
-    /// Sets the active turn token atomically and returns the messages, tool
-    /// context, model, and reasoning effort the caller needs. Returns an error
-    /// if a turn is already active.
-    pub(crate) fn begin_turn(
-        &self,
-        session_id: &SessionId,
-        token: CancellationToken,
-        user_message: ChatMessage,
-        prompt_title: Option<&str>,
-    ) -> Result<TurnSetup, AdapterError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        let client_capabilities = guard.client_capabilities.clone();
-        let session = guard.sessions.get_mut(session_id).ok_or_else(|| {
-            AdapterError::InvalidParams(format!("unknown session id: {}", session_id.0))
-        })?;
-
-        if session.active_turn.is_some() {
-            return Err(AdapterError::InvalidRequest(format!(
-                "session {} already has an active turn",
-                session_id.0
-            )));
-        }
-        session.active_turn = Some(token);
-
-        // Bump the last-activity timestamp on every prompt turn.
-        session.updated_at = iso_timestamp_now();
-
-        // Derive the title once from ACP text-block structure when available,
-        // falling back to the flattened message when no text block is present.
-        let title_changed = session.title.is_empty();
-        if title_changed {
-            session.title = prompt_title.map_or_else(
-                || {
-                    let mut candidate_messages = session.history.clone();
-                    candidate_messages.push(user_message.clone());
-                    derive_session_title(&candidate_messages)
-                },
-                format_session_title,
-            );
-        }
-
-        let mut messages = session.history.clone();
-        messages.push(user_message);
-        Ok(TurnSetup {
-            messages,
-            tool_context: ToolContext {
-                session_id: session_id.clone(),
-                cwd: session.cwd.clone(),
-                additional_directories: session.additional_directories.clone(),
-                client_capabilities,
-            },
-            behavior: session.mode,
-            model: session.model.clone(),
-            reasoning_effort: session.reasoning_effort,
-            max_tokens: session.max_tokens,
-            title: session.title.clone(),
-            title_changed,
-            updated_at: session.updated_at.clone(),
-        })
-    }
-
-    /// Persist the messages as the session history after a turn completes.
-    pub(crate) fn save_history(
-        &self,
-        session_id: &SessionId,
-        messages: &[ChatMessage],
-    ) -> Result<(), AdapterError> {
-        let (persistence, meta, new_messages) = {
-            let guard = self
-                .state
-                .lock()
-                .map_err(|e| AdapterError::Internal(e.to_string()))?;
-            let session = guard.sessions.get(session_id).ok_or_else(|| {
-                AdapterError::InvalidParams(format!("unknown session id: {}", session_id.0))
-            })?;
-            let previous_len = session.history.len();
-            let new_messages = messages
-                .iter()
-                .skip(previous_len)
-                .cloned()
-                .collect::<Vec<_>>();
-            (
-                self.persistence.clone(),
-                PersistedSessionMeta {
-                    session_id: session_id.0.to_string(),
-                    cwd: session.cwd.clone(),
-                    additional_directories: session.additional_directories.clone(),
-                    mode: session.mode,
-                    model: session.model.clone(),
-                    reasoning_effort: session.reasoning_effort,
-                    max_tokens: session.max_tokens,
-                    mcp_servers: session.mcp_servers.clone(),
-                    title: Some(session.title.clone()),
-                    updated_at: Some(session.updated_at.clone()),
-                    cost_micros: session.cost_micros,
-                },
-                new_messages,
-            )
-        };
-
-        if let Some(persistence) = persistence {
-            persistence
-                .persist_turn(&meta, &new_messages)
-                .map_err(|e| AdapterError::Internal(e.to_string()))?;
-        }
-
-        self.with_session_mut(session_id, |session| {
-            session.history = messages.to_vec();
-            Ok(())
-        })
-    }
-
-    /// Add a model cost to a session and return its cumulative cost.
-    pub(crate) fn add_cost_micros(
-        &self,
-        session_id: &SessionId,
-        cost_micros: u64,
-    ) -> Result<u64, AdapterError> {
-        self.with_session_mut(session_id, |session| {
-            session.cost_micros = session.cost_micros.saturating_add(cost_micros);
-            Ok(session.cost_micros)
-        })
-    }
-
-    /// Return the session config options for a session.
-    pub(crate) fn session_config_options(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Vec<SessionConfigOption>, AdapterError> {
-        let available_models = self.available_models()?;
-        self.with_session(session_id, |session| {
-            Ok(session_config_options(session, &available_models))
-        })
-    }
-
-    /// Look up a session record for a new-session response.
-    pub(crate) fn lookup_session(&self, session_id: &SessionId) -> Result<(), AdapterError> {
-        self.with_session(session_id, |_session| Ok(()))
-    }
 }
 
 #[cfg(test)]
