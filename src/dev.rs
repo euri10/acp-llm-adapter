@@ -30,7 +30,22 @@ use futures_util::stream::{self, BoxStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::{PermissionRequester, handle_new_session_request};
-use crate::session::{AdapterState, PermissionDecision, SessionStore, request_tool_permission};
+use crate::session::PermissionDecision;
+use crate::session_store::{AdapterState, SessionStore};
+/// Return the model the adapter should default to at startup.
+///
+/// Checks `LLM_MODEL` first, then falls back to `fallback_model`.
+pub(crate) fn initial_model(fallback_model: impl Into<String>) -> String {
+    if let Ok(value) = std::env::var(ChatConfig::ENV_MODEL) {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    fallback_model.into()
+}
+
+use crate::request_tool_permission;
 use crate::tools::ToolContext;
 
 /// Provider backend selection.
@@ -411,7 +426,7 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
     let store = SessionStore::new(Arc::new(std::sync::Mutex::new(AdapterState::default())));
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::env::current_dir().map_err(|error| {
             agent_client_protocol::Error::internal_error()
                 .data(format!("failed to get current directory: {error}"))
@@ -428,8 +443,9 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
         &store,
         &context,
         &call,
-        agent_client_protocol::schema::v1::ToolKind::Edit,
+        crate::tools::ToolKind::Edit,
         &MockPermissionRequester,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await?;
 
@@ -438,7 +454,7 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
             .data("permission gate smoke check did not allow always"));
     }
 
-    if !store.is_always_allowed(&session.session_id, "write_file")? {
+    if !store.is_always_allowed(&session.session_id.0, "write_file")? {
         return Err(agent_client_protocol::Error::internal_error()
             .data("permission gate smoke check did not cache allow_always"));
     }
@@ -476,9 +492,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
 
-    fn test_store() -> crate::session::SessionStore {
-        crate::session::SessionStore::new(Arc::new(Mutex::new(
-            crate::session::AdapterState::default(),
+    fn test_store() -> crate::session_store::SessionStore {
+        crate::session_store::SessionStore::new(Arc::new(Mutex::new(
+            crate::session_store::AdapterState::default(),
         )))
     }
 

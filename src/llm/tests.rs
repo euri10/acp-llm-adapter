@@ -2,13 +2,15 @@
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
+use serde_json::json;
+use sse_reqwest_client::{RequestBuilderExt as _, SseErrorEvent, SseEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use super::client::{ChatClient, LlmClient};
 use super::config::ChatConfig;
-use super::stream::parse_chat_completion_chunk;
+use super::stream::{parse_chat_completion_chunk, run_stream_attempt};
 use super::{
     ChatError, ChatMessage, ChatRequest, FinishReason, MessageRole, StreamEvent, ToolCall,
     ToolCallDelta, ToolDefinition,
@@ -260,6 +262,182 @@ fn parses_deepseek_usage_details() -> Result<(), ChatError> {
     );
 
     Ok(())
+}
+
+#[test_log::test]
+fn normalizes_usage_only_and_groq_envelopes() -> Result<(), ChatError> {
+    let usage = json!({
+        "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+        "context_window": 4096,
+        "prompt_tokens_details": {"cached_tokens": 1},
+        "prompt_cache_miss_tokens": 2,
+        "completion_tokens_details": {"reasoning_tokens": 2}
+    });
+    let expected = super::UsageData {
+        input_tokens: 3,
+        output_tokens: 4,
+        total_tokens: Some(7),
+        context_length: 4096,
+        thought_tokens: Some(2),
+        cached_read_tokens: Some(1),
+        cached_write_tokens: Some(2),
+    };
+    for payload in [
+        json!({"choices": [], "usage": usage}),
+        json!({"choices": [], "usage": null, "x_groq": {"usage": usage, "future": true}}),
+        json!({"choices": [], "usage": usage, "x_groq": {"usage": usage}}),
+        // Optional details can be supplied in either envelope, without counting twice.
+        json!({"choices": [], "usage": usage, "x_groq": {
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}
+        }}),
+    ] {
+        assert_eq!(
+            parse_chat_completion_chunk(&payload.to_string())?,
+            vec![StreamEvent::Usage(expected)]
+        );
+    }
+    let inline = json!({
+        "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+        "x_groq": {"id": "fixture", "usage": usage}, "future_metadata": {}
+    });
+    assert_eq!(
+        parse_chat_completion_chunk(&inline.to_string())?,
+        vec![
+            StreamEvent::Message("ok".into()),
+            StreamEvent::Finished(FinishReason::EndTurn),
+            StreamEvent::Usage(expected)
+        ]
+    );
+    Ok(())
+}
+
+#[test_log::test]
+fn usage_details_may_be_null_but_conflicting_cache_aliases_are_invalid() -> Result<(), ChatError> {
+    let payload = json!({"choices": [], "x_groq": {"usage": {
+        "prompt_tokens": 0, "completion_tokens": 0,
+        "prompt_tokens_details": null, "completion_tokens_details": null
+    }}});
+    let updates = parse_chat_completion_chunk(&payload.to_string())?;
+    assert!(
+        matches!(updates.as_slice(), [StreamEvent::Usage(usage)] if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.thought_tokens.is_none() && usage.cached_read_tokens.is_none())
+    );
+    let payload = json!({"choices": [], "usage": {
+        "prompt_tokens": 3, "completion_tokens": 4,
+        "prompt_tokens_details": {"cached_tokens": 1}, "prompt_cache_hit_tokens": 2
+    }});
+    assert!(matches!(
+        parse_chat_completion_chunk(&payload.to_string()),
+        Err(ChatError::InvalidResponse(_))
+    ));
+    Ok(())
+}
+
+#[test_log::test]
+fn rejects_empty_or_conflicting_accounting_envelopes() -> Result<(), ChatError> {
+    let usage = json!({"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7});
+    for payload in [
+        json!({"choices": [], "usage": null, "x_groq": null}),
+        json!({"choices": [], "usage": {}, "x_groq": {"id": "fixture"}}),
+        json!({"choices": [], "x_groq": {"usage": {"new_metadata": 7}}}),
+        json!({"choices": [], "usage": {"total_tokens": 7}}),
+        json!({"choices": [{"delta": {}}], "usage": usage,
+            "x_groq": {"usage": {"prompt_tokens": 4, "completion_tokens": 4, "total_tokens": 8}}}),
+        json!({"choices": [], "usage": usage,
+            "x_groq": {"usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 8}}}),
+        json!({"choices": [], "x_groq": {"usage": {"prompt_tokens": u64::MAX, "completion_tokens": 1}}}),
+    ] {
+        assert!(
+            matches!(
+                parse_chat_completion_chunk(&payload.to_string()),
+                Err(ChatError::InvalidResponse(_))
+            ),
+            "accepted {payload}"
+        );
+    }
+    for payload in [
+        json!({"choices": [{"delta": {}}], "usage": null, "x_groq": null}),
+        json!({"choices": [{"delta": {}}], "x_groq": {"id": "fixture", "future": true}}),
+    ] {
+        assert!(parse_chat_completion_chunk(&payload.to_string())?.is_empty());
+    }
+    for (field, left, right) in [
+        ("context_length", json!(4096), json!(8192)),
+        (
+            "prompt_tokens_details",
+            json!({"cached_tokens": 1}),
+            json!({"cached_tokens": 2}),
+        ),
+        (
+            "completion_tokens_details",
+            json!({"reasoning_tokens": 1}),
+            json!({"reasoning_tokens": 2}),
+        ),
+        ("prompt_cache_miss_tokens", json!(1), json!(2)),
+    ] {
+        let mut top = usage.clone();
+        let mut nested = usage.clone();
+        top[field] = left;
+        nested[field] = right;
+        let payload = json!({"choices": [], "usage": top, "x_groq": {"usage": nested}});
+        assert!(matches!(
+            parse_chat_completion_chunk(&payload.to_string()),
+            Err(ChatError::InvalidResponse(_))
+        ));
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn usage_only_frames_do_not_complete_a_truncated_stream() -> Result<(), ChatError> {
+    let body = concat!(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, server) = spawn_sse_server(body.into(), Arc::new(Mutex::new(None))).await?;
+    let client = ChatClient::new(ChatConfig::new("fixture-key", base_url, "fixture-model"));
+    let mut stream = client.stream_chat(
+        ChatRequest::new(vec![ChatMessage::user("hello")]),
+        CancellationToken::new(),
+    )?;
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::Usage(_)))
+    ));
+    let result = stream.next().await;
+    assert!(
+        matches!(result, Some(Err(ChatError::InvalidResponse(ref reason))) if reason == "stream ended before a finish reason was received")
+    );
+    server
+        .await
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
+    Ok(())
+}
+
+#[test_log::test]
+fn rejects_invalid_usage_counters() {
+    for usage in [
+        json!({"prompt_tokens": u64::MAX, "completion_tokens": 1}),
+        json!({"prompt_tokens": u64::MAX, "completion_tokens": 1, "total_tokens": u64::MAX}),
+        json!({"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 6}),
+        json!({"prompt_tokens": 3, "prompt_cache_hit_tokens": 4}),
+        json!({"prompt_tokens": 3, "prompt_cache_miss_tokens": 4}),
+        json!({"prompt_tokens": 3, "prompt_cache_hit_tokens": 2, "prompt_cache_miss_tokens": 2}),
+        json!({"prompt_tokens": u64::MAX, "prompt_cache_hit_tokens": u64::MAX, "prompt_cache_miss_tokens": 1}),
+        json!({"completion_tokens": 4, "completion_tokens_details": {"reasoning_tokens": 5}}),
+    ] {
+        let payload = json!({
+            "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": usage,
+        });
+        assert!(
+            matches!(
+                parse_chat_completion_chunk(&payload.to_string()),
+                Err(ChatError::InvalidResponse(_))
+            ),
+            "invalid usage was accepted: {usage}"
+        );
+    }
 }
 
 #[test_log::test]
@@ -582,6 +760,176 @@ async fn retries_stream_on_connection_drop_before_events() -> Result<(), ChatErr
     Ok(())
 }
 
+#[test_log::test(tokio::test)]
+async fn cancellation_or_consumer_drop_stops_a_pending_reconnect()
+-> Result<(), Box<dyn std::error::Error>> {
+    for cancel in [false, true] {
+        let (url, server) =
+            spawn_sse_server("retry: 30000\n\n".into(), Arc::new(Mutex::new(None))).await?;
+        let mut source = reqwest::Client::new()
+            .post(url)
+            .json(&serde_json::json!({"messages":[]}))
+            .into_event_source();
+        // Poll the source into backoff explicitly, rather than guessing at its
+        // state from elapsed time or the server's request counter.
+        assert!(matches!(source.next().await, Some(Ok(SseEvent::Open))));
+        assert!(matches!(
+            source.next().await,
+            Some(Ok(SseEvent::Error(SseErrorEvent::Eof)))
+        ));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        if cancel {
+            token.cancel();
+        } else {
+            drop(rx);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_stream_attempt(source, &tx, &token),
+        )
+        .await?;
+        server.await??;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn lost_sse_events_fail_before_and_after_finish() -> Result<(), Box<dyn std::error::Error>> {
+    let finish = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+    let oversized_chunks = [
+        json!({"choices":[{"delta":{"content":"x".repeat(1024)}}]}),
+        json!({"choices":[{"delta":{"reasoning_content":"x".repeat(1024)}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"x".repeat(1024)}}]}}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2},"extra":"x".repeat(1024)}),
+    ];
+    for lost in oversized_chunks {
+        for after_finish in [false, true] {
+            for fatal_decoder in [false, true] {
+                let [first, second] = if after_finish {
+                    [&finish, &lost]
+                } else {
+                    [&lost, &finish]
+                };
+                let body = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+                let (url, server) = spawn_sse_server(body, Arc::new(Mutex::new(None))).await?;
+                let source = reqwest::Client::new()
+                    .post(url)
+                    .json(&json!({}))
+                    .into_event_source_builder()
+                    .max_payload_size(std::num::NonZeroUsize::new(256).ok_or("zero size")?)
+                    .fail_on_oversized_event(fatal_decoder)
+                    .build();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                run_stream_attempt(source, &tx, &CancellationToken::new()).await;
+                drop(tx);
+                let mut failed = false;
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        Err(ChatError::Transport(_)) => failed = true,
+                        Ok(StreamEvent::Finished(_)) if after_finish => {}
+                        other => {
+                            return Err(
+                                format!("unexpected event from lossy stream: {other:?}").into()
+                            );
+                        }
+                    }
+                }
+                server.await??;
+                assert!(
+                    failed,
+                    "lost event accepted: after_finish={after_finish}, fatal_decoder={fatal_decoder}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn network_failure_after_finish_is_not_clean_eof() -> Result<(), Box<dyn std::error::Error>> {
+    for single_send in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await?;
+                if count == 0 {
+                    return Err(std::io::Error::other("request ended before headers"));
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+            // Claim more body bytes than are sent: reqwest must report a body
+            // transport failure, even though a complete finish event arrived.
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len() + 100).as_bytes()).await?;
+            socket.shutdown().await
+        });
+        let mut builder = reqwest::Client::new().get(url).into_event_source_builder();
+        if single_send {
+            builder = builder.retry_config(sse_reqwest_client::SseRetryConfig::disabled());
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        run_stream_attempt(builder.build(), &tx, &CancellationToken::new()).await;
+        drop(tx);
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(StreamEvent::Finished(_)))
+        ));
+        assert!(
+            matches!(rx.recv().await, Some(Err(ChatError::Transport(_)))),
+            "truncated HTTP body after finish was accepted: single_send={single_send}"
+        );
+        server.await??;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn trailing_usage_is_validated_after_finish_without_done()
+-> Result<(), Box<dyn std::error::Error>> {
+    for single_send in [false, true] {
+        for malformed in [false, true] {
+            let usage = if malformed {
+                json!({"prompt_tokens":5})
+            } else {
+                json!({"prompt_tokens":5,"completion_tokens":2})
+            };
+            let finish = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let accounting = json!({"choices":[],"usage":usage});
+            let (url, server) = spawn_sse_server(
+                format!("data: {finish}\n\ndata: {accounting}\n\n"),
+                Arc::new(Mutex::new(None)),
+            )
+            .await?;
+            let client = ChatClient::new(ChatConfig::new("fixture-key", url, "fixture-model"));
+            let mut request = ChatRequest::new(vec![ChatMessage::user("hello")]);
+            if single_send {
+                request = request.without_retries();
+            }
+            let mut response = client.stream_chat(request, CancellationToken::new())?;
+            assert!(matches!(
+                response.next().await,
+                Some(Ok(StreamEvent::Finished(_)))
+            ));
+            match response.next().await {
+                Some(Err(ChatError::InvalidResponse(_))) if malformed => {}
+                Some(Ok(StreamEvent::Usage(data))) if !malformed => {
+                    assert_eq!(data.input_tokens, 5);
+                    assert_eq!(data.output_tokens, 2);
+                }
+                other => return Err(format!("unexpected trailing usage event: {other:?}").into()),
+            }
+            assert!(response.next().await.is_none());
+            server.await??;
+        }
+    }
+    Ok(())
+}
+
 #[test_log::test]
 fn deepseek_config_rejects_blank_api_key_from_environment() {
     assert!(matches!(
@@ -758,6 +1106,38 @@ fn chat_message_content_and_tool_calls_accessors() {
     assert_eq!(assistant.tool_call_id(), None);
 }
 
+#[test]
+fn assistant_reasoning_roundtrips_separately_and_only_reaches_supported_wire_formats()
+-> Result<(), serde_json::Error> {
+    let message =
+        ChatMessage::assistant_with_tool_calls("", vec![ToolCall::new("call", "echo", "{}")])
+            .with_reasoning_content("opaque provider reasoning");
+    let persisted = serde_json::to_value(&message)?;
+    assert_eq!(serde_json::from_value::<ChatMessage>(persisted)?, message);
+    assert_eq!(message.content(), "");
+    for model in ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash"] {
+        let wire = serde_json::to_value(super::types::WireMessage::for_model(&message, model))?;
+        assert_eq!(wire["reasoning_content"], "opaque provider reasoning");
+        assert_eq!(wire["content"], "");
+    }
+    for model in ["openai/gpt-oss-120b", "glm-4.6", "unknown-model"] {
+        let wire = serde_json::to_value(super::types::WireMessage::for_model(&message, model))?;
+        assert!(wire.get("reasoning_content").is_none());
+        assert!(wire.get("content").is_none());
+    }
+    for message in [
+        ChatMessage::assistant("without reasoning"),
+        ChatMessage::user("user").with_reasoning_content("not an assistant"),
+    ] {
+        let wire = serde_json::to_value(super::types::WireMessage::for_model(
+            &message,
+            "deepseek-v4-pro",
+        ))?;
+        assert!(wire.get("reasoning_content").is_none());
+    }
+    Ok(())
+}
+
 #[test_log::test]
 fn chat_message_role_system_and_user() {
     assert_eq!(ChatMessage::system("s").role(), MessageRole::System);
@@ -772,6 +1152,8 @@ fn chat_request_empty_by_default() {
     assert!(request.tools().is_empty());
     assert_eq!(request.model(), None);
     assert_eq!(request.reasoning_effort(), None);
+    assert!(request.retries_allowed());
+    assert!(!request.without_retries().retries_allowed());
 }
 
 #[test_log::test]

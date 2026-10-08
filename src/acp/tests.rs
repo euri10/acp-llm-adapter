@@ -11,20 +11,23 @@ use super::{
     tool_result_content, validate_load_session_paths, validate_resume_session_paths,
     validate_session_paths,
 };
+use crate::acp::session_options::model_select_options;
 use crate::dev::MockLlmClient;
+use crate::request_tool_permission;
 use crate::session::tests::permission_mode_fixture;
 use crate::session::{
-    AdapterState, DEFAULT_MAX_TURN_REQUESTS, PERMISSION_ALLOW_ALWAYS_OPTION_ID,
-    PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision,
-    ReasoningEffort, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
-    SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, SessionStore,
-    initial_model, model_select_options, request_tool_permission, validate_session_model,
+    DEFAULT_MAX_TURN_REQUESTS, PERMISSION_ALLOW_ALWAYS_OPTION_ID, PERMISSION_ALLOW_ONCE_OPTION_ID,
+    PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision, ReasoningEffort, SESSION_CONFIG_MODE_ID,
+    SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord,
+    validate_session_model,
 };
 use crate::session_store::{FilesystemSessionStore, PersistedSessionMeta};
 use crate::test_utils::*;
+use crate::tools::ToolKind;
 use crate::tools::{
     AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolRegistry, require_tool_permission,
 };
+use crate::{AdapterState, SessionStore, initial_model};
 use acp_llm_adapter::llm::{ChatMessage, LlmClient};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -35,7 +38,6 @@ use agent_client_protocol::schema::v1::{
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigSelectOptions, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, ToolCallContent, ToolCallStatus,
-    ToolKind,
 };
 use agent_client_protocol::{Channel, Client};
 use std::path::Path;
@@ -99,7 +101,7 @@ fn assert_stored_session_state(
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let restored = guard.sessions.get(session_id).ok_or_else(|| {
+    let restored = guard.sessions.get(session_id.0.as_ref()).ok_or_else(|| {
         agent_client_protocol::Error::internal_error().data("missing restored session")
     })?;
     assert_eq!(restored.cwd, expected_cwd);
@@ -174,9 +176,12 @@ async fn prompt_request_rejects_active_turn() -> Result<(), agent_client_protoco
             .state
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let record = guard.sessions.get_mut(&session.session_id).ok_or_else(|| {
-            agent_client_protocol::Error::internal_error().data("missing stored session")
-        })?;
+        let record = guard
+            .sessions
+            .get_mut(session.session_id.0.as_ref())
+            .ok_or_else(|| {
+                agent_client_protocol::Error::internal_error().data("missing stored session")
+            })?;
         record.active_turn = Some(CancellationToken::new());
     }
 
@@ -365,11 +370,12 @@ fn initialize_handshake_records_client_capabilities() -> Result<(), agent_client
     assert_eq!(
         guard.client_capabilities.clone(),
         Some(
-            ClientCapabilities::new()
+            (ClientCapabilities::new()
                 .fs(FileSystemCapabilities::new()
                     .read_text_file(true)
                     .write_text_file(false),)
-                .terminal(true),
+                .terminal(true))
+            .into()
         )
     );
 
@@ -423,7 +429,7 @@ fn new_session_returns_id_and_mode() -> Result<(), agent_client_protocol::Error>
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    assert!(guard.sessions.contains_key(&response.session_id));
+    assert!(guard.sessions.contains_key(response.session_id.0.as_ref()));
 
     Ok(())
 }
@@ -461,7 +467,7 @@ fn new_session_advertises_model_and_reasoning_config_options()
     );
     assert_eq!(
         select_current_value(&options, SESSION_CONFIG_REASONING_EFFORT_ID)?,
-        "high"
+        "default"
     );
 
     assert_eq!(
@@ -514,9 +520,12 @@ fn set_mode_updates_session_state() -> Result<(), agent_client_protocol::Error> 
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing stored session")
-    })?;
+    let stored = guard
+        .sessions
+        .get(session.session_id.0.as_ref())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
     assert_eq!(stored.mode, SessionBehavior::Plan);
 
     Ok(())
@@ -587,9 +596,12 @@ fn set_config_option_updates_session_model_and_reasoning()
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing stored session")
-    })?;
+    let stored = guard
+        .sessions
+        .get(session.session_id.0.as_ref())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
     assert_eq!(stored.model, "deepseek-v4-flash");
     assert_eq!(stored.reasoning_effort, ReasoningEffort::Max);
 
@@ -654,7 +666,7 @@ async fn permission_request_prompts_and_caches_allow_always()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -670,8 +682,15 @@ async fn permission_request_prompts_and_caches_allow_always()
         )),
     )]);
 
-    let decision =
-        request_tool_permission(&store, &context, &call, ToolKind::Edit, &requester).await?;
+    let decision = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        &requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
 
     assert_eq!(decision, PermissionDecision::AllowAlways);
     let requests = requester.requests();
@@ -703,8 +722,15 @@ async fn permission_request_prompts_and_caches_allow_always()
     }
 
     let second_requester = FakePermissionRequester::new(Vec::new());
-    let second_decision =
-        request_tool_permission(&store, &context, &call, ToolKind::Edit, &second_requester).await?;
+    let second_decision = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        &second_requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
 
     assert_eq!(second_decision, PermissionDecision::AllowAlways);
     let second_requests = second_requester.requests();
@@ -717,9 +743,12 @@ async fn permission_request_prompts_and_caches_allow_always()
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing stored session")
-    })?;
+    let stored = guard
+        .sessions
+        .get(session.session_id.0.as_ref())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
     assert!(stored.permission_allow_always.contains("write_file"));
 
     Ok(())
@@ -730,7 +759,7 @@ async fn permission_request_rejects_without_caching() -> Result<(), agent_client
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -746,8 +775,15 @@ async fn permission_request_rejects_without_caching() -> Result<(), agent_client
         )),
     )]);
 
-    let decision =
-        request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester).await?;
+    let decision = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Execute,
+        &requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
 
     assert_eq!(decision, PermissionDecision::RejectOnce);
     let requests = requester.requests();
@@ -761,9 +797,12 @@ async fn permission_request_rejects_without_caching() -> Result<(), agent_client
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing stored session")
-    })?;
+    let stored = guard
+        .sessions
+        .get(session.session_id.0.as_ref())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
     assert!(!stored.permission_allow_always.contains("run_command"));
 
     Ok(())
@@ -782,12 +821,27 @@ async fn session_behavior_ask_prompts_all_mutations() -> Result<(), agent_client
     ]);
 
     assert_eq!(
-        request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester).await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &edit_call,
+            ToolKind::Edit,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowOnce
     );
     assert_eq!(
-        request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
-            .await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &shell_call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowOnce
     );
     assert_eq!(
@@ -817,12 +871,27 @@ async fn session_behavior_accept_edits_skips_edit_prompts()
     )]);
 
     assert_eq!(
-        request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester).await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &edit_call,
+            ToolKind::Edit,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowByMode
     );
     assert_eq!(
-        request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
-            .await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &shell_call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowOnce
     );
     assert_eq!(
@@ -838,7 +907,7 @@ async fn session_behavior_accept_edits_skips_edit_prompts()
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session_id).ok_or_else(|| {
+    let stored = guard.sessions.get(session_id.0.as_ref()).ok_or_else(|| {
         agent_client_protocol::Error::internal_error().data("missing stored session")
     })?;
     assert_eq!(stored.mode, SessionBehavior::AcceptEdits);
@@ -854,12 +923,27 @@ async fn session_behavior_yolo_auto_allows_all_mutations()
     let requester = FakePermissionRequester::new(Vec::new());
 
     assert_eq!(
-        request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester).await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &edit_call,
+            ToolKind::Edit,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowByMode
     );
     assert_eq!(
-        request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
-            .await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &shell_call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowByMode
     );
     assert!(
@@ -1001,7 +1085,7 @@ async fn request_permission_rejects_unknown_option() -> Result<(), agent_client_
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1015,8 +1099,15 @@ async fn request_permission_rejects_unknown_option() -> Result<(), agent_client_
         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("bogus")),
     )]);
 
-    let Err(error) =
-        request_tool_permission(&store, &context, &call, ToolKind::Edit, &requester).await
+    let Err(error) = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        &requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
     else {
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected unknown permission option to fail"));
@@ -1072,7 +1163,7 @@ fn validate_session_model_accepts_known_models() -> Result<(), agent_client_prot
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let record = guard
         .sessions
-        .get(&session.session_id)
+        .get(session.session_id.0.as_ref())
         .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing session"))?;
     let available = &[
         "deepseek-v4-pro".to_string(),
@@ -1094,7 +1185,7 @@ fn validate_session_model_rejects_unknown_models() -> Result<(), agent_client_pr
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let record = guard
         .sessions
-        .get(&session.session_id)
+        .get(session.session_id.0.as_ref())
         .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing session"))?;
     let available = &["deepseek-v4-pro".to_string()];
     assert!(validate_session_model(record, "bogus-model", available).is_err());
@@ -1126,7 +1217,7 @@ async fn require_tool_permission_rejects() -> Result<(), agent_client_protocol::
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1142,8 +1233,15 @@ async fn require_tool_permission_rejects() -> Result<(), agent_client_protocol::
         )),
     )]);
 
-    let Err(error) =
-        require_tool_permission(&store, &context, &call, ToolKind::Execute, Some(&requester)).await
+    let Err(error) = require_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Execute,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
     else {
         return Err(agent_client_protocol::Error::internal_error().data("expected rejection"));
     };
@@ -1156,7 +1254,7 @@ async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1170,8 +1268,15 @@ async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol
         RequestPermissionOutcome::Cancelled,
     )]);
 
-    let Err(error) =
-        require_tool_permission(&store, &context, &call, ToolKind::Execute, Some(&requester)).await
+    let Err(error) = require_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Execute,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
     else {
         return Err(agent_client_protocol::Error::internal_error().data("expected cancellation"));
     };
@@ -1183,13 +1288,21 @@ async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol
 async fn require_tool_permission_missing_requester() {
     let store = test_store();
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("no-connection"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("no-connection").to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = acp_llm_adapter::llm::ToolCall::new("id", "tool", "{}");
-    let Err(error) = require_tool_permission(&store, &context, &call, ToolKind::Edit, None).await
+    let Err(error) = require_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
     else {
         return;
     };
@@ -1201,7 +1314,8 @@ async fn request_permission_handles_unknown_session_and_cancelled()
 -> Result<(), agent_client_protocol::Error> {
     let missing_store = test_store();
     let missing_context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("missing-session"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("missing-session")
+            .to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1219,6 +1333,7 @@ async fn request_permission_handles_unknown_session_and_cancelled()
         &missing_call,
         ToolKind::Edit,
         &missing_requester,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     else {
@@ -1230,7 +1345,7 @@ async fn request_permission_handles_unknown_session_and_cancelled()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1245,7 +1360,15 @@ async fn request_permission_handles_unknown_session_and_cancelled()
     )]);
 
     assert_eq!(
-        request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester).await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::Cancelled
     );
 
@@ -1275,9 +1398,12 @@ fn set_config_option_updates_mode() -> Result<(), agent_client_protocol::Error> 
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing stored session")
-    })?;
+    let stored = guard
+        .sessions
+        .get(session.session_id.0.as_ref())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
     assert_eq!(stored.mode, SessionBehavior::Plan);
     Ok(())
 }
@@ -1337,9 +1463,12 @@ fn set_config_option_updates_session_max_tokens() -> Result<(), agent_client_pro
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing stored session")
-    })?;
+    let stored = guard
+        .sessions
+        .get(session.session_id.0.as_ref())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
     assert_eq!(stored.max_tokens, Some(8_192));
 
     Ok(())
@@ -1610,11 +1739,11 @@ fn save_history_appends_only_new_messages_to_persistence()
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
 
     store.save_history(
-        &session.session_id,
+        &session.session_id.0,
         &[ChatMessage::user("one"), ChatMessage::assistant("two")],
     )?;
     store.save_history(
-        &session.session_id,
+        &session.session_id.0,
         &[
             ChatMessage::user("one"),
             ChatMessage::assistant("two"),
@@ -1642,7 +1771,7 @@ fn list_sessions_includes_persisted_sessions_for_requested_cwd()
         .with_persistence(FilesystemSessionStore::new(&state_dir));
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
 
-    store.save_history(&session.session_id, &[ChatMessage::user("persist me")])?;
+    store.save_history(&session.session_id.0, &[ChatMessage::user("persist me")])?;
     handle_close_session_request(
         &store,
         &CloseSessionRequest::new(session.session_id.clone()),
@@ -1714,7 +1843,7 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone());
     let active = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
-    store.save_history(&active.session_id, &[ChatMessage::user("active")])?;
+    store.save_history(&active.session_id.0, &[ChatMessage::user("active")])?;
 
     let persisted_id = agent_client_protocol::schema::v1::SessionId::new("session-persisted-list");
     persistence
@@ -2039,7 +2168,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
     let session_id = agent_client_protocol::schema::v1::SessionId::new("session-delete");
     let active_turn = CancellationToken::new();
     store.insert_session(
-        session_id.clone(),
+        session_id.0.to_string(),
         SessionRecord {
             selected_content: None,
             selected_content_used: false,
@@ -2052,8 +2181,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
             reasoning_effort: ReasoningEffort::High,
             max_tokens: None,
             permission_allow_always: std::collections::HashSet::new(),
-            mcp_servers: Vec::new(),
-            mcp_sessions: Vec::new(),
+            permission_reject_always: std::collections::HashSet::new(),
             title: "temporary title".to_string(),
             updated_at: "2026-06-14T00:00:00Z".to_string(),
             cost_micros: 0,
@@ -2091,7 +2219,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    assert!(!guard.sessions.contains_key(&session_id));
+    assert!(!guard.sessions.contains_key(session_id.0.as_ref()));
     drop(guard);
 
     assert!(persistence.load_record(session_id.0.as_ref()).is_err());

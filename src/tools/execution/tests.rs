@@ -12,7 +12,7 @@ use acp_llm_adapter::llm::ToolCall as ChatToolCall;
 use agent_client_protocol::schema::v1::{
     ClientCapabilities, FileSystemCapabilities, NewSessionRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionResponse,
-    SelectedPermissionOutcome, ToolKind,
+    SelectedPermissionOutcome,
 };
 use agent_client_protocol::{Agent, Channel, Client};
 use std::sync::atomic::Ordering;
@@ -29,7 +29,8 @@ async fn read_file_tool_defaults_line_and_limit() -> Result<(), agent_client_pro
     std::fs::write(&file_path, "alpha\nbeta\ngamma\n")
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-defaults"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-defaults")
+            .to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -57,7 +58,7 @@ async fn read_file_tool_error_paths_report_failures() -> Result<(), agent_client
     std::fs::write(temp_root.join("visible.txt"), "one\ntwo\nthree")
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-tools"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-tools").to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -116,7 +117,7 @@ async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_pro
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-tools"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-tools").to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -136,7 +137,14 @@ async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_pro
         )
         .success
     );
-    assert!(!glob_tool_execution(&ChatToolCall::new("ig", "glob", "not json"), &context).success);
+    assert!(
+        !glob_tool_execution(
+            &ChatToolCall::new("ig", "glob", "not json"),
+            &context,
+            &CancellationToken::new()
+        )
+        .success
+    );
     assert!(
         !glob_tool_execution(
             &ChatToolCall::new(
@@ -144,11 +152,19 @@ async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_pro
                 "glob",
                 serde_json::json!({"pattern":"["}).to_string()
             ),
-            &context
+            &context,
+            &CancellationToken::new()
         )
         .success
     );
-    assert!(!grep_tool_execution(&ChatToolCall::new("ig2", "grep", "not json"), &context).success);
+    assert!(
+        !grep_tool_execution(
+            &ChatToolCall::new("ig2", "grep", "not json"),
+            &context,
+            &CancellationToken::new()
+        )
+        .success
+    );
     assert!(
         !grep_tool_execution(
             &ChatToolCall::new(
@@ -156,7 +172,8 @@ async fn local_tool_error_paths_report_failures() -> Result<(), agent_client_pro
                 "grep",
                 serde_json::json!({"pattern":"("}).to_string()
             ),
-            &context
+            &context,
+            &CancellationToken::new()
         )
         .success
     );
@@ -174,7 +191,7 @@ async fn read_file_tool_uses_local_fallback() -> Result<(), agent_client_protoco
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-local"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-local").to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -233,13 +250,14 @@ async fn read_file_tool_routes_to_client_fs() -> Result<(), agent_client_protoco
     });
 
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-client"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-client").to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new()
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new()
                 .read_text_file(true)
-                .write_text_file(false)),
+                .write_text_file(false)))
+            .into(),
         ),
     };
     let call = ChatToolCall::new(
@@ -305,11 +323,13 @@ async fn read_file_tool_rejects_local_non_utf8_before_client_fs()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-non-utf8"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-non-utf8")
+            .to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)))
+                .into(),
         ),
     };
     let call = ChatToolCall::new(
@@ -351,11 +371,13 @@ async fn read_file_tool_sanitizes_client_non_utf8_error() -> Result<(), agent_cl
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-client-utf8"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-client-utf8")
+            .to_string(),
         cwd: temp_root,
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)))
+                .into(),
         ),
     };
     let call = ChatToolCall::new(
@@ -394,11 +416,12 @@ async fn write_file_tool_routes_to_client_fs_write() -> Result<(), agent_client_
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)))
+                .into(),
         ),
     };
 
@@ -426,6 +449,7 @@ async fn write_file_tool_routes_to_client_fs_write() -> Result<(), agent_client_
         None,
         Some(&write_requester as &dyn crate::acp::WriteTextFileRequester),
         Some(&permission_requester),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await;
 
@@ -458,13 +482,14 @@ async fn edit_file_tool_routes_to_client_fs_read_and_write()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new()
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new()
                 .read_text_file(true)
-                .write_text_file(true)),
+                .write_text_file(true)))
+            .into(),
         ),
     };
 
@@ -495,6 +520,7 @@ async fn edit_file_tool_routes_to_client_fs_read_and_write()
         Some(&read_requester as &dyn crate::acp::ReadTextFileRequester),
         Some(&write_requester as &dyn crate::acp::WriteTextFileRequester),
         Some(&permission_requester),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await;
 
@@ -506,7 +532,7 @@ async fn edit_file_tool_routes_to_client_fs_read_and_write()
         *read_calls
             .lock()
             .map_err(agent_client_protocol::Error::into_internal_error)?,
-        1
+        2
     );
 
     let write_requests_guard = write_requests
@@ -522,6 +548,115 @@ async fn edit_file_tool_routes_to_client_fs_read_and_write()
     Ok(())
 }
 
+struct PreflightReadError {
+    error: agent_client_protocol::Error,
+    cancel: Option<CancellationToken>,
+}
+
+impl ReadTextFileRequester for PreflightReadError {
+    fn read_text_file(
+        &self,
+        _request: ReadTextFileRequest,
+    ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
+        Box::pin(async move {
+            if let Some(token) = &self.cancel {
+                token.cancel();
+            }
+            Err(self.error.clone())
+        })
+    }
+}
+
+#[test_log::test(tokio::test)]
+async fn write_file_client_preflight_only_accepts_missing_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (error, cancel, allowed) in [
+        (
+            agent_client_protocol::Error::resource_not_found(None),
+            false,
+            true,
+        ),
+        (agent_client_protocol::Error::internal_error(), false, true),
+        (
+            agent_client_protocol::Error::resource_not_found(None),
+            true,
+            true,
+        ),
+        (
+            agent_client_protocol::Error::resource_not_found(None),
+            false,
+            false,
+        ),
+    ] {
+        let root =
+            std::env::temp_dir().join(format!("acp-write-preflight-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        let store = test_store();
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&root))?;
+        let context = ToolContext {
+            session_id: session.session_id.0.to_string(),
+            cwd: root.clone(),
+            additional_directories: Vec::new(),
+            client_capabilities: Some(
+                (ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true)))
+                .into(),
+            ),
+        };
+        let token = CancellationToken::new();
+        let reader = PreflightReadError {
+            error,
+            cancel: cancel.then(|| token.clone()),
+        };
+        let writer = RecordingWriteTextFileRequester::new();
+        let permission = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(if allowed {
+                PERMISSION_ALLOW_ONCE_OPTION_ID
+            } else {
+                crate::session::PERMISSION_REJECT_ONCE_OPTION_ID
+            })),
+        )]);
+        let call = ChatToolCall::new(
+            "new-file",
+            "write_file",
+            serde_json::json!({
+                "path":"new.txt", "content":"new content"
+            })
+            .to_string(),
+        );
+        let result = write_file_tool_execution(
+            &store,
+            &call,
+            &context,
+            Some(&reader),
+            Some(&writer),
+            Some(&permission),
+            &token,
+        )
+        .await;
+        let expected_success = reader.error.code
+            == agent_client_protocol::ErrorCode::ResourceNotFound
+            && !cancel
+            && allowed;
+        assert_eq!(result.success, expected_success, "{}", result.content);
+        let requests = writer.requests();
+        let requests = requests.lock().map_err(|error| error.to_string())?;
+        assert_eq!(requests.len(), usize::from(expected_success));
+        if expected_success {
+            let request = requests.first().ok_or("missing client write")?;
+            assert_eq!(request.path, root.join("new.txt"));
+            assert_eq!(request.content, "new content");
+            let edit = result.edit.ok_or("missing native diff")?;
+            assert_eq!(edit.old_text, None);
+            assert_eq!(edit.new_text, "new content");
+        }
+        assert!(!root.join("new.txt").exists(), "unexpected local fallback");
+        std::fs::remove_dir_all(root)?;
+    }
+    Ok(())
+}
+
 #[test_log::test(tokio::test)]
 async fn write_and_edit_file_tools_modify_local_files_after_permission()
 -> Result<(), agent_client_protocol::Error> {
@@ -532,7 +667,7 @@ async fn write_and_edit_file_tools_modify_local_files_after_permission()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -560,6 +695,7 @@ async fn write_and_edit_file_tools_modify_local_files_after_permission()
         None,
         None,
         Some(&write_requester),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await;
 
@@ -603,6 +739,7 @@ async fn write_and_edit_file_tools_modify_local_files_after_permission()
         None,
         None,
         Some(&edit_requester),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await;
 
@@ -637,7 +774,7 @@ async fn run_command_tool_executes_in_session_cwd_after_permission()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root,
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -696,7 +833,7 @@ async fn local_tools_list_dir_and_glob() -> Result<(), agent_client_protocol::Er
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id,
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -766,7 +903,7 @@ async fn local_tools_grep_respects_gitignore_and_truncates()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id,
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -802,7 +939,7 @@ async fn registry_and_tool_execution_helpers_cover_error_branches()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id,
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -834,17 +971,10 @@ async fn registry_and_tool_execution_helpers_cover_error_branches()
 
     let failed = ToolExecution::failed("boom");
     assert!(!failed.success);
-    assert_eq!(
-        failed.status(),
-        agent_client_protocol::schema::v1::ToolCallStatus::Failed
-    );
     assert_eq!(failed.content_for_model(), "boom");
 
     let succeeded = ToolExecution::completed("ok", serde_json::json!({ "value": 1 }));
-    assert_eq!(
-        succeeded.status(),
-        agent_client_protocol::schema::v1::ToolCallStatus::Completed
-    );
+    assert!(succeeded.success);
     assert_eq!(succeeded.content_for_model(), "ok");
 
     Ok(())
@@ -905,7 +1035,7 @@ fn utf8_error_message_detects_all_variants() {
 async fn run_command_rejects_empty_command() {
     let store = test_store();
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("empty-cmd"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("empty-cmd").to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -931,9 +1061,9 @@ async fn run_command_rejects_empty_command() {
 
 #[test]
 fn collect_directory_entries_reports_missing() -> Result<(), agent_client_protocol::Error> {
-    let Err(error) =
-        collect_directory_entries(std::path::Path::new("/tmp/nonexistent-dir-for-test"))
-    else {
+    let Err(error) = collect_directory_entries(&confined_test_path(std::path::Path::new(
+        "/tmp/nonexistent-dir-for-test",
+    ))?) else {
         return Err(
             agent_client_protocol::Error::internal_error().data("expected error for missing dir")
         );
@@ -942,38 +1072,9 @@ fn collect_directory_entries_reports_missing() -> Result<(), agent_client_protoc
     Ok(())
 }
 
-#[test]
-fn build_root_gitignore_loads_when_present() -> Result<(), agent_client_protocol::Error> {
-    let temp_root =
-        std::env::temp_dir().join(format!("acp-llm-adapter-gi-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&temp_root)
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    std::fs::write(temp_root.join(".gitignore"), "*.log\n")
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-
-    let gitignore = build_root_gitignore(&temp_root);
-    assert!(gitignore.is_some());
-    Ok(())
-}
-
-#[test]
-fn build_root_gitignore_loads_file() -> Result<(), agent_client_protocol::Error> {
-    let temp_root = std::env::temp_dir().join(format!(
-        "acp-llm-adapter-gitignore-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&temp_root)
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    std::fs::write(temp_root.join(".gitignore"), "*.log\n")
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-
-    let gitignore = build_root_gitignore(&temp_root);
-    assert!(gitignore.is_some());
-    Ok(())
-}
-
-#[test]
-fn read_file_from_local_zero_line_defaults_to_start() -> Result<(), agent_client_protocol::Error> {
+#[tokio::test]
+async fn read_file_from_local_zero_line_defaults_to_start()
+-> Result<(), agent_client_protocol::Error> {
     let temp_root =
         std::env::temp_dir().join(format!("acp-llm-adapter-read-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
@@ -981,7 +1082,8 @@ fn read_file_from_local_zero_line_defaults_to_start() -> Result<(), agent_client
     std::fs::write(temp_root.join("lines.txt"), "a\nb\nc\nd\ne\n")
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-    let result = read_file_from_local(&temp_root.join("lines.txt"), 10, 1);
+    let result =
+        read_file_from_local(&confined_test_path(&temp_root.join("lines.txt"))?, 10, 1).await;
     assert_eq!(
         result.map_err(|e| agent_client_protocol::Error::internal_error().data(e))?,
         ""
@@ -989,8 +1091,9 @@ fn read_file_from_local_zero_line_defaults_to_start() -> Result<(), agent_client
     Ok(())
 }
 
-#[test]
-fn read_file_from_local_line_past_end_returns_empty() -> Result<(), agent_client_protocol::Error> {
+#[tokio::test]
+async fn read_file_from_local_line_past_end_returns_empty()
+-> Result<(), agent_client_protocol::Error> {
     let temp_root = std::env::temp_dir().join(format!(
         "acp-llm-adapter-read-past-{}",
         uuid::Uuid::new_v4()
@@ -1000,7 +1103,8 @@ fn read_file_from_local_line_past_end_returns_empty() -> Result<(), agent_client
     std::fs::write(temp_root.join("lines.txt"), "a\nb\nc\n")
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-    let result = read_file_from_local(&temp_root.join("lines.txt"), 10, 5);
+    let result =
+        read_file_from_local(&confined_test_path(&temp_root.join("lines.txt"))?, 10, 5).await;
     assert_eq!(
         result.map_err(|e| agent_client_protocol::Error::internal_error().data(e))?,
         ""
@@ -1038,7 +1142,7 @@ async fn glob_tool_execution_invalid_build_pattern() -> Result<(), agent_client_
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("glob-err"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("glob-err").to_string(),
         cwd: temp_root,
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1049,7 +1153,7 @@ async fn glob_tool_execution_invalid_build_pattern() -> Result<(), agent_client_
         serde_json::json!({ "pattern": "[" }).to_string(),
     );
 
-    let result = glob_tool_execution(&call, &context);
+    let result = glob_tool_execution(&call, &context, &CancellationToken::new());
     assert!(!result.success);
     assert!(result.content.contains("invalid glob pattern"));
     Ok(())
@@ -1067,7 +1171,7 @@ async fn grep_tool_execution_invalid_regex() -> Result<(), agent_client_protocol
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("grep-regex"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("grep-regex").to_string(),
         cwd: temp_root,
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1078,7 +1182,7 @@ async fn grep_tool_execution_invalid_regex() -> Result<(), agent_client_protocol
         serde_json::json!({ "pattern": "(" }).to_string(),
     );
 
-    let result = grep_tool_execution(&call, &context);
+    let result = grep_tool_execution(&call, &context, &CancellationToken::new());
     assert!(!result.success);
     assert!(result.content.contains("invalid grep regex"));
     Ok(())
@@ -1101,7 +1205,7 @@ async fn adapter_registry_execute_write_without_permission()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id,
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root,
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1132,11 +1236,12 @@ async fn write_file_with_client_capability_but_no_connection_errors()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)))
+                .into(),
         ),
     };
     let call = ChatToolCall::new(
@@ -1150,8 +1255,16 @@ async fn write_file_with_client_capability_but_no_connection_errors()
             PERMISSION_ALLOW_ONCE_OPTION_ID,
         )),
     )]);
-    let result =
-        write_file_tool_execution(&store, &call, &context, None, None, Some(&permission)).await;
+    let result = write_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        Some(&permission),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(
         result
@@ -1167,11 +1280,12 @@ async fn edit_file_with_client_read_capability_but_no_connection_errors()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)))
+                .into(),
         ),
     };
     let call = ChatToolCall::new(
@@ -1185,8 +1299,16 @@ async fn edit_file_with_client_read_capability_but_no_connection_errors()
             PERMISSION_ALLOW_ONCE_OPTION_ID,
         )),
     )]);
-    let result =
-        edit_file_tool_execution(&store, &call, &context, None, None, Some(&permission)).await;
+    let result = edit_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        Some(&permission),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(
         result
@@ -1209,11 +1331,12 @@ async fn edit_file_with_client_write_capability_but_no_connection_errors()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)))
+                .into(),
         ),
     };
     let call = ChatToolCall::new(
@@ -1227,8 +1350,16 @@ async fn edit_file_with_client_write_capability_but_no_connection_errors()
             PERMISSION_ALLOW_ONCE_OPTION_ID,
         )),
     )]);
-    let result =
-        edit_file_tool_execution(&store, &call, &context, None, None, Some(&permission)).await;
+    let result = edit_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        Some(&permission),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(
         result
@@ -1244,11 +1375,12 @@ async fn read_file_with_client_capability_but_no_connection_errors()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+            (ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)))
+                .into(),
         ),
     };
     let call = ChatToolCall::new(
@@ -1267,15 +1399,22 @@ async fn read_file_with_client_capability_but_no_connection_errors()
     Ok(())
 }
 
-#[test]
-fn helper_path_functions_cover_error_branches() -> Result<(), agent_client_protocol::Error> {
+fn confined_test_path(
+    path: &std::path::Path,
+) -> Result<ConfinedPath, agent_client_protocol::Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(agent_client_protocol::Error::internal_error)?;
+    ConfinedPath::resolve(parent, &[], path)
+        .map_err(agent_client_protocol::Error::into_internal_error)
+}
+
+#[tokio::test]
+async fn helper_path_functions_cover_error_branches() -> Result<(), agent_client_protocol::Error> {
     let temp_root =
         std::env::temp_dir().join(format!("acp-llm-adapter-path-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_root)
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    assert!(build_root_gitignore(&temp_root).is_none());
-    assert!(is_hidden_path(std::path::Path::new(".gitignore")));
-    assert!(!is_hidden_path(std::path::Path::new("src/lib.rs")));
 
     let alternate_directory = temp_root.join("alternate");
     std::fs::create_dir_all(&alternate_directory)
@@ -1287,28 +1426,40 @@ fn helper_path_functions_cover_error_branches() -> Result<(), agent_client_proto
     std::fs::write(alternate_directory.join("alternate-only.txt"), "found")
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-paths"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-paths").to_string(),
         cwd: temp_root.clone(),
         additional_directories: vec![alternate_directory.clone()],
         client_capabilities: None,
     };
     assert_eq!(
-        resolve_tool_path(&context, std::path::Path::new("found.txt")),
+        resolve_tool_path(&context, std::path::Path::new("found.txt"))
+            .await
+            .map_err(|error| agent_client_protocol::Error::internal_error().data(error))?
+            .path,
         temp_root.join("found.txt")
     );
     assert_eq!(
-        resolve_tool_path(&context, std::path::Path::new("alternate-only.txt")),
+        resolve_tool_path(&context, std::path::Path::new("alternate-only.txt"))
+            .await
+            .map_err(|error| agent_client_protocol::Error::internal_error().data(error))?
+            .path,
         alternate_directory.join("alternate-only.txt")
     );
-    assert_eq!(
-        resolve_tool_path(&context, std::path::Path::new("/abs/path")),
-        std::path::PathBuf::from("/abs/path")
+    assert!(
+        resolve_tool_path(&context, std::path::Path::new("/abs/path"))
+            .await
+            .is_err()
     );
     assert_eq!(
-        resolve_tool_path(&context, std::path::Path::new("missing.txt")),
+        resolve_tool_path(&context, std::path::Path::new("missing.txt"))
+            .await
+            .map_err(|error| agent_client_protocol::Error::internal_error().data(error))?
+            .path,
         temp_root.join("missing.txt")
     );
-    assert!(collect_directory_entries(&temp_root.join("missing-dir")).is_err());
+    assert!(
+        collect_directory_entries(&confined_test_path(&temp_root.join("missing-dir"))?).is_err()
+    );
 
     Ok(())
 }
@@ -1335,9 +1486,10 @@ async fn write_file_to_client_propagates_error() -> Result<(), agent_client_prot
     let session_id = agent_client_protocol::schema::v1::SessionId::new("write-err");
     let result = write_file_to_client(
         &FailingWriteRequester,
-        &session_id,
-        std::path::Path::new("/tmp/note.txt"),
+        &session_id.0,
+        &confined_test_path(std::path::Path::new("/tmp/note.txt"))?,
         "content",
+        &CancellationToken::new(),
     )
     .await;
     let Err(error) = result else {
@@ -1362,7 +1514,7 @@ async fn run_command_via_terminal_success_path() {
     };
 
     let result = run_command_via_terminal(
-        &session_id,
+        &session_id.0,
         "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
@@ -1380,7 +1532,7 @@ async fn run_command_via_terminal_success_path() {
 async fn run_command_via_terminal_no_connection() {
     let session_id = agent_client_protocol::schema::v1::SessionId::new("terminal-no-conn");
     let result = run_command_via_terminal(
-        &session_id,
+        &session_id.0,
         "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
@@ -1409,7 +1561,7 @@ async fn run_command_via_terminal_create_error() {
     };
 
     let result = run_command_via_terminal(
-        &session_id,
+        &session_id.0,
         "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
@@ -1438,7 +1590,7 @@ async fn run_command_via_terminal_wait_error() {
     };
 
     let result = run_command_via_terminal(
-        &session_id,
+        &session_id.0,
         "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
@@ -1467,7 +1619,7 @@ async fn run_command_via_terminal_output_error() {
     };
 
     let result = run_command_via_terminal(
-        &session_id,
+        &session_id.0,
         "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
@@ -1496,7 +1648,7 @@ async fn run_command_via_terminal_release_error() {
     };
 
     let result = run_command_via_terminal(
-        &session_id,
+        &session_id.0,
         "terminal-call",
         std::path::Path::new("/tmp"),
         "echo hi",
@@ -1512,13 +1664,15 @@ async fn run_command_via_terminal_release_error() {
 
 #[test_log::test(tokio::test)]
 async fn run_command_via_terminal_kills_on_cancellation() {
-    let tracker = CancelTracker::default();
     let token = CancellationToken::new();
-    token.cancel();
+    let tracker = CancelTracker {
+        cancel_on_wait: Some(token.clone()),
+        ..CancelTracker::default()
+    };
 
     let session_id = agent_client_protocol::schema::v1::SessionId::new("terminal-cancel");
     let result = run_command_via_terminal(
-        &session_id,
+        &session_id.0,
         "terminal-call",
         std::path::Path::new("/tmp"),
         "sleep 100",
@@ -1530,8 +1684,30 @@ async fn run_command_via_terminal_kills_on_cancellation() {
 
     assert!(!result.success);
     assert!(result.content.contains("cancelled"));
+    assert_eq!(tracker.creates.load(Ordering::SeqCst), 1);
     assert_eq!(tracker.kills.load(Ordering::SeqCst), 1);
     assert_eq!(tracker.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test_log::test(tokio::test)]
+async fn run_command_via_terminal_never_creates_after_cancellation() {
+    let tracker = CancelTracker::default();
+    let token = CancellationToken::new();
+    token.cancel();
+    let result = run_command_via_terminal(
+        "cancelled-before-create",
+        "call",
+        Path::new("/tmp"),
+        "echo fixture",
+        Some(&tracker),
+        None,
+        &token,
+    )
+    .await;
+    assert!(!result.success);
+    assert_eq!(tracker.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(tracker.kills.load(Ordering::SeqCst), 0);
+    assert_eq!(tracker.releases.load(Ordering::SeqCst), 0);
 }
 
 #[test_log::test(tokio::test)]
@@ -1548,7 +1724,7 @@ async fn edit_file_rejects_empty_old_text() -> Result<(), agent_client_protocol:
 
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1564,7 +1740,16 @@ async fn edit_file_rejects_empty_old_text() -> Result<(), agent_client_protocol:
         .to_string(),
     );
 
-    let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
+    let result = edit_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("old_text must not be empty"));
     Ok(())
@@ -1582,7 +1767,7 @@ async fn edit_file_rejects_old_text_not_found() -> Result<(), agent_client_proto
 
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1598,7 +1783,16 @@ async fn edit_file_rejects_old_text_not_found() -> Result<(), agent_client_proto
         .to_string(),
     );
 
-    let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
+    let result = edit_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("could not find old_text"));
     Ok(())
@@ -1618,7 +1812,7 @@ async fn edit_file_rejects_multiple_matches() -> Result<(), agent_client_protoco
 
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1634,7 +1828,16 @@ async fn edit_file_rejects_multiple_matches() -> Result<(), agent_client_protoco
         .to_string(),
     );
 
-    let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
+    let result = edit_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("found old_text"));
     assert!(result.content.contains("2 times"));
@@ -1646,14 +1849,23 @@ async fn write_file_rejects_invalid_arguments() -> Result<(), agent_client_proto
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = ChatToolCall::new("write-invalid", "write_file", "not json");
 
-    let result = write_file_tool_execution(&store, &call, &context, None, None, None).await;
+    let result = write_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("invalid write_file arguments"));
     Ok(())
@@ -1664,7 +1876,7 @@ async fn run_command_rejects_invalid_arguments() -> Result<(), agent_client_prot
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1691,14 +1903,23 @@ async fn edit_file_rejects_invalid_arguments() -> Result<(), agent_client_protoc
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = ChatToolCall::new("edit-invalid", "edit_file", "not json");
 
-    let result = edit_file_tool_execution(&store, &call, &context, None, None, None).await;
+    let result = edit_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(!result.success);
     assert!(result.content.contains("invalid edit_file arguments"));
     Ok(())
@@ -1712,7 +1933,7 @@ async fn require_tool_permission_propagates_request_error()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1725,8 +1946,15 @@ async fn require_tool_permission_propagates_request_error()
         "write_file",
         "{\"path\": \"x\", \"content\": \"c\"}",
     );
-    let err =
-        require_tool_permission(&store, &context, &call, ToolKind::Edit, Some(&requester)).await;
+    let err = require_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(err.is_err());
     let msg = err.err().map_or(String::new(), |e| e);
     assert!(msg.contains("failed to request permission"));
@@ -1746,7 +1974,7 @@ async fn write_file_tool_execution_read_existing_text_local_success()
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1761,8 +1989,16 @@ async fn write_file_tool_execution_read_existing_text_local_success()
         "write_file",
         serde_json::json!({"path": "existing.txt", "content": "new content"}).to_string(),
     );
-    let result =
-        write_file_tool_execution(&store, &call, &context, None, None, Some(&permission)).await;
+    let result = write_file_tool_execution(
+        &store,
+        &call,
+        &context,
+        None,
+        None,
+        Some(&permission),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     assert!(result.success);
     // old_text should be Some with the previous content
     let Some(ref edit) = result.edit else {
@@ -1821,13 +2057,14 @@ async fn run_command_tool_uses_terminal_when_capability_present()
         release_error: None,
     };
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: temp_root,
         additional_directories: Vec::new(),
         client_capabilities: Some(
-            ClientCapabilities::new()
+            (ClientCapabilities::new()
                 .terminal(true)
-                .fs(FileSystemCapabilities::new()),
+                .fs(FileSystemCapabilities::new()))
+            .into(),
         ),
     };
     let call = ChatToolCall::new(
@@ -1854,7 +2091,7 @@ async fn run_command_tool_uses_terminal_when_capability_present()
 async fn run_command_tool_execution_spawn_error_path() {
     let store = test_store();
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("spawn-err"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("spawn-err").to_string(),
         cwd: std::path::PathBuf::from("/nonexistent-dir-that-does-not-exist-for-test"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1889,7 +2126,7 @@ async fn run_command_tool_execution_spawn_error_path() {
 fn cancellation_context(store: &SessionStore) -> Result<ToolContext, agent_client_protocol::Error> {
     let session = handle_new_session_request(store, &NewSessionRequest::new("/tmp"))?;
     Ok(ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         // No terminal capability: this is the branch that runs the command
@@ -2157,17 +2394,17 @@ async fn exit_plan_mode_tool_execution_switches_to_accept_edits()
 -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+    store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
 
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
     };
     let call = ChatToolCall::new("exit-plan", "exit_plan_mode", "{}");
 
-    let result = exit_plan_mode_tool_execution(&store, &call, &context).await;
+    let result = exit_plan_mode_tool_execution(&store, &call, &context);
 
     assert!(result.success);
     assert_eq!(result.content, "switched to Accept edits mode");
@@ -2178,24 +2415,29 @@ async fn exit_plan_mode_tool_execution_switches_to_accept_edits()
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let stored = guard.sessions.get(&session.session_id).ok_or_else(|| {
-        agent_client_protocol::Error::internal_error().data("missing stored session")
-    })?;
+    let stored = guard
+        .sessions
+        .get(session.session_id.0.as_ref())
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing stored session")
+        })?;
     assert_eq!(stored.mode, SessionBehavior::AcceptEdits);
 
     Ok(())
 }
 
 #[test]
-fn collect_directory_entries_inner_read_error_path() {
+fn collect_directory_entries_inner_read_error_path() -> Result<(), agent_client_protocol::Error> {
     // On Linux, /proc/1/fd is a directory whose entries cannot be stat'd by
     // non-root — exercises the entry-level error path.
     // When /proc is absent the test is a no-op; the path is already validated
     // by the existing `collect_directory_entries_reports_missing` test.
     if std::path::Path::new("/proc/1/fd").is_dir() {
-        let result = collect_directory_entries(std::path::Path::new("/proc/1/fd"));
+        let result =
+            collect_directory_entries(&confined_test_path(std::path::Path::new("/proc/1/fd"))?);
         let _ = result;
     }
+    Ok(())
 }
 
 #[test_log::test(tokio::test)]
@@ -2213,7 +2455,8 @@ async fn read_file_tool_byte_caps_pathological_wide_line()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-widecap"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-widecap")
+            .to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -2247,7 +2490,8 @@ async fn grep_tool_byte_caps_wide_matches() -> Result<(), agent_client_protocol:
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("session-grepcap"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("session-grepcap")
+            .to_string(),
         cwd: temp_root.clone(),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -2260,6 +2504,7 @@ async fn grep_tool_byte_caps_wide_matches() -> Result<(), agent_client_protocol:
             serde_json::json!({ "pattern": "needle" }).to_string(),
         ),
         &context,
+        &CancellationToken::new(),
     );
 
     assert!(result.success);

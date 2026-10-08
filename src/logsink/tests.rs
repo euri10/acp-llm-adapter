@@ -93,10 +93,15 @@ fn record_serialises_to_exactly_one_line() {
 }
 
 #[test]
-fn unparseable_frame_is_kept_verbatim_as_a_string() {
+fn unparseable_frame_remains_a_string_subject_to_redaction() {
     let record = LogRecord::frame(Direction::AgentToClient, "not json at all");
 
-    assert_eq!(record.payload, Value::String("not json at all".to_string()));
+    let expected = if redaction_enabled() {
+        "[REDACTED]"
+    } else {
+        "not json at all"
+    };
+    assert_eq!(record.payload, Value::String(expected.to_string()));
     assert_eq!(record.kind, KIND_FRAME);
 }
 
@@ -131,6 +136,119 @@ fn structured_payloads_share_one_redaction_policy() {
         params.and_then(|params| params.get("prompt")),
         Some(&json!("[REDACTED]"))
     );
+}
+
+#[test]
+fn acp_payloads_and_trace_fields_redact_content_before_persistence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempRoot::new("acp-redaction");
+    let (sink, writer) = LogSink::channel(root.path(), 32);
+    let connection = open(&sink, "redacted");
+    let secret = "ACP_LOG_SECRET_SENTINEL";
+    let payloads = [
+        json!({"sessionUpdate": "session_info_update", "title": secret}),
+        json!({"sessionUpdate": "tool_call", "toolCallId": "call-1", "status": "pending",
+            "title": secret, "rawInput": {"command": secret}}),
+        json!({"sessionUpdate": "tool_call_update", "toolCallId": "call-1", "status": "completed",
+            "rawOutput": {"stdout": secret}, "content": [{"type": "text", "text": secret}]}),
+        json!({"toolCall": {"toolCallId": "call-1", "title": secret, "rawInput": {"command": secret}}}),
+        json!({"type": "diff", "path": "/tmp/example", "oldText": secret, "newText": secret}),
+        json!({"mcpServers": [
+            {"name": "local", "command": secret, "args": [secret], "env": [{"name": "KEY", "value": secret}]},
+            {"type": "http", "name": "remote", "url": secret, "headers": [{"name": "Authorization", "value": secret}]}
+        ], "_meta": {"extension": secret}}),
+        json!({"configOptions": [{"id": "config-1", "description": secret, "currentValue": secret}]}),
+        json!({"error": {"code": -32602, "message": secret, "data": {"detail": secret}}}),
+    ];
+    for update in payloads {
+        let payload = json!({"jsonrpc": "2.0", "id": 7, "method": "session/update",
+            "params": {"sessionId": "session-safe", "update": update}});
+        connection.log(LogRecord::new_with_redaction(
+            Direction::AgentToClient,
+            KIND_FRAME,
+            payload.clone(),
+            true,
+        ));
+        connection.log(LogRecord::new_with_redaction(
+            Direction::Internal,
+            "trace-event",
+            payload,
+            true,
+        ));
+    }
+    connection.log(LogRecord::new_with_redaction(
+        Direction::Internal,
+        "trace-event",
+        json!({"level": "WARN", "target": "adapter", "fields": {
+            "raw_input": secret, "raw_output": secret, "old_text": secret, "new_text": secret,
+            "message": secret, "error": secret, "api_key": secret, "accessToken": secret,
+            "stdout": secret, "stderr": secret,
+            "elapsed_ms": 12, "status": "completed"
+        }}),
+        true,
+    ));
+    let path = sink.connection_log_path("redacted")?;
+    drain(sink, connection, writer);
+    let contents = fs::read_to_string(&path)?;
+    assert!(
+        !contents.contains(secret),
+        "content leaked into a persisted record"
+    );
+    let records = read_records(&path);
+    assert_eq!(records.len(), 17);
+    for record in records.iter().take(16) {
+        assert_eq!(record.payload.get("method"), Some(&json!("session/update")));
+        assert_eq!(
+            record.payload.pointer("/params/sessionId"),
+            Some(&json!("session-safe"))
+        );
+        assert_eq!(record.payload.get("id"), Some(&json!(7)));
+    }
+    for (index, pointer, expected) in [
+        (2, "/params/update/toolCallId", json!("call-1")),
+        (4, "/params/update/status", json!("completed")),
+        (14, "/params/update/error/code", json!(-32602)),
+        (16, "/fields/elapsed_ms", json!(12)),
+        (16, "/target", json!("adapter")),
+    ] {
+        assert_eq!(
+            records
+                .get(index)
+                .and_then(|record| record.payload.pointer(pointer)),
+            Some(&expected)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn opaque_text_is_redacted_with_an_explicit_opt_out() {
+    for payload in [
+        json!("malformed ACP_LOG_SECRET_SENTINEL"),
+        json!(["ACP_LOG_SECRET_SENTINEL"]),
+    ] {
+        let redacted =
+            LogRecord::new_with_redaction(Direction::Internal, "stderr", payload.clone(), true);
+        assert!(
+            !redacted
+                .payload
+                .to_string()
+                .contains("ACP_LOG_SECRET_SENTINEL")
+        );
+        let clear =
+            LogRecord::new_with_redaction(Direction::Internal, "stderr", payload.clone(), false);
+        assert_eq!(clear.payload, payload);
+    }
+}
+
+#[test]
+fn unknown_text_fields_cannot_bypass_redaction() {
+    let secret = "ACP_LOG_SECRET_SENTINEL";
+    let payload =
+        json!({"method": "session/update", "extension": {"arbitrary": secret}, "echo": secret});
+    let record = LogRecord::new_with_redaction(Direction::AgentToClient, KIND_FRAME, payload, true);
+    assert!(!record.payload.to_string().contains(secret));
+    assert_eq!(record.payload.get("method"), Some(&json!("session/update")));
 }
 
 #[test]
@@ -275,6 +393,12 @@ fn binding_a_session_reroutes_subsequent_records() {
         connection_records.len(),
         2,
         "the pre-bind record plus the mapping record"
+    );
+    assert_eq!(
+        connection_records
+            .get(1)
+            .and_then(|record| record.payload.get("sessionId")),
+        Some(&json!("session-xyz"))
     );
     assert_eq!(
         connection_records.get(1).map(|r| r.kind.clone()),
