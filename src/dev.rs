@@ -8,7 +8,6 @@
 #![allow(clippy::print_stdout)]
 
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use acp_llm_adapter::llm::{
@@ -23,7 +22,7 @@ use agent_client_protocol::schema::v1::{
     StopReason,
 };
 use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{AcpAgent, Client, ConnectTo, SessionMessage};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo, SessionMessage};
 use clap::ValueEnum;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
@@ -170,28 +169,8 @@ fn trimmed_env(key: &str) -> Option<String> {
 }
 
 /// Build a dev agent pointing back at this adapter executable.
-///
-/// # Errors
-///
-/// Returns an ACP error if the agent config cannot be parsed.
-pub(crate) fn build_dev_agent(
-    executable: &Path,
-    backend: Backend,
-) -> Result<AcpAgent, agent_client_protocol::Error> {
-    let command = executable.to_string_lossy();
-    let agent_config = serde_json::json!({
-        "type": "stdio",
-        "name": "acp-llm-adapter-dev",
-        "command": command,
-        "args": [
-            "serve",
-            "--backend",
-            backend.as_str(),
-        ],
-        "env": [],
-    });
-
-    AcpAgent::from_str(&agent_config.to_string())
+pub(crate) fn build_dev_agent(executable: &Path, backend: Backend) -> AcpAgent {
+    AcpAgent::new(AcpAgentConfig::new(executable).args(["serve", "--backend", backend.as_str()]))
 }
 
 /// Run a smoke test end-to-end: init → new session → prompt → stop reason.
@@ -227,16 +206,8 @@ pub(crate) async fn run_smoke_flow(
                 .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
                 .block_task()
                 .await?;
-            let new_session_response = cx
-                .send_request(NewSessionRequest::new(std::env::current_dir().map_err(
-                    |error| {
-                        agent_client_protocol::Error::internal_error()
-                            .data(format!("failed to get current directory: {error}"))
-                    },
-                )?))
-                .block_task()
-                .await?;
-            let mut session = cx.attach_session(new_session_response.clone(), Vec::new())?;
+            let mut session = cx.build_session_cwd()?.block_task().start_session().await?;
+            let new_session_response = session.response();
             session.send_prompt(prompt.as_str())?;
 
             let mut updates = Vec::new();
@@ -484,9 +455,8 @@ mod tests {
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
-        McpServer, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
-        RequestPermissionRequest, SessionId, StopReason, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields, ToolKind,
+        PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+        SessionId, StopReason, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
     use futures_util::StreamExt;
     use std::sync::{Arc, Mutex};
@@ -499,24 +469,15 @@ mod tests {
     }
 
     #[test_log::test]
-    fn build_dev_agent_uses_backend_and_executable_path() -> Result<(), agent_client_protocol::Error>
-    {
-        let agent = build_dev_agent(std::path::Path::new("/tmp/acp-llm-adapter"), Backend::Mock)?;
-
-        let McpServer::Stdio(stdio) = agent.server() else {
-            return Err(
-                agent_client_protocol::Error::internal_error().data("expected stdio transport")
-            );
-        };
+    fn build_dev_agent_uses_backend_and_executable_path() {
+        let agent = build_dev_agent(std::path::Path::new("/tmp/acp-llm-adapter"), Backend::Mock);
 
         assert_eq!(
-            stdio.command,
-            std::path::PathBuf::from("/tmp/acp-llm-adapter")
+            agent.config().command(),
+            std::path::Path::new("/tmp/acp-llm-adapter")
         );
-        assert_eq!(stdio.args, vec!["serve", "--backend", "mock"]);
-        assert!(stdio.env.is_empty());
-
-        Ok(())
+        assert_eq!(agent.config().arguments(), ["serve", "--backend", "mock"]);
+        assert!(agent.config().environment().is_empty());
     }
 
     #[test_log::test(tokio::test)]
@@ -811,23 +772,20 @@ mod tests {
     }
 
     #[test_log::test]
-    fn build_dev_agent_uses_deepseek_backend_args() -> Result<(), agent_client_protocol::Error> {
+    fn build_dev_agent_uses_deepseek_backend_args() {
         let agent = build_dev_agent(
             std::path::Path::new("/tmp/acp-llm-adapter"),
             Backend::DeepSeek,
-        )?;
-
-        let McpServer::Stdio(stdio) = agent.server() else {
-            return Err(
-                agent_client_protocol::Error::internal_error().data("expected stdio transport")
-            );
-        };
-        assert_eq!(
-            stdio.command,
-            std::path::PathBuf::from("/tmp/acp-llm-adapter")
         );
-        assert_eq!(stdio.args, vec!["serve", "--backend", "deepseek"]);
-        Ok(())
+
+        assert_eq!(
+            agent.config().command(),
+            std::path::Path::new("/tmp/acp-llm-adapter")
+        );
+        assert_eq!(
+            agent.config().arguments(),
+            ["serve", "--backend", "deepseek"]
+        );
     }
 
     #[test_log::test(tokio::test)]

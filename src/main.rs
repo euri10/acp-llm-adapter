@@ -534,7 +534,7 @@ async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protoc
                 .data(format!("failed to locate current executable: {error}"))
         })?,
         backend,
-    )?;
+    );
     let result = run_smoke_flow(agent, prompt).await?;
     print_dev_smoke_result(&result);
     exercise_permission_gate_smoke().await?;
