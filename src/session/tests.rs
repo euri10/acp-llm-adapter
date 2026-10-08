@@ -6,6 +6,81 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome, SessionModeId,
     ToolKind,
 };
+use tokio_util::sync::CancellationToken;
+
+#[test_log::test(tokio::test)]
+async fn clear_history_preserves_settings_permissions_and_spend()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = std::env::temp_dir().join(format!("acp-clear-store-{}", uuid::Uuid::new_v4()));
+    let store = crate::test_store()
+        .with_persistence(crate::session_store::FilesystemSessionStore::new(&root));
+    let session = crate::acp::handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+    )?
+    .session_id;
+    let history = vec![acp_llm_adapter::llm::ChatMessage::user(
+        "private old context",
+    )];
+    store.save_history(&session, &history)?;
+    store.set_model(&session, "deepseek-v4-pro".into())?;
+    store.set_reasoning_effort(&session, ReasoningEffort::Max)?;
+    store.set_max_tokens(&session, Some(4096))?;
+    store.set_mode(&session, SessionBehavior::Plan)?;
+    store.add_cost_micros(&session, 1234)?;
+    store.add_always_allow(&session, "write_file".into())?;
+    store.add_always_reject(&session, "run_command".into())?;
+    store.clear_history(&session).await?;
+    store.with_session(&session, |record| {
+        assert!(record.history.is_empty());
+        assert_eq!(record.cost_micros, 1234);
+        assert!(record.permission_allow_always.contains("write_file"));
+        assert!(record.permission_reject_always.contains("run_command"));
+        assert!(record.active_turn.is_none());
+        Ok(())
+    })?;
+    let persisted = store.load_persisted_record(&session)?;
+    assert!(persisted.history.is_empty());
+    assert_eq!(persisted.meta.cost_micros, 1234);
+    assert_eq!(persisted.meta.mode, SessionBehavior::Plan);
+    assert_eq!(persisted.meta.model, "deepseek-v4-pro");
+    assert_eq!(persisted.meta.reasoning_effort, ReasoningEffort::Max);
+    assert_eq!(persisted.meta.max_tokens, Some(4096));
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn clear_history_failure_keeps_memory_and_disk_conversation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = std::env::temp_dir().join(format!("acp-clear-failure-{}", uuid::Uuid::new_v4()));
+    let store = crate::test_store()
+        .with_persistence(crate::session_store::FilesystemSessionStore::new(&root));
+    let session = crate::acp::handle_new_session_request(
+        &store,
+        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+    )?
+    .session_id;
+    let history = vec![acp_llm_adapter::llm::ChatMessage::user("keep this context")];
+    store.save_history(&session, &history)?;
+    let staging_path = root
+        .join("sessions")
+        .join(session.0.as_ref())
+        .join("history.jsonl.tmp");
+    std::fs::create_dir(&staging_path)?;
+    assert!(store.clear_history(&session).await.is_err());
+    store.with_session(&session, |record| {
+        assert_eq!(record.history, history);
+        assert!(record.active_turn.is_none());
+        Ok(())
+    })?;
+    assert_eq!(store.load_persisted_record(&session)?.history, history);
+    std::fs::remove_dir(staging_path)?;
+    store.clear_history(&session).await?;
+    assert!(store.load_persisted_record(&session)?.history.is_empty());
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
 
 /// Return type for [`permission_mode_fixture`].
 pub(crate) type PermissionModeFixture = (
@@ -83,15 +158,29 @@ async fn reject_always_is_remembered_before_mode_auto_approval()
             )),
         )]);
     assert_eq!(
-        super::request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester)
-            .await?,
+        super::request_tool_permission(
+            &store,
+            &context,
+            &call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::RejectAlways
     );
     store.set_mode(&session_id, SessionBehavior::Yolo)?;
     let requester = crate::test_utils::FakePermissionRequester::new(Vec::new());
     assert_eq!(
-        super::request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester)
-            .await?,
+        super::request_tool_permission(
+            &store,
+            &context,
+            &call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::RejectAlways,
         "YOLO must not discard a remembered editor denial"
     );
@@ -103,9 +192,9 @@ fn reasoning_effort_name_and_description() {
     assert_eq!(ReasoningEffort::High.name(), "High");
     assert_eq!(ReasoningEffort::Max.name(), "Max");
     assert!(
-        ReasoningEffort::High
+        ReasoningEffort::Default
             .description()
-            .contains("Default reasoning")
+            .contains("default reasoning")
     );
     assert!(
         ReasoningEffort::Max

@@ -265,6 +265,156 @@ fn parses_deepseek_usage_details() -> Result<(), ChatError> {
 }
 
 #[test_log::test]
+fn normalizes_usage_only_and_groq_envelopes() -> Result<(), ChatError> {
+    let usage = json!({
+        "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+        "context_window": 4096,
+        "prompt_tokens_details": {"cached_tokens": 1},
+        "prompt_cache_miss_tokens": 2,
+        "completion_tokens_details": {"reasoning_tokens": 2}
+    });
+    let expected = super::UsageData {
+        input_tokens: 3,
+        output_tokens: 4,
+        total_tokens: Some(7),
+        context_length: 4096,
+        thought_tokens: Some(2),
+        cached_read_tokens: Some(1),
+        cached_write_tokens: Some(2),
+    };
+    for payload in [
+        json!({"choices": [], "usage": usage}),
+        json!({"choices": [], "usage": null, "x_groq": {"usage": usage, "future": true}}),
+        json!({"choices": [], "usage": usage, "x_groq": {"usage": usage}}),
+        // Optional details can be supplied in either envelope, without counting twice.
+        json!({"choices": [], "usage": usage, "x_groq": {
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}
+        }}),
+    ] {
+        assert_eq!(
+            parse_chat_completion_chunk(&payload.to_string())?,
+            vec![StreamEvent::Usage(expected)]
+        );
+    }
+    let inline = json!({
+        "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+        "x_groq": {"id": "fixture", "usage": usage}, "future_metadata": {}
+    });
+    assert_eq!(
+        parse_chat_completion_chunk(&inline.to_string())?,
+        vec![
+            StreamEvent::Message("ok".into()),
+            StreamEvent::Finished(FinishReason::EndTurn),
+            StreamEvent::Usage(expected)
+        ]
+    );
+    Ok(())
+}
+
+#[test_log::test]
+fn usage_details_may_be_null_but_conflicting_cache_aliases_are_invalid() -> Result<(), ChatError> {
+    let payload = json!({"choices": [], "x_groq": {"usage": {
+        "prompt_tokens": 0, "completion_tokens": 0,
+        "prompt_tokens_details": null, "completion_tokens_details": null
+    }}});
+    let updates = parse_chat_completion_chunk(&payload.to_string())?;
+    assert!(
+        matches!(updates.as_slice(), [StreamEvent::Usage(usage)] if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.thought_tokens.is_none() && usage.cached_read_tokens.is_none())
+    );
+    let payload = json!({"choices": [], "usage": {
+        "prompt_tokens": 3, "completion_tokens": 4,
+        "prompt_tokens_details": {"cached_tokens": 1}, "prompt_cache_hit_tokens": 2
+    }});
+    assert!(matches!(
+        parse_chat_completion_chunk(&payload.to_string()),
+        Err(ChatError::InvalidResponse(_))
+    ));
+    Ok(())
+}
+
+#[test_log::test]
+fn rejects_empty_or_conflicting_accounting_envelopes() -> Result<(), ChatError> {
+    let usage = json!({"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7});
+    for payload in [
+        json!({"choices": [], "usage": null, "x_groq": null}),
+        json!({"choices": [], "usage": {}, "x_groq": {"id": "fixture"}}),
+        json!({"choices": [], "x_groq": {"usage": {"new_metadata": 7}}}),
+        json!({"choices": [], "usage": {"total_tokens": 7}}),
+        json!({"choices": [{"delta": {}}], "usage": usage,
+            "x_groq": {"usage": {"prompt_tokens": 4, "completion_tokens": 4, "total_tokens": 8}}}),
+        json!({"choices": [], "usage": usage,
+            "x_groq": {"usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 8}}}),
+        json!({"choices": [], "x_groq": {"usage": {"prompt_tokens": u64::MAX, "completion_tokens": 1}}}),
+    ] {
+        assert!(
+            matches!(
+                parse_chat_completion_chunk(&payload.to_string()),
+                Err(ChatError::InvalidResponse(_))
+            ),
+            "accepted {payload}"
+        );
+    }
+    for payload in [
+        json!({"choices": [{"delta": {}}], "usage": null, "x_groq": null}),
+        json!({"choices": [{"delta": {}}], "x_groq": {"id": "fixture", "future": true}}),
+    ] {
+        assert!(parse_chat_completion_chunk(&payload.to_string())?.is_empty());
+    }
+    for (field, left, right) in [
+        ("context_length", json!(4096), json!(8192)),
+        (
+            "prompt_tokens_details",
+            json!({"cached_tokens": 1}),
+            json!({"cached_tokens": 2}),
+        ),
+        (
+            "completion_tokens_details",
+            json!({"reasoning_tokens": 1}),
+            json!({"reasoning_tokens": 2}),
+        ),
+        ("prompt_cache_miss_tokens", json!(1), json!(2)),
+    ] {
+        let mut top = usage.clone();
+        let mut nested = usage.clone();
+        top[field] = left;
+        nested[field] = right;
+        let payload = json!({"choices": [], "usage": top, "x_groq": {"usage": nested}});
+        assert!(matches!(
+            parse_chat_completion_chunk(&payload.to_string()),
+            Err(ChatError::InvalidResponse(_))
+        ));
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn usage_only_frames_do_not_complete_a_truncated_stream() -> Result<(), ChatError> {
+    let body = concat!(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, server) = spawn_sse_server(body.into(), Arc::new(Mutex::new(None))).await?;
+    let client = ChatClient::new(ChatConfig::new("fixture-key", base_url, "fixture-model"));
+    let mut stream = client.stream_chat(
+        ChatRequest::new(vec![ChatMessage::user("hello")]),
+        CancellationToken::new(),
+    )?;
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::Usage(_)))
+    ));
+    let result = stream.next().await;
+    assert!(
+        matches!(result, Some(Err(ChatError::InvalidResponse(ref reason))) if reason == "stream ended before a finish reason was received")
+    );
+    server
+        .await
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
+    Ok(())
+}
+
+#[test_log::test]
 fn rejects_invalid_usage_counters() {
     for usage in [
         json!({"prompt_tokens": u64::MAX, "completion_tokens": 1}),
@@ -818,6 +968,38 @@ fn chat_message_content_and_tool_calls_accessors() {
     assert!(!assistant.tool_calls().is_empty());
     assert_eq!(assistant.tool_calls()[0].name(), "n");
     assert_eq!(assistant.tool_call_id(), None);
+}
+
+#[test]
+fn assistant_reasoning_roundtrips_separately_and_only_reaches_supported_wire_formats()
+-> Result<(), serde_json::Error> {
+    let message =
+        ChatMessage::assistant_with_tool_calls("", vec![ToolCall::new("call", "echo", "{}")])
+            .with_reasoning_content("opaque provider reasoning");
+    let persisted = serde_json::to_value(&message)?;
+    assert_eq!(serde_json::from_value::<ChatMessage>(persisted)?, message);
+    assert_eq!(message.content(), "");
+    for model in ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash"] {
+        let wire = serde_json::to_value(super::types::WireMessage::for_model(&message, model))?;
+        assert_eq!(wire["reasoning_content"], "opaque provider reasoning");
+        assert_eq!(wire["content"], "");
+    }
+    for model in ["openai/gpt-oss-120b", "glm-4.6", "unknown-model"] {
+        let wire = serde_json::to_value(super::types::WireMessage::for_model(&message, model))?;
+        assert!(wire.get("reasoning_content").is_none());
+        assert!(wire.get("content").is_none());
+    }
+    for message in [
+        ChatMessage::assistant("without reasoning"),
+        ChatMessage::user("user").with_reasoning_content("not an assistant"),
+    ] {
+        let wire = serde_json::to_value(super::types::WireMessage::for_model(
+            &message,
+            "deepseek-v4-pro",
+        ))?;
+        assert!(wire.get("reasoning_content").is_none());
+    }
+    Ok(())
 }
 
 #[test_log::test]

@@ -137,6 +137,9 @@ impl ToolRegistry for AdapterToolRegistry {
         cancellation_token: CancellationToken,
     ) -> ToolExecutionFuture<'a> {
         Box::pin(async move {
+            if cancellation_token.is_cancelled() {
+                return ToolExecution::failed(format!("{} cancelled", call.name()));
+            }
             match store.selected_content_limits(&context.session_id) {
                 Ok(Some(_)) => {
                     return ToolExecution::failed(
@@ -155,9 +158,26 @@ impl ToolRegistry for AdapterToolRegistry {
                     )
                     .await
                 }
-                "list_dir" => list_dir_tool_execution(call, context),
-                "glob" => glob_tool_execution(call, context),
-                "grep" => grep_tool_execution(call, context),
+                "list_dir" => {
+                    let call = call.clone();
+                    let context = context.clone();
+                    blocking::unblock(move || list_dir_tool_execution(&call, &context)).await
+                }
+                "glob" | "grep" => {
+                    let call = call.clone();
+                    let context = context.clone();
+                    let cancellation = cancellation_token.child_token();
+                    // Dropping the ACP turn also stops its blocking traversal.
+                    let _cancel_on_drop = cancellation.clone().drop_guard();
+                    blocking::unblock(move || {
+                        if call.name() == "glob" {
+                            glob_tool_execution(&call, &context, &cancellation)
+                        } else {
+                            grep_tool_execution(&call, &context, &cancellation)
+                        }
+                    })
+                    .await
+                }
                 "write_file" => {
                     write_file_tool_execution(
                         store,
@@ -166,6 +186,7 @@ impl ToolRegistry for AdapterToolRegistry {
                         connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
                         connection.map(|requester| requester as &dyn crate::WriteTextFileRequester),
                         connection.map(|requester| requester as &dyn crate::PermissionRequester),
+                        &cancellation_token,
                     )
                     .await
                 }
@@ -177,6 +198,7 @@ impl ToolRegistry for AdapterToolRegistry {
                         connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
                         connection.map(|requester| requester as &dyn crate::WriteTextFileRequester),
                         connection.map(|requester| requester as &dyn crate::PermissionRequester),
+                        &cancellation_token,
                     )
                     .await
                 }
@@ -286,6 +308,9 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingToolCallRequester {
+        cancel_on_permission: Option<CancellationToken>,
+        hold_permission: bool,
+        cancel_on_read: Option<CancellationToken>,
         read_file: AtomicUsize,
         write_file: AtomicUsize,
         permission: AtomicUsize,
@@ -293,6 +318,7 @@ mod tests {
         terminal_output: AtomicUsize,
         terminal_wait: AtomicUsize,
         terminal_release: AtomicUsize,
+        progress: AtomicUsize,
     }
 
     impl RecordingToolCallRequester {
@@ -315,6 +341,9 @@ mod tests {
             _request: ReadTextFileRequest,
         ) -> BoxFuture<'_, Result<ReadTextFileResponse, agent_client_protocol::Error>> {
             self.read_file.fetch_add(1, Ordering::SeqCst);
+            if let Some(token) = &self.cancel_on_read {
+                token.cancel();
+            }
             Box::pin(async move { Ok(ReadTextFileResponse::new("client original")) })
         }
     }
@@ -337,6 +366,17 @@ mod tests {
         {
             self.permission.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                if let Some(token) = &self.cancel_on_permission {
+                    token.cancel();
+                    if self.hold_permission {
+                        return std::future::pending().await;
+                    }
+                    return Ok(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                            crate::session::PERMISSION_ALLOW_ALWAYS_OPTION_ID,
+                        )),
+                    ));
+                }
                 Ok(RequestPermissionResponse::new(
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                         PERMISSION_ALLOW_ONCE_OPTION_ID,
@@ -352,9 +392,7 @@ mod tests {
             _session_id: &agent_client_protocol::schema::v1::SessionId,
             _tool_call_id: &str,
         ) {
-            // Progress is a notification with no reply, so there is nothing for
-            // these tests to observe. tests/serve_tool_calls.rs asserts it over
-            // the wire, where a client can actually see it.
+            self.progress.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -415,6 +453,110 @@ mod tests {
             additional_directories: Vec::new(),
             client_capabilities: None,
         }
+    }
+
+    async fn check_cancelled_mutations(
+        cancel_before: bool,
+        hold_permission: bool,
+        cancel_on_read: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("tool-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let file = root.join("sample.txt");
+        for client_io in [false, true] {
+            for (tool, arguments) in [
+                (
+                    "write_file",
+                    serde_json::json!({"path":"sample.txt", "content":"changed"}),
+                ),
+                (
+                    "edit_file",
+                    serde_json::json!({"path":"sample.txt", "old_text":"original", "new_text":"changed"}),
+                ),
+                (
+                    "run_command",
+                    serde_json::json!({"command":"printf changed > sample.txt"}),
+                ),
+            ] {
+                if cancel_on_read && (!client_io || tool == "run_command") {
+                    continue;
+                }
+                std::fs::write(&file, "client original")?;
+                let store = test_store();
+                let session = handle_new_session_request(&store, &NewSessionRequest::new(&root))?;
+                let mut context = registry_context(root.clone());
+                context.session_id = session.session_id;
+                if client_io {
+                    context.client_capabilities = Some(
+                        ClientCapabilities::new()
+                            .fs(FileSystemCapabilities::new()
+                                .read_text_file(true)
+                                .write_text_file(true))
+                            .terminal(true),
+                    );
+                }
+                let token = CancellationToken::new();
+                if cancel_before {
+                    store.set_mode(&context.session_id, crate::SessionBehavior::Yolo)?;
+                    token.cancel();
+                }
+                let requester = RecordingToolCallRequester {
+                    cancel_on_permission: (!cancel_before && !cancel_on_read)
+                        .then(|| token.clone()),
+                    hold_permission,
+                    cancel_on_read: cancel_on_read.then(|| token.clone()),
+                    ..RecordingToolCallRequester::default()
+                };
+                let call = ChatToolCall::new("cancelled-call", tool, arguments.to_string());
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    AdapterToolRegistry.execute(&call, &context, &store, Some(&requester), token),
+                )
+                .await?;
+                assert!(
+                    !result.success && result.content.contains("cancelled"),
+                    "{tool}: {result:?}"
+                );
+                assert_eq!(
+                    requester.write_calls(),
+                    0,
+                    "{tool} wrote after cancellation"
+                );
+                assert_eq!(requester.terminal_create.load(Ordering::SeqCst), 0);
+                assert_eq!(requester.progress.load(Ordering::SeqCst), 0);
+                assert_eq!(std::fs::read_to_string(&file)?, "client original");
+                assert!(!store.is_always_allowed(&context.session_id, tool)?);
+                if cancel_before {
+                    assert_eq!(requester.permission_calls(), 0);
+                }
+            }
+        }
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn pending_builtin_approval_cancels_without_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        check_cancelled_mutations(false, true, false).await
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn late_builtin_approval_neither_executes_nor_remembers_permission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        check_cancelled_mutations(false, false, false).await
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn already_cancelled_builtin_tools_never_start() -> Result<(), Box<dyn std::error::Error>>
+    {
+        check_cancelled_mutations(true, false, false).await
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn cancellation_during_edit_preflight_prevents_writing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        check_cancelled_mutations(false, false, true).await
     }
 
     #[test]

@@ -5,7 +5,9 @@
 //! - `execution`: tool definitions, execution functions, helpers, tests
 
 mod execution;
+mod filesystem;
 mod registry;
+mod search;
 
 pub(crate) use execution::require_tool_permission;
 pub(crate) use registry::{AdapterToolRegistry, ToolContext, ToolExecution, ToolRegistry};

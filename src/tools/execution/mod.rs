@@ -1,27 +1,26 @@
 //! Tool definitions, execution, and helper utilities.
 
 use std::fmt::Write as _;
-use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
-    CreateTerminalRequest, KillTerminalRequest, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, ReadTextFileRequest, ReleaseTerminalRequest, SessionId, TerminalOutputRequest,
-    ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
+    CreateTerminalRequest, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    ReadTextFileRequest, SessionId, TerminalOutputRequest, ToolKind, WaitForTerminalExitRequest,
+    WriteTextFileRequest,
 };
 use globset::{Glob, GlobSetBuilder};
 use grep::regex::RegexMatcher;
 use grep::searcher::sinks::UTF8;
 use grep::searcher::{BinaryDetection, SearcherBuilder};
-use ignore::WalkBuilder;
-use ignore::gitignore::GitignoreBuilder;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use super::filesystem::ConfinedPath;
 use super::registry::{ToolContext, ToolEdit, ToolExecution};
+use super::search::{SearchReader, walk_files};
 use crate::{
     PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionBehavior, SessionStore,
     TerminalRequester, ToolProgressReporter, WriteTextFileRequester, request_tool_permission,
@@ -323,7 +322,10 @@ pub(crate) async fn read_file_tool_execution(
         }
     };
 
-    let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
+    let resolved_path = match resolve_tool_path(context, &parsed_arguments.path).await {
+        Ok(path) => path,
+        Err(error) => return ToolExecution::failed(error),
+    };
     let start_line = parsed_arguments.line.unwrap_or(1);
     let requested_limit = parsed_arguments.limit.unwrap_or(TOOL_OUTPUT_LIMIT_U32);
     let limit = requested_limit.min(TOOL_OUTPUT_LIMIT_U32);
@@ -343,8 +345,8 @@ pub(crate) async fn read_file_tool_execution(
     {
         match connection {
             Some(connection) => {
-                if local_file_is_non_utf8(&resolved_path) {
-                    return ToolExecution::failed(non_utf8_file_message(&resolved_path));
+                if local_file_is_non_utf8(&resolved_path).await {
+                    return ToolExecution::failed(non_utf8_file_message(&resolved_path.path));
                 }
 
                 read_file_from_client(
@@ -359,14 +361,14 @@ pub(crate) async fn read_file_tool_execution(
             None => Err("read_file needs a client connection for fs/read_text_file".to_owned()),
         }
     } else {
-        read_file_from_local(&resolved_path, start_line, limit)
+        read_file_from_local(&resolved_path, start_line, limit).await
     };
 
     match file_result {
         Ok(file_slice) => ToolExecution {
             content: truncate_tool_output(&file_slice, FILE_OUTPUT_LIMIT).0,
             raw_output: serde_json::json!({
-                "path": resolved_path,
+                "path": resolved_path.path,
                 "line": start_line,
                 "limit": limit,
                 "source": if context
@@ -393,6 +395,7 @@ pub(crate) async fn write_file_tool_execution(
     read_connection: Option<&dyn ReadTextFileRequester>,
     write_connection: Option<&dyn WriteTextFileRequester>,
     permission_requester: Option<&dyn PermissionRequester>,
+    cancellation: &CancellationToken,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<WriteFileArguments>(call.arguments()) {
         Ok(arguments) => arguments,
@@ -401,28 +404,39 @@ pub(crate) async fn write_file_tool_execution(
         }
     };
 
-    if let Err(error) =
-        require_tool_permission(store, context, call, ToolKind::Edit, permission_requester).await
+    let resolved_path = match resolve_tool_path(context, &parsed_arguments.path).await {
+        Ok(path) => path,
+        Err(error) => return ToolExecution::failed(error),
+    };
+
+    if let Err(error) = require_tool_permission(
+        store,
+        context,
+        call,
+        ToolKind::Edit,
+        permission_requester,
+        cancellation,
+    )
+    .await
     {
         return ToolExecution::failed(error);
     }
 
-    let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
     let use_client_write = context
         .client_capabilities
         .as_ref()
         .is_some_and(|capabilities| capabilities.fs.write_text_file);
-    let old_text = match read_existing_text(
-        context,
-        &resolved_path,
-        read_connection,
-        use_client_write,
-    )
-    .await
-    {
+    let old_text = match tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return ToolExecution::failed("write_file cancelled"),
+        result = read_existing_text(context, &resolved_path, read_connection, use_client_write) => result,
+    } {
         Ok(text) => text,
         Err(error) => return ToolExecution::failed(error),
     };
+    if cancellation.is_cancelled() {
+        return ToolExecution::failed("write_file cancelled");
+    }
     let write_result = if use_client_write {
         match write_connection {
             Some(connection) => {
@@ -431,28 +445,32 @@ pub(crate) async fn write_file_tool_execution(
                     &context.session_id,
                     &resolved_path,
                     &parsed_arguments.content,
+                    cancellation,
                 )
                 .await
             }
             None => Err("write_file needs a client connection for fs/write_text_file".to_owned()),
         }
     } else {
-        write_file_to_local(&resolved_path, &parsed_arguments.content)
+        write_file_to_local(&resolved_path, &parsed_arguments.content, cancellation).await
     };
 
     match write_result {
         Ok(()) => {
             let byte_count = parsed_arguments.content.len();
             ToolExecution {
-                content: format!("wrote {byte_count} bytes to {}", resolved_path.display()),
+                content: format!(
+                    "wrote {byte_count} bytes to {}",
+                    resolved_path.path.display()
+                ),
                 raw_output: serde_json::json!({
-                    "path": resolved_path,
+                    "path": resolved_path.path,
                     "bytes": byte_count,
                     "source": if use_client_write { "client" } else { "local" },
                 }),
                 success: true,
                 edit: Some(ToolEdit {
-                    path: resolved_path,
+                    path: resolved_path.path,
                     old_text,
                     new_text: parsed_arguments.content,
                     line: 1,
@@ -463,6 +481,10 @@ pub(crate) async fn write_file_tool_execution(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the read, approval, cancellation and write stages of one edit transaction together."
+)]
 pub(crate) async fn edit_file_tool_execution(
     store: &SessionStore,
     call: &ChatToolCall,
@@ -470,6 +492,7 @@ pub(crate) async fn edit_file_tool_execution(
     read_connection: Option<&dyn ReadTextFileRequester>,
     write_connection: Option<&dyn WriteTextFileRequester>,
     permission_requester: Option<&dyn PermissionRequester>,
+    cancellation: &CancellationToken,
 ) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<EditFileArguments>(call.arguments()) {
         Ok(arguments) => arguments,
@@ -482,7 +505,10 @@ pub(crate) async fn edit_file_tool_execution(
         return ToolExecution::failed("edit_file old_text must not be empty");
     }
 
-    let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
+    let resolved_path = match resolve_tool_path(context, &parsed_arguments.path).await {
+        Ok(path) => path,
+        Err(error) => return ToolExecution::failed(error),
+    };
     let use_client_read = context
         .client_capabilities
         .as_ref()
@@ -490,17 +516,25 @@ pub(crate) async fn edit_file_tool_execution(
     let original_result = if use_client_read {
         match read_connection {
             Some(connection) => {
-                read_full_file_from_client(connection, &context.session_id, &resolved_path).await
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return ToolExecution::failed("edit_file cancelled"),
+                    result = read_full_file_from_client(connection, &context.session_id, &resolved_path) => result,
+                }
             }
             None => Err("edit_file needs a client connection for fs/read_text_file".to_owned()),
         }
     } else {
-        fs::read_to_string(&resolved_path).map_err(|error| {
-            format!(
-                "failed to read {} before editing: {error}",
-                resolved_path.display()
-            )
+        let path = resolved_path.clone();
+        blocking::unblock(move || {
+            path.read_to_string().map_err(|error| {
+                format!(
+                    "failed to read {} before editing: {error}",
+                    path.path.display()
+                )
+            })
         })
+        .await
     };
 
     let original = match original_result {
@@ -512,18 +546,25 @@ pub(crate) async fn edit_file_tool_execution(
     if matches == 0 {
         return ToolExecution::failed(format!(
             "edit_file could not find old_text in {}",
-            resolved_path.display()
+            resolved_path.path.display()
         ));
     }
     if matches > 1 {
         return ToolExecution::failed(format!(
             "edit_file found old_text {matches} times in {}; provide a unique span",
-            resolved_path.display()
+            resolved_path.path.display()
         ));
     }
 
-    if let Err(error) =
-        require_tool_permission(store, context, call, ToolKind::Edit, permission_requester).await
+    if let Err(error) = require_tool_permission(
+        store,
+        context,
+        call,
+        ToolKind::Edit,
+        permission_requester,
+        cancellation,
+    )
+    .await
     {
         return ToolExecution::failed(error);
     }
@@ -540,27 +581,33 @@ pub(crate) async fn edit_file_tool_execution(
     let write_result = if use_client_write {
         match write_connection {
             Some(connection) => {
-                write_file_to_client(connection, &context.session_id, &resolved_path, &updated)
-                    .await
+                write_file_to_client(
+                    connection,
+                    &context.session_id,
+                    &resolved_path,
+                    &updated,
+                    cancellation,
+                )
+                .await
             }
             None => Err("edit_file needs a client connection for fs/write_text_file".to_owned()),
         }
     } else {
-        write_file_to_local(&resolved_path, &updated)
+        write_file_to_local(&resolved_path, &updated, cancellation).await
     };
 
     match write_result {
         Ok(()) => ToolExecution {
-            content: format!("edited {}", resolved_path.display()),
+            content: format!("edited {}", resolved_path.path.display()),
             raw_output: serde_json::json!({
-                "path": resolved_path,
+                "path": resolved_path.path,
                 "replacements": 1,
                 "read_source": if use_client_read { "client" } else { "local" },
                 "write_source": if use_client_write { "client" } else { "local" },
             }),
             success: true,
             edit: Some(ToolEdit {
-                path: resolved_path,
+                path: resolved_path.path,
                 old_text: Some(original),
                 new_text: updated,
                 line: edit_line,
@@ -661,6 +708,7 @@ pub(crate) async fn run_command_tool_execution(
         call,
         ToolKind::Execute,
         permission_requester,
+        cancellation_token,
     )
     .await
     {
@@ -773,11 +821,16 @@ pub(crate) async fn run_command_via_terminal(
     let create_request = CreateTerminalRequest::new(session_id.clone(), command)
         .cwd(Some(cwd.to_path_buf()))
         .output_byte_limit(Some(COMMAND_OUTPUT_LIMIT as u64));
-    let create_response = match terminal_requester.create_terminal(create_request).await {
-        Ok(response) => response,
-        Err(error) => {
-            return ToolExecution::failed(format!("terminal/create failed: {error}"));
-        }
+    let create_response = tokio::select! {
+        biased;
+        () = cancellation_token.cancelled() => return ToolExecution::failed("run_command cancelled"),
+        result = terminal_requester.create_terminal(create_request) => match result {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(code = ?error.code, "terminal/create failed");
+                return ToolExecution::failed("terminal/create failed");
+            }
+        },
     };
     let terminal_id = create_response.terminal_id;
 
@@ -789,59 +842,48 @@ pub(crate) async fn run_command_via_terminal(
 
     let wait_request = WaitForTerminalExitRequest::new(session_id.clone(), terminal_id.clone());
     let wait_response = tokio::select! {
+        biased;
         // Turn cancelled while the command is running: kill it, then release the
         // terminal so the client frees its resources.
         () = cancellation_token.cancelled() => {
-            let _ = terminal_requester
-                .kill_terminal(KillTerminalRequest::new(
-                    session_id.clone(),
-                    terminal_id.clone(),
-                ))
-                .await;
-            let _ = terminal_requester
-                .release_terminal(ReleaseTerminalRequest::new(
-                    session_id.clone(),
-                    terminal_id.clone(),
-                ))
-                .await;
+            // Cleanup logs failed/unanswered RPCs and attempts both operations.
+            let _ = crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, true).await;
             return ToolExecution::failed("run_command cancelled");
         }
         result = terminal_requester.wait_for_terminal_exit(wait_request) => match result {
             Ok(response) => response,
             Err(error) => {
-                let _ = terminal_requester
-                    .release_terminal(ReleaseTerminalRequest::new(
-                        session_id.clone(),
-                        terminal_id.clone(),
-                    ))
-                    .await;
-                return ToolExecution::failed(format!("terminal/wait_for_exit failed: {error}"));
+                tracing::warn!(code = ?error.code, "terminal/wait_for_exit failed");
+                // An unsuccessful wait does not prove the command exited.
+                let _ = crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, true).await;
+                return ToolExecution::failed("terminal/wait_for_exit failed");
             }
         },
     };
 
     let output_request = TerminalOutputRequest::new(session_id.clone(), terminal_id.clone());
-    let output_response = match terminal_requester.terminal_output(output_request).await {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = terminal_requester
-                .release_terminal(ReleaseTerminalRequest::new(
-                    session_id.clone(),
-                    terminal_id.clone(),
-                ))
-                .await;
-            return ToolExecution::failed(format!("terminal/output failed: {error}"));
+    let output_response = tokio::select! {
+        biased;
+        () = cancellation_token.cancelled() => {
+            // Keep cancellation cleanup consistent even after exit notification.
+            let _ = crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, true).await;
+            return ToolExecution::failed("run_command cancelled");
         }
+        result = terminal_requester.terminal_output(output_request) => match result {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(code = ?error.code, "terminal/output failed");
+                let _ = crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, false).await;
+                return ToolExecution::failed("terminal/output failed");
+            }
+        },
     };
 
-    if let Err(error) = terminal_requester
-        .release_terminal(ReleaseTerminalRequest::new(
-            session_id.clone(),
-            terminal_id.clone(),
-        ))
+    if crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, false)
         .await
+        .is_err()
     {
-        return ToolExecution::failed(format!("terminal/release failed: {error}"));
+        return ToolExecution::failed("terminal/release failed");
     }
 
     let exit_code = wait_response.exit_status.exit_code;
@@ -872,7 +914,14 @@ pub(crate) fn list_dir_tool_execution(call: &ChatToolCall, context: &ToolContext
         }
     };
 
-    let resolved_path = resolve_tool_path(context, &parsed_arguments.path);
+    let resolved_path = match ConfinedPath::resolve(
+        &context.cwd,
+        &context.additional_directories,
+        &parsed_arguments.path,
+    ) {
+        Ok(path) => path,
+        Err(error) => return ToolExecution::failed(error.to_string()),
+    };
     let entries = match collect_directory_entries(&resolved_path) {
         Ok(entries) => entries,
         Err(error) => return ToolExecution::failed(error),
@@ -888,7 +937,7 @@ pub(crate) fn list_dir_tool_execution(call: &ChatToolCall, context: &ToolContext
     ToolExecution {
         content: output_text,
         raw_output: serde_json::json!({
-            "path": resolved_path,
+            "path": resolved_path.path,
             "entries": entries,
             "truncated": truncated,
         }),
@@ -897,7 +946,11 @@ pub(crate) fn list_dir_tool_execution(call: &ChatToolCall, context: &ToolContext
     }
 }
 
-pub(crate) fn glob_tool_execution(call: &ChatToolCall, context: &ToolContext) -> ToolExecution {
+pub(crate) fn glob_tool_execution(
+    call: &ChatToolCall,
+    context: &ToolContext,
+    cancellation: &CancellationToken,
+) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<GlobArguments>(call.arguments()) {
         Ok(arguments) => arguments,
         Err(error) => return ToolExecution::failed(format!("invalid glob arguments: {error}")),
@@ -917,45 +970,18 @@ pub(crate) fn glob_tool_execution(call: &ChatToolCall, context: &ToolContext) ->
         Err(error) => return ToolExecution::failed(format!("invalid glob pattern: {error}")),
     };
 
-    let root_gitignore = build_root_gitignore(&context.cwd);
+    let root = match ConfinedPath::resolve(&context.cwd, &[], Path::new(".")) {
+        Ok(root) => root,
+        Err(error) => return ToolExecution::failed(error.to_string()),
+    };
     let mut glob_paths = Vec::new();
-    let walker = WalkBuilder::new(&context.cwd)
-        .hidden(false)
-        .parents(true)
-        .ignore(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => return ToolExecution::failed(error.to_string()),
-        };
-
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
-        }
-
-        if is_hidden_path(entry.path()) {
-            continue;
-        }
-
-        let path = entry.path();
-        let relative_path = path.strip_prefix(&context.cwd).unwrap_or(path);
-        if root_gitignore.as_ref().is_some_and(|matcher| {
-            matcher
-                .matched_path_or_any_parents(relative_path, false)
-                .is_ignore()
-        }) {
-            continue;
-        }
-        if matcher.is_match(relative_path) || matcher.is_match(path) {
+    if let Err(error) = walk_files(&root, cancellation, |relative_path, _entry| {
+        if matcher.is_match(relative_path) || matcher.is_match(context.cwd.join(relative_path)) {
             glob_paths.push(relative_path.display().to_string());
         }
+        Ok(true)
+    }) {
+        return ToolExecution::failed(error);
     }
 
     glob_paths.sort_unstable();
@@ -978,7 +1004,11 @@ pub(crate) fn glob_tool_execution(call: &ChatToolCall, context: &ToolContext) ->
     }
 }
 
-pub(crate) fn grep_tool_execution(call: &ChatToolCall, context: &ToolContext) -> ToolExecution {
+pub(crate) fn grep_tool_execution(
+    call: &ChatToolCall,
+    context: &ToolContext,
+    cancellation: &CancellationToken,
+) -> ToolExecution {
     let parsed_arguments = match serde_json::from_str::<GrepArguments>(call.arguments()) {
         Ok(arguments) => arguments,
         Err(error) => return ToolExecution::failed(format!("invalid grep arguments: {error}")),
@@ -989,9 +1019,8 @@ pub(crate) fn grep_tool_execution(call: &ChatToolCall, context: &ToolContext) ->
         Err(error) => return ToolExecution::failed(format!("invalid grep regex: {error}")),
     };
 
-    let root_gitignore = build_root_gitignore(&context.cwd);
     let (mut grep_hits, truncated) =
-        match collect_grep_matches(&context.cwd, root_gitignore.as_ref(), &matcher) {
+        match collect_grep_matches(&context.cwd, &matcher, cancellation) {
             Ok(result) => result,
             Err(error) => return ToolExecution::failed(error),
         };
@@ -1027,6 +1056,7 @@ pub(crate) async fn require_tool_permission(
     call: &ChatToolCall,
     kind: ToolKind,
     requester: Option<&dyn PermissionRequester>,
+    cancellation: &CancellationToken,
 ) -> Result<(), String> {
     let requester = requester.ok_or_else(|| {
         format!(
@@ -1035,7 +1065,7 @@ pub(crate) async fn require_tool_permission(
         )
     })?;
 
-    match request_tool_permission(store, context, call, kind, requester).await {
+    match request_tool_permission(store, context, call, kind, requester, cancellation).await {
         Ok(
             PermissionDecision::AllowOnce
             | PermissionDecision::AllowAlways
@@ -1057,18 +1087,19 @@ pub(crate) async fn require_tool_permission(
 async fn read_file_from_client<'a>(
     connection: &'a dyn ReadTextFileRequester,
     session_id: &'a SessionId,
-    path: &'a Path,
+    path: &'a ConfinedPath,
     line: u32,
     limit: u32,
 ) -> Result<String, String> {
+    let path = client_file_path(path).await?;
     let response = connection
         .read_text_file(
-            ReadTextFileRequest::new(session_id.clone(), path.to_path_buf())
+            ReadTextFileRequest::new(session_id.clone(), path.clone())
                 .line(line)
                 .limit(limit),
         )
         .await
-        .map_err(|error| read_file_client_error(path, &error.to_string()))?;
+        .map_err(|error| read_file_client_error(&path, &error.to_string()))?;
 
     Ok(response.content)
 }
@@ -1076,22 +1107,20 @@ async fn read_file_from_client<'a>(
 async fn read_full_file_from_client<'a>(
     connection: &'a dyn ReadTextFileRequester,
     session_id: &'a SessionId,
-    path: &'a Path,
+    path: &'a ConfinedPath,
 ) -> Result<String, String> {
+    let path = client_file_path(path).await?;
     let response = connection
-        .read_text_file(ReadTextFileRequest::new(
-            session_id.clone(),
-            path.to_path_buf(),
-        ))
+        .read_text_file(ReadTextFileRequest::new(session_id.clone(), path.clone()))
         .await
-        .map_err(|error| read_file_client_error(path, &error.to_string()))?;
+        .map_err(|error| read_file_client_error(&path, &error.to_string()))?;
 
     Ok(response.content)
 }
 
 async fn read_existing_text(
     context: &ToolContext,
-    path: &Path,
+    path: &ConfinedPath,
     read_connection: Option<&dyn ReadTextFileRequester>,
     use_client_write: bool,
 ) -> Result<Option<String>, String> {
@@ -1111,23 +1140,30 @@ async fn read_existing_text(
             .map(Some);
     }
 
-    match fs::read_to_string(path) {
+    let path = path.clone();
+    blocking::unblock(move || match path.read_to_string() {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(read_file_local_error(path, &error)),
-    }
+        Err(error) => Err(read_file_local_error(&path.path, &error)),
+    })
+    .await
 }
 
 pub(crate) async fn write_file_to_client(
     connection: &dyn WriteTextFileRequester,
     session_id: &SessionId,
-    path: &Path,
+    path: &ConfinedPath,
     content: &str,
+    cancellation: &CancellationToken,
 ) -> Result<(), String> {
+    let path = client_file_path(path).await?;
+    if cancellation.is_cancelled() {
+        return Err("file write cancelled".to_owned());
+    }
     connection
         .write_text_file(WriteTextFileRequest::new(
             session_id.clone(),
-            path.to_path_buf(),
+            path.clone(),
             content.to_owned(),
         ))
         .await
@@ -1141,9 +1177,22 @@ pub(crate) async fn write_file_to_client(
     Ok(())
 }
 
-fn write_file_to_local(path: &Path, content: &str) -> Result<(), String> {
-    fs::write(path, content.as_bytes())
-        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+async fn write_file_to_local(
+    path: &ConfinedPath,
+    content: &str,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let path = path.clone();
+    let content = content.to_owned();
+    let cancellation = cancellation.clone();
+    blocking::unblock(move || {
+        if cancellation.is_cancelled() {
+            return Err("file write cancelled".to_owned());
+        }
+        path.write(&content)
+            .map_err(|error| format!("failed to write {}: {error}", path.path.display()))
+    })
+    .await
 }
 
 fn line_number_for_offset(text: &str, offset: usize) -> u32 {
@@ -1159,8 +1208,17 @@ fn line_number_for_offset(text: &str, offset: usize) -> u32 {
     u32::try_from(line).unwrap_or(u32::MAX)
 }
 
-pub(crate) fn read_file_from_local(path: &Path, line: u32, limit: u32) -> Result<String, String> {
-    let text = fs::read_to_string(path).map_err(|error| read_file_local_error(path, &error))?;
+pub(crate) async fn read_file_from_local(
+    path: &ConfinedPath,
+    line: u32,
+    limit: u32,
+) -> Result<String, String> {
+    let path = path.clone();
+    let text = blocking::unblock(move || {
+        path.read_to_string()
+            .map_err(|error| read_file_local_error(&path.path, &error))
+    })
+    .await?;
     let lines: Vec<&str> = text.lines().collect();
 
     let start_index = usize::try_from(line.saturating_sub(1))
@@ -1179,8 +1237,13 @@ pub(crate) fn read_file_from_local(path: &Path, line: u32, limit: u32) -> Result
     Ok(content)
 }
 
-pub(crate) fn local_file_is_non_utf8(path: &Path) -> bool {
-    fs::read_to_string(path).is_err_and(|error| error.kind() == ErrorKind::InvalidData)
+async fn local_file_is_non_utf8(path: &ConfinedPath) -> bool {
+    let path = path.clone();
+    blocking::unblock(move || {
+        path.read_to_string()
+            .is_err_and(|error| error.kind() == ErrorKind::InvalidData)
+    })
+    .await
 }
 
 pub(crate) fn read_file_local_error(path: &Path, error: &std::io::Error) -> String {
@@ -1217,34 +1280,31 @@ pub(crate) fn is_utf8_error_message(message: &str) -> bool {
         || lower.contains("utf8")
 }
 
-pub(crate) fn resolve_tool_path(context: &ToolContext, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-
-    let candidate = context.cwd.join(path);
-    if candidate.exists() {
-        return candidate;
-    }
-
-    for directory in &context.additional_directories {
-        let alternate = directory.join(path);
-        if alternate.exists() {
-            return alternate;
-        }
-    }
-
-    candidate
+async fn resolve_tool_path(context: &ToolContext, path: &Path) -> Result<ConfinedPath, String> {
+    let context = context.clone();
+    let path = path.to_path_buf();
+    blocking::unblock(move || {
+        ConfinedPath::resolve(&context.cwd, &context.additional_directories, &path)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
-pub(crate) fn collect_directory_entries(path: &Path) -> Result<Vec<String>, String> {
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| format!("failed to read directory {}: {error}", path.display()))?
+async fn client_file_path(path: &ConfinedPath) -> Result<PathBuf, String> {
+    let path = path.clone();
+    blocking::unblock(move || path.path_for_client().map_err(|error| error.to_string())).await
+}
+
+pub(crate) fn collect_directory_entries(path: &ConfinedPath) -> Result<Vec<String>, String> {
+    let mut entries = path
+        .directory()
+        .and_then(|directory| directory.entries())
+        .map_err(|error| format!("failed to read directory {}: {error}", path.path.display()))?
         .map(|entry| {
             entry.map_err(|error| {
                 format!(
                     "failed to read directory entry in {}: {error}",
-                    path.display()
+                    path.path.display()
                 )
             })
         })
@@ -1266,25 +1326,6 @@ pub(crate) fn collect_directory_entries(path: &Path) -> Result<Vec<String>, Stri
             }
         })
         .collect())
-}
-
-pub(crate) fn is_hidden_path(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
-}
-
-pub(crate) fn build_root_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
-    let gitignore_path = root.join(".gitignore");
-    if !gitignore_path.is_file() {
-        return None;
-    }
-
-    let mut builder = GitignoreBuilder::new(root);
-    if builder.add(&gitignore_path).is_some() {
-        return None;
-    }
-
-    builder.build().ok()
 }
 
 pub(crate) fn render_tool_lines(
@@ -1355,8 +1396,8 @@ struct GrepMatch {
 
 fn collect_grep_matches(
     root: &Path,
-    root_gitignore: Option<&ignore::gitignore::Gitignore>,
     matcher: &RegexMatcher,
+    cancellation: &CancellationToken,
 ) -> Result<(Vec<GrepMatch>, bool), String> {
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(b'\x00'))
@@ -1365,44 +1406,13 @@ fn collect_grep_matches(
     let mut grep_hits = Vec::<GrepMatch>::new();
     let mut truncated = false;
 
-    let walker = WalkBuilder::new(root)
-        .hidden(false)
-        .parents(true)
-        .ignore(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => return Err(error.to_string()),
-        };
-
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
-        }
-
-        if is_hidden_path(entry.path()) {
-            continue;
-        }
-
-        let path = entry.path().to_path_buf();
-        let relative_path = path.strip_prefix(root).unwrap_or(&path);
-        if root_gitignore.as_ref().is_some_and(|matcher| {
-            matcher
-                .matched_path_or_any_parents(relative_path, false)
-                .is_ignore()
-        }) {
-            continue;
-        }
-
-        let search_result = searcher.search_path(
+    let root =
+        ConfinedPath::resolve(root, &[], Path::new(".")).map_err(|error| error.to_string())?;
+    walk_files(&root, cancellation, |relative_path, entry| {
+        let file = entry.open().map_err(|error| error.to_string())?;
+        let search_result = searcher.search_reader(
             matcher,
-            &path,
+            SearchReader { file, cancellation },
             UTF8(|line_number, line| {
                 if grep_hits.len() >= TOOL_OUTPUT_LIMIT {
                     truncated = true;
@@ -1423,16 +1433,20 @@ fn collect_grep_matches(
             }),
         );
         if let Err(error) = search_result {
-            return Err(format!("failed to grep {}: {error}", path.display()));
+            return Err(format!(
+                "failed to grep {}: {error}",
+                relative_path.display()
+            ));
         }
 
-        if truncated {
-            break;
-        }
-    }
+        Ok(!truncated)
+    })?;
 
     Ok((grep_hits, truncated))
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod confinement_tests;

@@ -135,6 +135,9 @@ impl SessionBehavior {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReasoningEffort {
     #[default]
+    Default,
+    Low,
+    Medium,
     High,
     Max,
 }
@@ -142,6 +145,9 @@ pub(crate) enum ReasoningEffort {
 impl ReasoningEffort {
     pub(crate) const fn id(self) -> &'static str {
         match self {
+            Self::Default => "default",
+            Self::Low => "low",
+            Self::Medium => "medium",
             Self::High => REASONING_EFFORT_HIGH_ID,
             Self::Max => REASONING_EFFORT_MAX_ID,
         }
@@ -149,6 +155,9 @@ impl ReasoningEffort {
 
     pub(crate) const fn name(self) -> &'static str {
         match self {
+            Self::Default => "Provider default",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
             Self::High => "High",
             Self::Max => "Max",
         }
@@ -156,16 +165,49 @@ impl ReasoningEffort {
 
     pub(crate) const fn description(self) -> &'static str {
         match self {
-            Self::High => "Default reasoning effort.",
+            Self::Default => "Use the provider's default reasoning effort.",
+            Self::Low => "Low reasoning effort.",
+            Self::Medium => "Medium reasoning effort.",
+            Self::High => "High reasoning effort.",
             Self::Max => "Maximum reasoning effort for complex agent work.",
         }
     }
 
     pub(crate) fn from_value_id(value: &SessionConfigValueId) -> Option<Self> {
         match value.0.as_ref() {
+            "default" => Some(Self::Default),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
             REASONING_EFFORT_HIGH_ID => Some(Self::High),
             REASONING_EFFORT_MAX_ID => Some(Self::Max),
             _ => None,
+        }
+    }
+
+    pub(crate) fn supported_for_model(model: &str) -> &'static [Self] {
+        match model {
+            // https://console.groq.com/docs/api-reference#chat-create
+            "openai/gpt-oss-120b" | "openai/gpt-oss-20b" => {
+                &[Self::Default, Self::Low, Self::Medium, Self::High]
+            }
+            // https://api-docs.deepseek.com/api/create-chat-completion/
+            // Legacy Flash IDs remain accepted: https://api-docs.deepseek.com/
+            "deepseek-v4-pro"
+            | "deepseek-flash"
+            | "deepseek-v4-flash"
+            | "deepseek-v4-flash-vision-exp" => &[Self::Default, Self::Low, Self::High, Self::Max],
+            // GLM-4.6 does not support this parameter (Z.ai documents support
+            // starting at GLM-5.2). Unknown model contracts are not guessed.
+            // https://docs.z.ai/api-reference/llm/chat-completion
+            _ => &[Self::Default],
+        }
+    }
+
+    pub(crate) fn for_model(self, model: &str) -> Self {
+        if Self::supported_for_model(model).contains(&self) {
+            self
+        } else {
+            Self::Default
         }
     }
 }
@@ -182,7 +224,11 @@ pub(crate) async fn request_tool_permission(
     call: &ChatToolCall,
     kind: ToolKind,
     requester: &dyn PermissionRequester,
+    cancellation: &CancellationToken,
 ) -> Result<PermissionDecision, AdapterError> {
+    if cancellation.is_cancelled() {
+        return Ok(PermissionDecision::Cancelled);
+    }
     if store.is_always_rejected(&context.session_id, call.name())? {
         return Ok(PermissionDecision::RejectAlways);
     }
@@ -209,10 +255,17 @@ pub(crate) async fn request_tool_permission(
         permission_options(),
     );
 
-    let response = requester
-        .request_permission(request)
-        .await
-        .map_err(|e| AdapterError::Internal(e.to_string()))?;
+    let response = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Ok(PermissionDecision::Cancelled),
+        response = requester.request_permission(request) => response,
+    }
+    .map_err(|e| AdapterError::Internal(e.to_string()))?;
+    // Approval and cancellation can become ready together. A stale reply must
+    // neither authorize this call nor change remembered permission decisions.
+    if cancellation.is_cancelled() {
+        return Ok(PermissionDecision::Cancelled);
+    }
     let decision = match response.outcome {
         RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
         RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
@@ -390,7 +443,7 @@ pub(crate) fn session_config_options(
             SESSION_CONFIG_REASONING_EFFORT_ID,
             "Reasoning Effort",
             session.reasoning_effort.id(),
-            reasoning_effort_select_options(),
+            reasoning_effort_select_options(&session.model),
         )
         .category(SessionConfigOptionCategory::ThoughtLevel)
         .description("Choose how much thinking effort to request."),
@@ -443,9 +496,9 @@ pub(crate) fn model_select_options(
     options
 }
 
-fn reasoning_effort_select_options() -> Vec<SessionConfigSelectOption> {
-    [ReasoningEffort::High, ReasoningEffort::Max]
-        .into_iter()
+fn reasoning_effort_select_options(model: &str) -> Vec<SessionConfigSelectOption> {
+    ReasoningEffort::supported_for_model(model)
+        .iter()
         .map(|effort| {
             SessionConfigSelectOption::new(effort.id(), effort.name())
                 .description(effort.description())
@@ -633,6 +686,24 @@ pub(crate) struct SessionRecord {
     pub(crate) updated_at: String,
     /// Cumulative `DeepSeek` cost in microdollars.
     pub(crate) cost_micros: u64,
+}
+
+impl SessionRecord {
+    fn persisted_meta(&self, session_id: &SessionId) -> PersistedSessionMeta {
+        PersistedSessionMeta {
+            session_id: session_id.0.to_string(),
+            cwd: self.cwd.clone(),
+            additional_directories: self.additional_directories.clone(),
+            mode: self.mode,
+            model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort,
+            max_tokens: self.max_tokens,
+            mcp_servers: self.mcp_servers.clone(),
+            title: Some(self.title.clone()),
+            updated_at: Some(self.updated_at.clone()),
+            cost_micros: self.cost_micros,
+        }
+    }
 }
 
 /// Narrow boundary around shared adapter state.
@@ -1092,6 +1163,7 @@ impl SessionStore {
         model: String,
     ) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
+            session.reasoning_effort = session.reasoning_effort.for_model(&model);
             session.model = model;
             Ok(())
         })
@@ -1104,6 +1176,11 @@ impl SessionStore {
         effort: ReasoningEffort,
     ) -> Result<(), AdapterError> {
         self.with_session_mut(session_id, |session| {
+            if !ReasoningEffort::supported_for_model(&session.model).contains(&effort) {
+                return Err(AdapterError::InvalidParams(
+                    "unsupported reasoning effort for selected model".into(),
+                ));
+            }
             session.reasoning_effort = effort;
             Ok(())
         })
@@ -1227,19 +1304,7 @@ impl SessionStore {
                 .collect::<Vec<_>>();
             (
                 self.persistence.clone(),
-                PersistedSessionMeta {
-                    session_id: session_id.0.to_string(),
-                    cwd: session.cwd.clone(),
-                    additional_directories: session.additional_directories.clone(),
-                    mode: session.mode,
-                    model: session.model.clone(),
-                    reasoning_effort: session.reasoning_effort,
-                    max_tokens: session.max_tokens,
-                    mcp_servers: session.mcp_servers.clone(),
-                    title: Some(session.title.clone()),
-                    updated_at: Some(session.updated_at.clone()),
-                    cost_micros: session.cost_micros,
-                },
+                session.persisted_meta(session_id),
                 new_messages,
             )
         };
@@ -1254,6 +1319,37 @@ impl SessionStore {
             session.history = messages.to_vec();
             Ok(())
         })
+    }
+
+    /// Clear an idle ordinary session's history, preserving settings and spend.
+    ///
+    /// Disk replacement precedes the in-memory mutation. The whole transaction
+    /// runs on the blocking pool, serialized with session admission/removal; no
+    /// lock is held across an await and failures leave conversation history intact.
+    pub(crate) async fn clear_history(&self, session_id: &SessionId) -> Result<(), AdapterError> {
+        let store = self.clone();
+        let session_id = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            store.with_session_mut(&session_id, |session| {
+                if session.active_turn.is_some() {
+                    return Err(AdapterError::InvalidRequest(
+                        "cannot clear an active turn".into(),
+                    ));
+                }
+                if session.selected_content.is_some() {
+                    return Err(AdapterError::InvalidRequest(
+                        "selected-content sessions cannot clear history".into(),
+                    ));
+                }
+                if let Some(persistence) = &store.persistence {
+                    persistence.clear_history(&session.persisted_meta(&session_id))?;
+                }
+                session.history.clear();
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| AdapterError::Internal(error.to_string()))?
     }
 
     /// Add a model cost to a session and return its cumulative cost.

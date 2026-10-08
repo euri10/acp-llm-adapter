@@ -208,6 +208,12 @@ Costs use wide integer arithmetic before conversion to microdollars, avoiding
 silent wrapping or saturation. Missing usage or unknown model prices remain
 unknown.
 
+Usage may arrive beside a completion or in a separate final accounting frame,
+including Groq's `x_groq.usage` envelope. Duplicate envelopes count once;
+matching counters are combined with optional details, and conflicting counters
+are rejected. Accounting requires explicit input and output counts and never
+substitutes for a completion's finish reason.
+
 Tracing spans for prompt turns, tool dispatch, LLM requests, and session lifecycle handlers carry `session_id`. Startup, model-list discovery, `initialize`, and new-session setup intentionally use `session_id="none"` because no ACP session exists at those entry points; child prompt spans replace that value once a session is established.
 
 When serve logging is enabled, those tracing events are written alongside wire records: session-scoped events go to that session's `log.jsonl`, while unscoped events stay in the connection fallback log. They continue to be emitted to stderr and remain controlled by `RUST_LOG`.
@@ -255,7 +261,7 @@ The adapter bridges two independent channels:
 
 **Right side** — the adapter speaks HTTPS + Server-Sent Events to the provider's OpenAI-compatible `/chat/completions` endpoint via a thin client owned by this crate in [`src/llm/`](src/llm/). A [`LlmClient`](src/llm/client.rs) trait provides the mock seam for testing without a live API key.
 
-**Middle** — the adapter is the translator _and_ the agent harness. [`turn.rs`](src/turn.rs) orchestrates the prompt→tool-call→execute→feed-back loop. [`tools.rs`](src/tools.rs) registers built-in tools (read/write/edit files, glob, grep, shell commands) and routes execution to the right backend. [`mcp.rs`](src/mcp.rs) connects to external MCP servers and exposes their tools through the same loop. [`session_store.rs`](src/session_store.rs) provides optional filesystem persistence so sessions survive process restarts. Accepted prompts are saved before provider work, so even a first-request failure remains discoverable and resumable; a storage failure prevents the provider request.
+**Middle** — the adapter is the translator _and_ the agent harness. [`turn.rs`](src/turn.rs) orchestrates the prompt→tool-call→execute→feed-back loop. [`tools/`](src/tools/) registers built-in tools (read/write/edit files, glob, grep, shell commands) and routes execution to the right backend. [`mcp.rs`](src/mcp.rs) connects to external MCP servers and exposes their tools through the same loop. [`session_store.rs`](src/session_store.rs) provides optional filesystem persistence so sessions survive process restarts. Accepted prompts are saved before provider work, so even a first-request failure remains discoverable and resumable; a storage failure prevents the provider request.
 
 ### Module Map
 
@@ -266,9 +272,11 @@ The adapter bridges two independent channels:
 | [`acp/`](src/acp/)                         | ACP transport registration, request handler dispatch, response builders, permission requesters       |
 | [`session.rs`](src/session.rs)             | Session state, permission model, in-memory session store, session lifecycle                          |
 | [`turn.rs`](src/turn.rs)                   | Prompt-turn orchestration: LLM streaming, tool-call accumulation, loop control, cancellation         |
-| [`tools/`](src/tools/)                     | Built-in tool execution with two submodules:                                                         |
+| [`tools/`](src/tools/)                     | Built-in tool registration, execution and filesystem boundaries                                      |
 | [`registry.rs`](src/tools/registry.rs)     | `ToolRegistry` trait, `ToolContext`, `AdapterToolRegistry` impl, tool metadata                       |
 | [`execution/`](src/tools/execution)        | Tool definitions, argument parsing, execution (read/write/edit/grep/glob/command), output truncation |
+| [`filesystem.rs`](src/tools/filesystem.rs) | Approved-root path resolution, directory-capability I/O, editor-path validation                     |
+| [`search.rs`](src/tools/search.rs)         | Confined cwd traversal, in-root ignore rules and cancellable file reads                              |
 | [`mcp.rs`](src/mcp.rs)                     | MCP server connection (stdio + HTTP streamable), tool-name mapping, invocation, result rendering     |
 | [`session_store.rs`](src/session_store.rs) | Filesystem-backed session metadata and JSONL chat-history persistence                                |
 | [`dev.rs`](src/dev.rs)                     | Development utilities, smoke tests, CLI testing backends                                             |
@@ -314,6 +322,15 @@ Fragmented and interleaved calls within the limit remain supported.
 
 Select a provider with `--backend deepseek|glm|groq|mock`. On both `serve` and `dev`, `--backend` is required. The `mock` backend requires no API key and is useful for local testing.
 
+The reasoning-effort selector starts at **Provider default**, which omits the
+parameter. Explicit choices are sent unchanged: Groq GPT-OSS offers Low, Medium
+and High; known DeepSeek models offer Low, High and Max. Options follow the
+provider contracts ([Groq](https://console.groq.com/docs/api-reference),
+[DeepSeek](https://api-docs.deepseek.com/api/create-chat-completion/)). Other
+models, including GLM-4.6, offer only Provider default until their effort contract
+is supported. Invalid updates are rejected before changing state; switching or
+restoring a model resets an unsupported stored effort to Provider default.
+
 Every live backend is the same OpenAI-compatible client; the backend only chooses the defaults that `LLM_BASE_URL` and `LLM_MODEL` override:
 
 | Backend | Default base URL | Default model |
@@ -323,6 +340,20 @@ Every live backend is the same OpenAI-compatible client; the backend only choose
 | `groq` | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` |
 
 ## Supported Modes
+
+Ordinary sessions receive a concise adapter-owned coding instruction with the
+current mode's permission rules on every provider request. It is assembled with
+the advertised tools and conversation, never stored or replayed as conversation
+history. Plan adds its read-only restrictions. Selected-content sessions retain
+their separate tool-less contract and do not receive this coding instruction.
+
+Completed assistant reasoning is retained separately from visible answers in
+ordinary session history. DeepSeek requests replay it as `reasoning_content`,
+including after tool calls, subsequent prompts and load/resume, as required by
+the provider's [thinking-mode contract](https://api-docs.deepseek.com/guides/thinking_mode/#tool-calls).
+It counts toward the request-size budget and stays with its assistant/tool unit
+when old history is dropped. Other providers' outgoing message formats are
+unchanged; selected-content sessions still do not persist their payloads.
 
 - `ask`
 - `accept-edits`
@@ -336,17 +367,58 @@ Cancelling a turn during MCP approval prevents invocation. Cancelling an in-flig
 
 ## Supported Tools
 
+In ordinary sessions, sending `/clear` as the only text block clears both the
+in-memory conversation and persisted replay history without calling a provider
+or tool. Session settings, permission decisions, title, and cumulative spend are
+retained. Clearing an active turn is rejected; a failed disk update leaves the
+history intact. In selected-content helpers, `/clear` is literal input and does
+not reset their one-attempt limit.
+
 - `read_file`
+- `list_dir`
+- `glob`
+- `grep`
 - `write_file`
 - `edit_file`
 - `run_command`
 
 Tool calls are permission-gated and surfaced through ACP so the editor can show native diffs and command output. A tool call is reported in progress only once its work actually starts — after you approve it — so a command waiting on a permission prompt stays visibly pending rather than appearing to run.
 
-For sessions that advertise `additionalDirectories`, relative file paths resolve against the
-session `cwd` first and then each additional directory in order. Absolute paths are passed
-through unchanged, and `run_command` runs as a regular shell command rooted at `cwd` rather
-than a filesystem sandbox.
+Cancelling during approval ends the wait without starting the tool. Late approval
+replies cannot execute the cancelled call or change remembered permissions.
+Cancellation also skips remaining calls in the same batch and prevents a file
+write after a cancelled preflight read. It cannot undo an operation already sent
+to an editor or a write that has already started.
+
+Editor-backed terminal creation, exit waits, and output waits are cancellable.
+Kill and release each have a one-second response deadline; release is attempted
+even if kill fails. A cancelled creation request remains owned by the ACP
+connection: a late terminal ID is killed and released, and disconnect drops the
+pending wait. A silent editor may still have a running process; local cleanup
+deadlines cannot guarantee remote termination.
+
+Built-in file tools are confined to the session `cwd` and explicitly approved
+`additionalDirectories`, regardless of permission mode. Relative paths try `cwd`
+first, then additional directories in order; absolute paths must resolve inside
+an approved root. Traversal and symlinks cannot grant access outside those roots;
+dangling or unverifiable paths fail closed. New files require an allowed parent.
+Local reads and writes use directory handles to prevent a symlink replacement
+after validation from redirecting I/O outside the approved root.
+
+`glob` and `grep` search only `cwd`, not additional directories. They skip hidden
+entries and symlinks, apply nested in-root `.gitignore` and `.ignore` rules, and
+never load parent/global Git ignore configuration. An ignore file that cannot
+be safely read causes the search to fail. Search traversal and file reads use
+the same directory-capability boundary and stop cooperatively on cancellation.
+
+Editor-backed reads and writes are validated before delegation and carry
+canonical absolute paths. Roots must be locally verifiable, even for editor I/O.
+The trusted editor must preserve confinement when accessing the path: ACP passes
+a path, not an atomic filesystem capability.
+
+`run_command` remains permission-gated host execution starting in `cwd`, **not a
+filesystem sandbox**. MCP tools have their own permission boundary; these file
+roots do not sandbox MCP servers.
 
 ## Mock Backend
 

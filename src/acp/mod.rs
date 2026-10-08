@@ -19,7 +19,7 @@ use agent_client_protocol::schema::v1::{
     SessionCloseCapabilities, SessionConfigOptionValue, SessionConfigValueId,
     SessionDeleteCapabilities, SessionId, SessionListCapabilities, SessionNotification,
     SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent_client_protocol::{Agent, ConnectTo};
@@ -448,6 +448,10 @@ async fn restore_persisted_session(
             .data("persisted session id does not match requested session id"));
     }
     let history = persisted.history;
+    let reasoning_effort = persisted
+        .meta
+        .reasoning_effort
+        .for_model(&persisted.meta.model);
 
     // Backward compat: old persisted sessions may not have title/updated_at.
     let title = persisted
@@ -473,7 +477,7 @@ async fn restore_persisted_session(
             active_turn: None,
             mode: persisted.meta.mode,
             model: persisted.meta.model,
-            reasoning_effort: persisted.meta.reasoning_effort,
+            reasoning_effort,
             max_tokens: persisted.meta.max_tokens,
             permission_allow_always: HashSet::new(),
             permission_reject_always: HashSet::new(),
@@ -510,7 +514,7 @@ fn insert_session_record(
             active_turn: None,
             mode: SessionBehavior::Ask,
             model: default_model,
-            reasoning_effort: ReasoningEffort::High,
+            reasoning_effort: ReasoningEffort::Default,
             max_tokens: None,
             permission_allow_always: HashSet::new(),
             permission_reject_always: HashSet::new(),
@@ -740,8 +744,22 @@ pub(crate) async fn handle_prompt_request(
     connection: Option<&dyn ToolCallRequester>,
     request: PromptRequest,
     max_turn_requests: NonZeroUsize,
-    notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+    mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
+    if matches!(request.prompt.as_slice(), [ContentBlock::Text(text)] if text.text.trim() == "/clear")
+        && store
+            .selected_content_limits(&request.session_id)?
+            .is_none()
+    {
+        store.clear_history(&request.session_id).await?;
+        notify(session_notification(
+            request.session_id,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                "Conversation history cleared.".into(),
+            )),
+        ))?;
+        return Ok(PromptResponse::new(StopReason::EndTurn));
+    }
     crate::turn::handle_prompt_request(
         store,
         llm_client,

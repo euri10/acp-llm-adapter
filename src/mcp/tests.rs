@@ -333,9 +333,15 @@ async fn mcp_tools_use_explicit_execute_permission_kind() -> Result<(), agent_cl
         )),
     )]);
 
-    let decision =
-        request_tool_permission(&store, &context, &call, super::mcp_tool_kind(), &requester)
-            .await?;
+    let decision = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        super::mcp_tool_kind(),
+        &requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
 
     assert_eq!(decision, PermissionDecision::AllowOnce);
     let requests = requester.requests();

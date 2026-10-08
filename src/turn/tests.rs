@@ -510,12 +510,9 @@ impl TerminalRequester for TransitionRequester {
 }
 
 fn assert_normal_request(request: &ChatRequest) {
-    assert!(
-        request
-            .messages()
-            .iter()
-            .all(|message| message.role() != MessageRole::System)
-    );
+    assert_eq!(request.messages()[0].role(), MessageRole::System);
+    assert!(request.messages()[0].content().contains("coding assistant"));
+    assert!(!request.messages()[0].content().contains("Plan mode"));
     assert!(
         request
             .tools()
@@ -1072,7 +1069,7 @@ async fn leaving_plan_mode_restores_normal_request_assembly()
         request_guard[1]
             .messages()
             .iter()
-            .all(|message| message.role() != MessageRole::System)
+            .all(|message| !message.content().contains("Plan mode"))
     );
     assert_eq!(
         request_guard[1].messages().last().map(ChatMessage::content),
@@ -1389,7 +1386,7 @@ async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     assert_eq!(request_guard.len(), 1);
-    assert_eq!(request_guard[0].messages()[0].content(), "hi");
+    assert_eq!(request_guard[0].messages()[1].content(), "hi");
     drop(request_guard);
 
     let state_guard = store
@@ -2289,7 +2286,8 @@ async fn prompt_executes_tool_calls_and_replays_results() -> Result<(), agent_cl
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     assert_eq!(request_guard.len(), 2);
     assert_eq!(request_guard[0].tools().len(), 1);
-    let replayed = request_guard[1].messages();
+    assert_eq!(request_guard[1].messages()[0].role(), MessageRole::System);
+    let replayed = &request_guard[1].messages()[1..];
     assert_eq!(replayed.len(), 3);
     assert_eq!(replayed[0].content(), "use tool");
     assert_eq!(replayed[1].tool_calls()[0].id(), "call-1");
@@ -2361,6 +2359,73 @@ async fn prompt_tool_loop_stops_at_max_turn_requests() -> Result<(), agent_clien
 }
 
 #[test_log::test(tokio::test)]
+async fn cancellation_between_batched_tools_stops_execution_on_the_last_cycle()
+-> Result<(), AdapterError> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    let client = FakeLlmClient::new(vec![
+        Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+            0,
+            Some("first".into()),
+            Some("echo".into()),
+            Some("{}".into()),
+        ))),
+        Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+            1,
+            Some("second".into()),
+            Some("echo".into()),
+            Some("{}".into()),
+        ))),
+        Ok(StreamEvent::Finished(FinishReason::ToolCalls)),
+    ]);
+    let registry = FakeToolRegistry::new();
+    let response = handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        PromptRequest::new(
+            session.session_id.clone(),
+            vec![ContentBlock::from("two calls")],
+        ),
+        std::num::NonZeroUsize::MIN,
+        |notification| {
+            if matches!(notification.update, SessionUpdate::ToolCallUpdate(_)) {
+                store.cancel_active_turn(&session.session_id)?;
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    assert_eq!(response.stop_reason, StopReason::Cancelled);
+    assert_eq!(
+        registry
+            .calls()
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?
+            .len(),
+        1
+    );
+    let state = store
+        .state
+        .lock()
+        .map_err(|error| AdapterError::Internal(error.to_string()))?;
+    let record = state
+        .sessions
+        .get(&session.session_id)
+        .ok_or_else(|| AdapterError::Internal("missing session".into()))?;
+    assert!(record.active_turn.is_none());
+    assert_eq!(
+        record.history.len(),
+        4,
+        "every advertised call retains a paired result"
+    );
+    assert_eq!(record.history[3].tool_call_id(), Some("second"));
+    assert!(record.history[3].content().contains("cancelled"));
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let session = handle_new_session_request(
@@ -2403,7 +2468,8 @@ async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protoc
     let request_guard = second_requests
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let messages = request_guard[0].messages();
+    assert_eq!(request_guard[0].messages()[0].role(), MessageRole::System);
+    let messages = &request_guard[0].messages()[1..];
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0].content(), "first");
     assert_eq!(messages[1].content(), "first answer");
@@ -2624,6 +2690,33 @@ fn filter_messages_by_size_returns_unchanged_when_under_budget() {
         ChatMessage::user("third"),
     ];
     assert_eq!(super::filter_messages_by_size(&messages, 1_000), messages);
+}
+
+#[test]
+fn reasoning_counts_toward_the_size_budget_and_keeps_tool_pairs_whole() {
+    let first = ChatMessage::user("first");
+    let assistant =
+        ChatMessage::assistant_with_tool_calls("", vec![ChatToolCall::new("call", "echo", "{}")])
+            .with_reasoning_content("x".repeat(1000));
+    let messages = vec![
+        first.clone(),
+        assistant,
+        ChatMessage::tool_result("call", "done"),
+    ];
+    assert_eq!(super::filter_messages_by_size(&messages, 500), vec![first]);
+    assert_eq!(super::filter_messages_by_size(&messages, 2000), messages);
+}
+
+#[test]
+fn sanitization_preserves_complete_reasoning_without_coalescing_assistant_turns() {
+    let messages = vec![
+        ChatMessage::user("start"),
+        ChatMessage::assistant("").with_reasoning_content("first reasoning"),
+        ChatMessage::assistant("answer").with_reasoning_content("second reasoning"),
+        ChatMessage::assistant("last"),
+        ChatMessage::user("continue"),
+    ];
+    assert_eq!(super::sanitize_conversation(messages.clone()), messages);
 }
 
 #[test]

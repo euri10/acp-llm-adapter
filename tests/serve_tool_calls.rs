@@ -123,6 +123,60 @@ async fn run_prompt(serve: &mut Serve, text: &str) -> Result<Value, Box<dyn Erro
     }
 }
 
+#[test_log::test(tokio::test)]
+async fn cancellation_during_builtin_approval_prevents_execution_and_allows_recovery()
+-> Result<(), Box<dyn Error>> {
+    let root =
+        LogRoot(std::env::temp_dir().join(format!("acp-cancel-approval-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&root.0)?;
+    let marker = root.0.join("executed");
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+    command
+        .args(["serve", "--backend", "mock", "--max-turn-requests", "1"])
+        .env("XDG_STATE_HOME", &root.0)
+        .env_remove("ACP_LOG");
+    let mut serve = Serve::start_with(command, json!({"cwd": root.0, "mcpServers": []})).await?;
+    let id = serve
+        .start_prompt("!tool run_command printf executed > executed")
+        .await?;
+    let pending = serve
+        .pump_with_permission(Duration::from_secs(5), Some(id), || false, None)
+        .await?;
+    let Stopped::Permission(permission) = pending else {
+        return Err(format!("expected built-in approval, got {pending:?}").into());
+    };
+    serve
+        .notify("session/cancel", &json!({"sessionId": serve.session_id()}))
+        .await?;
+    let result = serve
+        .pump_with_permission(Duration::from_secs(2), Some(id), || false, None)
+        .await?;
+    assert!(
+        matches!(&result, Stopped::Response(response)
+            if response.pointer("/result/stopReason") == Some(&json!("cancelled"))),
+        "cancel must finish without an approval reply, got {result:?}"
+    );
+    assert!(serve.position_of_status("in_progress").is_none());
+    serve
+        .select_permission(
+            permission.get("id").ok_or("missing approval id")?,
+            "allow_once",
+        )
+        .await?;
+    let response = run_prompt(&mut serve, "hello after cancellation").await?;
+    assert_eq!(
+        response.pointer("/result/stopReason"),
+        Some(&json!("end_turn"))
+    );
+    assert!(
+        !marker.exists(),
+        "late approval executed a cancelled command"
+    );
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    Ok(())
+}
+
 fn tool_index_provider(posts: Arc<AtomicUsize>) -> Router {
     Router::new()
         .route(

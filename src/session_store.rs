@@ -85,6 +85,22 @@ impl FilesystemSessionStore {
         Ok(())
     }
 
+    /// Replace history atomically, retaining current metadata and cumulative spend.
+    pub(crate) fn clear_history(
+        &self,
+        meta: &PersistedSessionMeta,
+    ) -> Result<(), SessionPersistenceError> {
+        let session_dir = self.session_dir(&meta.session_id)?;
+        fs::create_dir_all(&session_dir)?;
+        let temporary_history = session_dir.join("history.jsonl.tmp");
+        File::create(&temporary_history)?.sync_all()?;
+        // Settings may have changed since the last prompt. A failed metadata
+        // write must not destroy the existing conversation.
+        Self::write_meta(&session_dir, meta)?;
+        fs::rename(temporary_history, session_dir.join(HISTORY_FILE))?;
+        Ok(())
+    }
+
     /// Load one persisted session record by id.
     pub(crate) fn load_record(
         &self,

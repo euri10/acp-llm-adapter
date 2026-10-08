@@ -201,7 +201,7 @@ impl LlmClient for ChatClient {
         let model = model_opt.unwrap_or_else(|| self.config.model().to_string());
         let wire_messages: Vec<WireMessage> = messages
             .into_iter()
-            .map(|message| WireMessage::from(&message))
+            .map(|message| WireMessage::for_model(&message, &model))
             .collect();
         let wire_tools: Vec<WireToolDefinition> =
             tools.iter().map(WireToolDefinition::from).collect();

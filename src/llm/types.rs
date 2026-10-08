@@ -51,6 +51,8 @@ pub struct ChatMessage {
     content: String,
     tool_calls: Vec<ToolCall>,
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -62,6 +64,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -73,6 +76,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -84,6 +88,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -98,6 +103,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -109,7 +115,24 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            reasoning_content: None,
         }
+    }
+
+    /// Attach the provider's complete reasoning to an assistant message.
+    ///
+    /// This is kept separate from visible content and replayed only by provider
+    /// request formats that support it. Non-assistant wire messages omit it.
+    #[must_use]
+    pub fn with_reasoning_content(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning_content = Some(reasoning.into());
+        self
+    }
+
+    /// Return the provider reasoning associated with this message, if supplied.
+    #[must_use]
+    pub fn reasoning_content(&self) -> Option<&str> {
+        self.reasoning_content.as_deref()
     }
 
     /// Return the message role.
@@ -146,23 +169,43 @@ pub(crate) struct WireMessage {
     tool_calls: Vec<WireToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
-impl From<&ChatMessage> for WireMessage {
-    fn from(message: &ChatMessage) -> Self {
+impl WireMessage {
+    pub(crate) fn for_model(message: &ChatMessage, model: &str) -> Self {
+        // DeepSeek requires full reasoning replay on tool-enabled requests and
+        // non-null assistant content. Keep other providers' wire shapes intact.
+        // https://api-docs.deepseek.com/guides/thinking_mode/#tool-calls
+        // https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi/
+        // Current/legacy Flash IDs: https://api-docs.deepseek.com/
+        let deepseek = matches!(
+            model,
+            "deepseek-v4-pro"
+                | "deepseek-flash"
+                | "deepseek-v4-flash"
+                | "deepseek-v4-flash-vision-exp"
+        );
         // The OpenAI-compatible API expects `content` to be null or omitted
         // when the message has `tool_calls` and no textual content.
         // Sending `"content": ""` can cause 400 Bad Request on some providers.
-        let content = if message.role == MessageRole::Assistant && message.content.is_empty() {
-            None
-        } else {
-            Some(message.content.clone())
-        };
+        let content =
+            if !deepseek && message.role == MessageRole::Assistant && message.content.is_empty() {
+                None
+            } else {
+                Some(message.content.clone())
+            };
         Self {
             role: message.role.as_str().to_string(),
             content,
             tool_calls: message.tool_calls.iter().map(WireToolCall::from).collect(),
             tool_call_id: message.tool_call_id.clone(),
+            reasoning_content: if deepseek && message.role == MessageRole::Assistant {
+                message.reasoning_content.clone()
+            } else {
+                None
+            },
         }
     }
 }

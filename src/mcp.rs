@@ -110,7 +110,7 @@ pub(crate) async fn mcp_tool_execution(
     let approval = tokio::select! {
         biased;
         () = cancellation.cancelled() => return ToolExecution::failed("MCP tool call cancelled"),
-        result = require_tool_permission(store, context, call, MCP_TOOL_KIND, requester) => result,
+        result = require_tool_permission(store, context, call, MCP_TOOL_KIND, requester, cancellation) => result,
     };
     if let Err(error) = approval {
         return ToolExecution::failed(error);

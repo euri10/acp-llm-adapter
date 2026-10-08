@@ -96,22 +96,31 @@ struct ChatCompletionChunk {
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<ChatCompletionUsage>,
+    // Groq documents both envelopes, including usage on the final chunk:
+    // https://github.com/groq/groq-python/blob/main/src/groq/types/chat/chat_completion_chunk.py
+    #[serde(default)]
+    x_groq: Option<GroqMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroqMetadata {
+    usage: Option<ChatCompletionUsage>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ChatCompletionUsage {
     #[serde(default)]
-    prompt_tokens: u64,
+    prompt_tokens: Option<u64>,
     #[serde(default)]
-    completion_tokens: u64,
+    completion_tokens: Option<u64>,
     #[serde(default)]
     total_tokens: Option<u64>,
     #[serde(default, alias = "context_window")]
     context_length: u64,
     #[serde(default)]
-    prompt_tokens_details: PromptTokensDetails,
+    prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default)]
-    completion_tokens_details: CompletionTokensDetails,
+    completion_tokens_details: Option<CompletionTokensDetails>,
     #[serde(default)]
     prompt_cache_hit_tokens: Option<u64>,
     #[serde(default)]
@@ -130,6 +139,80 @@ struct PromptTokensDetails {
 struct CompletionTokensDetails {
     #[serde(default)]
     reasoning_tokens: Option<u64>,
+}
+
+impl ChatCompletionUsage {
+    fn normalize(self) -> Result<UsageData, ChatError> {
+        let (Some(input_tokens), Some(output_tokens)) =
+            (self.prompt_tokens, self.completion_tokens)
+        else {
+            return Err(ChatError::InvalidResponse(
+                "usage must include input and output token counts".into(),
+            ));
+        };
+        let usage = UsageData {
+            input_tokens,
+            output_tokens,
+            context_length: self.context_length,
+            total_tokens: self.total_tokens,
+            thought_tokens: self
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            // DeepSeek may repeat cache hits in its flat and structured fields.
+            cached_read_tokens: merge_counter(
+                self.prompt_tokens_details
+                    .and_then(|details| details.cached_tokens),
+                self.prompt_cache_hit_tokens,
+            )?,
+            cached_write_tokens: self.prompt_cache_miss_tokens,
+        };
+        usage.validated_total_tokens()?;
+        Ok(usage)
+    }
+}
+
+fn merge_counter(left: Option<u64>, right: Option<u64>) -> Result<Option<u64>, ChatError> {
+    if matches!((left, right), (Some(left), Some(right)) if left != right) {
+        return Err(ChatError::InvalidResponse(
+            "conflicting usage envelopes".into(),
+        ));
+    }
+    Ok(left.or(right))
+}
+
+/// Both envelopes describe one completion, never separate billable work.
+fn normalize_usage(
+    top: Option<ChatCompletionUsage>,
+    groq: Option<GroqMetadata>,
+) -> Result<Option<UsageData>, ChatError> {
+    let top = top.map(ChatCompletionUsage::normalize).transpose()?;
+    let groq = groq
+        .and_then(|metadata| metadata.usage)
+        .map(ChatCompletionUsage::normalize)
+        .transpose()?;
+    let (Some(left), Some(right)) = (top, groq) else {
+        return Ok(top.or(groq));
+    };
+    if left.input_tokens != right.input_tokens || left.output_tokens != right.output_tokens {
+        return Err(ChatError::InvalidResponse(
+            "conflicting usage envelopes".into(),
+        ));
+    }
+    let usage = UsageData {
+        input_tokens: left.input_tokens,
+        output_tokens: left.output_tokens,
+        context_length: merge_counter(
+            (left.context_length != 0).then_some(left.context_length),
+            (right.context_length != 0).then_some(right.context_length),
+        )?
+        .unwrap_or(0),
+        total_tokens: merge_counter(left.total_tokens, right.total_tokens)?,
+        thought_tokens: merge_counter(left.thought_tokens, right.thought_tokens)?,
+        cached_read_tokens: merge_counter(left.cached_read_tokens, right.cached_read_tokens)?,
+        cached_write_tokens: merge_counter(left.cached_write_tokens, right.cached_write_tokens)?,
+    };
+    usage.validated_total_tokens()?;
+    Ok(Some(usage))
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,10 +250,15 @@ struct ChatToolCallFunctionDelta {
 
 pub(crate) fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEvent>, ChatError> {
     let chunk: ChatCompletionChunk = serde_json::from_str(payload)?;
+    let usage = normalize_usage(chunk.usage, chunk.x_groq)?;
     let Some(choice) = chunk.choices.into_iter().next() else {
-        return Err(ChatError::InvalidResponse(
-            "chat completion chunk did not include any choices".to_string(),
-        ));
+        return usage
+            .map(|usage| vec![StreamEvent::Usage(usage)])
+            .ok_or_else(|| {
+                ChatError::InvalidResponse(
+                    "chat completion chunk did not include any choices".to_string(),
+                )
+            });
     };
 
     let mut updates = Vec::new();
@@ -205,10 +293,10 @@ pub(crate) fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEve
         )));
     }
 
-    if let Some(usage) = chunk.usage {
+    if let Some(usage) = usage {
         tracing::debug!(
-            input_tokens = usage.prompt_tokens,
-            output_tokens = usage.completion_tokens,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
             context_length = usage.context_length,
             "parsed usage data from API chunk"
         );
@@ -218,25 +306,6 @@ pub(crate) fn parse_chat_completion_chunk(payload: &str) -> Result<Vec<StreamEve
                  falling back to the model context-window table"
             );
         }
-        let usage = UsageData {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            context_length: usage.context_length,
-            total_tokens: usage.total_tokens,
-            thought_tokens: usage.completion_tokens_details.reasoning_tokens,
-            // DeepSeek reports cache hits twice: once as the OpenAI-style
-            // `prompt_tokens_details.cached_tokens` and once as the flat
-            // `prompt_cache_hit_tokens`. Prefer the structured field when
-            // both are present and fall back to the flat counter otherwise.
-            cached_read_tokens: usage
-                .prompt_tokens_details
-                .cached_tokens
-                .or(usage.prompt_cache_hit_tokens),
-            // Tokens that missed the prompt cache are newly written to it,
-            // so they map to ACP's "cache write" counter.
-            cached_write_tokens: usage.prompt_cache_miss_tokens,
-        };
-        usage.validated_total_tokens()?;
         updates.push(StreamEvent::Usage(usage));
     }
 

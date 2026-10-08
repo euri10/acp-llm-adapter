@@ -461,7 +461,7 @@ fn new_session_advertises_model_and_reasoning_config_options()
     );
     assert_eq!(
         select_current_value(&options, SESSION_CONFIG_REASONING_EFFORT_ID)?,
-        "high"
+        "default"
     );
 
     assert_eq!(
@@ -670,8 +670,15 @@ async fn permission_request_prompts_and_caches_allow_always()
         )),
     )]);
 
-    let decision =
-        request_tool_permission(&store, &context, &call, ToolKind::Edit, &requester).await?;
+    let decision = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        &requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
 
     assert_eq!(decision, PermissionDecision::AllowAlways);
     let requests = requester.requests();
@@ -703,8 +710,15 @@ async fn permission_request_prompts_and_caches_allow_always()
     }
 
     let second_requester = FakePermissionRequester::new(Vec::new());
-    let second_decision =
-        request_tool_permission(&store, &context, &call, ToolKind::Edit, &second_requester).await?;
+    let second_decision = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        &second_requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
 
     assert_eq!(second_decision, PermissionDecision::AllowAlways);
     let second_requests = second_requester.requests();
@@ -746,8 +760,15 @@ async fn permission_request_rejects_without_caching() -> Result<(), agent_client
         )),
     )]);
 
-    let decision =
-        request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester).await?;
+    let decision = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Execute,
+        &requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
 
     assert_eq!(decision, PermissionDecision::RejectOnce);
     let requests = requester.requests();
@@ -782,12 +803,27 @@ async fn session_behavior_ask_prompts_all_mutations() -> Result<(), agent_client
     ]);
 
     assert_eq!(
-        request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester).await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &edit_call,
+            ToolKind::Edit,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowOnce
     );
     assert_eq!(
-        request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
-            .await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &shell_call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowOnce
     );
     assert_eq!(
@@ -817,12 +853,27 @@ async fn session_behavior_accept_edits_skips_edit_prompts()
     )]);
 
     assert_eq!(
-        request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester).await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &edit_call,
+            ToolKind::Edit,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowByMode
     );
     assert_eq!(
-        request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
-            .await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &shell_call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowOnce
     );
     assert_eq!(
@@ -854,12 +905,27 @@ async fn session_behavior_yolo_auto_allows_all_mutations()
     let requester = FakePermissionRequester::new(Vec::new());
 
     assert_eq!(
-        request_tool_permission(&store, &context, &edit_call, ToolKind::Edit, &requester).await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &edit_call,
+            ToolKind::Edit,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowByMode
     );
     assert_eq!(
-        request_tool_permission(&store, &context, &shell_call, ToolKind::Execute, &requester)
-            .await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &shell_call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::AllowByMode
     );
     assert!(
@@ -1015,8 +1081,15 @@ async fn request_permission_rejects_unknown_option() -> Result<(), agent_client_
         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("bogus")),
     )]);
 
-    let Err(error) =
-        request_tool_permission(&store, &context, &call, ToolKind::Edit, &requester).await
+    let Err(error) = request_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        &requester,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
     else {
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected unknown permission option to fail"));
@@ -1142,8 +1215,15 @@ async fn require_tool_permission_rejects() -> Result<(), agent_client_protocol::
         )),
     )]);
 
-    let Err(error) =
-        require_tool_permission(&store, &context, &call, ToolKind::Execute, Some(&requester)).await
+    let Err(error) = require_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Execute,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
     else {
         return Err(agent_client_protocol::Error::internal_error().data("expected rejection"));
     };
@@ -1170,8 +1250,15 @@ async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol
         RequestPermissionOutcome::Cancelled,
     )]);
 
-    let Err(error) =
-        require_tool_permission(&store, &context, &call, ToolKind::Execute, Some(&requester)).await
+    let Err(error) = require_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Execute,
+        Some(&requester),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
     else {
         return Err(agent_client_protocol::Error::internal_error().data("expected cancellation"));
     };
@@ -1189,7 +1276,15 @@ async fn require_tool_permission_missing_requester() {
         client_capabilities: None,
     };
     let call = acp_llm_adapter::llm::ToolCall::new("id", "tool", "{}");
-    let Err(error) = require_tool_permission(&store, &context, &call, ToolKind::Edit, None).await
+    let Err(error) = require_tool_permission(
+        &store,
+        &context,
+        &call,
+        ToolKind::Edit,
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
     else {
         return;
     };
@@ -1219,6 +1314,7 @@ async fn request_permission_handles_unknown_session_and_cancelled()
         &missing_call,
         ToolKind::Edit,
         &missing_requester,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     else {
@@ -1245,7 +1341,15 @@ async fn request_permission_handles_unknown_session_and_cancelled()
     )]);
 
     assert_eq!(
-        request_tool_permission(&store, &context, &call, ToolKind::Execute, &requester).await?,
+        request_tool_permission(
+            &store,
+            &context,
+            &call,
+            ToolKind::Execute,
+            &requester,
+            &CancellationToken::new()
+        )
+        .await?,
         PermissionDecision::Cancelled
     );
 

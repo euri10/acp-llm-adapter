@@ -25,6 +25,8 @@ pub(crate) enum Stopped {
     Response(Box<Value>),
     /// A permission request is waiting for the caller's decision.
     Permission(Box<Value>),
+    /// A client-side operation needs the test's response.
+    ClientRequest(Box<Value>),
     /// The caller's predicate became true.
     Predicate,
     /// The deadline passed with neither of the above.
@@ -69,8 +71,27 @@ impl Serve {
     ///
     /// Returns an error if spawning or the ACP handshake fails.
     pub(crate) async fn start_with(
+        command: Command,
+        new_session: Value,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::start_with_capabilities(
+            command,
+            new_session,
+            json!({
+                "fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false
+            }),
+        )
+        .await
+    }
+
+    /// Start with explicit editor capabilities.
+    ///
+    /// # Errors
+    /// Returns an error if spawning or the ACP handshake fails.
+    pub(crate) async fn start_with_capabilities(
         mut command: Command,
         new_session: Value,
+        capabilities: Value,
     ) -> Result<Self, Box<dyn Error>> {
         let mut child = command
             .stdin(Stdio::piped())
@@ -92,10 +113,7 @@ impl Serve {
 
         let initialize = json!({
             "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {"readTextFile": false, "writeTextFile": false},
-                "terminal": false
-            }
+            "clientCapabilities": capabilities
         });
         serve.request("initialize", &initialize).await?;
 
@@ -241,6 +259,9 @@ impl Serve {
             {
                 return Ok(Stopped::Response(Box::new(message)));
             }
+            if message.get("method").is_some() && message.get("id").is_some() {
+                return Ok(Stopped::ClientRequest(Box::new(message)));
+            }
         }
     }
 
@@ -293,6 +314,20 @@ impl Serve {
             "result": {"outcome": {"outcome": "selected", "optionId": option_id}}
         }))
         .await
+    }
+
+    /// Answer a client operation with the supplied result.
+    ///
+    /// # Errors
+    /// Returns an error if the client has disconnected or the write fails.
+    pub(crate) async fn respond(
+        &mut self,
+        request: &Value,
+        result: Value,
+    ) -> Result<(), Box<dyn Error>> {
+        let id = request.get("id").ok_or("client request has no id")?;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "result": result}))
+            .await
     }
 
     /// Wait for the process to exit.
