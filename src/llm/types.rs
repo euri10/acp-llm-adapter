@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::ChatError;
+
 /// Conversation role encoded in a chat-completions request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,6 +51,8 @@ pub struct ChatMessage {
     content: String,
     tool_calls: Vec<ToolCall>,
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -60,6 +64,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -71,6 +76,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -82,6 +88,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -96,6 +103,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -107,7 +115,24 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            reasoning_content: None,
         }
+    }
+
+    /// Attach the provider's complete reasoning to an assistant message.
+    ///
+    /// This is kept separate from visible content and replayed only by provider
+    /// request formats that support it. Non-assistant wire messages omit it.
+    #[must_use]
+    pub fn with_reasoning_content(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning_content = Some(reasoning.into());
+        self
+    }
+
+    /// Return the provider reasoning associated with this message, if supplied.
+    #[must_use]
+    pub fn reasoning_content(&self) -> Option<&str> {
+        self.reasoning_content.as_deref()
     }
 
     /// Return the message role.
@@ -144,23 +169,43 @@ pub(crate) struct WireMessage {
     tool_calls: Vec<WireToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
-impl From<&ChatMessage> for WireMessage {
-    fn from(message: &ChatMessage) -> Self {
+impl WireMessage {
+    pub(crate) fn for_model(message: &ChatMessage, model: &str) -> Self {
+        // DeepSeek requires full reasoning replay on tool-enabled requests and
+        // non-null assistant content. Keep other providers' wire shapes intact.
+        // https://api-docs.deepseek.com/guides/thinking_mode/#tool-calls
+        // https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi/
+        // Current/legacy Flash IDs: https://api-docs.deepseek.com/
+        let deepseek = matches!(
+            model,
+            "deepseek-v4-pro"
+                | "deepseek-flash"
+                | "deepseek-v4-flash"
+                | "deepseek-v4-flash-vision-exp"
+        );
         // The OpenAI-compatible API expects `content` to be null or omitted
         // when the message has `tool_calls` and no textual content.
         // Sending `"content": ""` can cause 400 Bad Request on some providers.
-        let content = if message.role == MessageRole::Assistant && message.content.is_empty() {
-            None
-        } else {
-            Some(message.content.clone())
-        };
+        let content =
+            if !deepseek && message.role == MessageRole::Assistant && message.content.is_empty() {
+                None
+            } else {
+                Some(message.content.clone())
+            };
         Self {
             role: message.role.as_str().to_string(),
             content,
             tool_calls: message.tool_calls.iter().map(WireToolCall::from).collect(),
             tool_call_id: message.tool_call_id.clone(),
+            reasoning_content: if deepseek && message.role == MessageRole::Assistant {
+                message.reasoning_content.clone()
+            } else {
+                None
+            },
         }
     }
 }
@@ -375,6 +420,7 @@ pub struct ChatRequest {
     model: Option<String>,
     reasoning_effort: Option<String>,
     max_tokens: Option<u32>,
+    retries_allowed: bool,
 }
 
 impl ChatRequest {
@@ -387,6 +433,7 @@ impl ChatRequest {
             model: None,
             reasoning_effort: None,
             max_tokens: None,
+            retries_allowed: true,
         }
     }
 
@@ -416,6 +463,19 @@ impl ChatRequest {
     pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
+    }
+
+    /// Limit this completion to one HTTP send, including transport failures.
+    #[must_use]
+    pub const fn without_retries(mut self) -> Self {
+        self.retries_allowed = false;
+        self
+    }
+
+    /// Whether transport recovery may resend before any completion event.
+    #[must_use]
+    pub const fn retries_allowed(&self) -> bool {
+        self.retries_allowed
     }
 
     pub(crate) fn into_parts(self) -> ChatRequestParts {
@@ -470,8 +530,8 @@ pub struct UsageData {
     pub context_length: u64,
     /// Total tokens reported by the provider, when available.
     ///
-    /// When the provider does not report a total, callers fall back to
-    /// `input_tokens + output_tokens`.
+    /// Use [`Self::validated_total_tokens`] to validate the counters and fall
+    /// back to the checked input/output sum when the provider omits the total.
     pub total_tokens: Option<u64>,
     /// Reasoning/thinking tokens reported by the provider, when available.
     pub thought_tokens: Option<u64>,
@@ -479,6 +539,54 @@ pub struct UsageData {
     pub cached_read_tokens: Option<u64>,
     /// Prompt cache write (cache miss) tokens, when available.
     pub cached_write_tokens: Option<u64>,
+}
+
+impl UsageData {
+    /// Validate token counters and return the provider total or input/output sum.
+    ///
+    /// Larger provider totals are preserved. Cache counters are subsets of
+    /// input tokens, and reasoning tokens are a subset of output tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatError::InvalidResponse`] if a sum overflows, a supplied
+    /// total is below the input/output sum, or a subset exceeds its parent.
+    pub fn validated_total_tokens(&self) -> Result<u64, ChatError> {
+        let token_sum = self
+            .input_tokens
+            .checked_add(self.output_tokens)
+            .ok_or_else(|| {
+                ChatError::InvalidResponse("token usage exceeds the supported range".to_string())
+            })?;
+        if self.total_tokens.is_some_and(|total| total < token_sum) {
+            return Err(ChatError::InvalidResponse(
+                "total token usage is below the input/output sum".to_string(),
+            ));
+        }
+        if self
+            .thought_tokens
+            .is_some_and(|thought| thought > self.output_tokens)
+        {
+            return Err(ChatError::InvalidResponse(
+                "reasoning token usage exceeds output tokens".to_string(),
+            ));
+        }
+        let cached_tokens = self
+            .cached_read_tokens
+            .unwrap_or(0)
+            .checked_add(self.cached_write_tokens.unwrap_or(0))
+            .ok_or_else(|| {
+                ChatError::InvalidResponse(
+                    "cache token usage exceeds the supported range".to_string(),
+                )
+            })?;
+        if cached_tokens > self.input_tokens {
+            return Err(ChatError::InvalidResponse(
+                "cache token usage exceeds input tokens".to_string(),
+            ));
+        }
+        Ok(self.total_tokens.unwrap_or(token_sum))
+    }
 }
 
 /// A normalized update emitted while streaming an LLM response.

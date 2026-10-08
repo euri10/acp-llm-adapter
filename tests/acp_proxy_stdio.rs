@@ -59,6 +59,7 @@ impl Drop for TempRoot {
 /// Outcome of driving the proxy over a fake agent.
 struct ProxyRun {
     stdout: String,
+    stderr: String,
     exit_code: Option<i32>,
     records: Vec<LogRecord>,
 }
@@ -75,6 +76,16 @@ fn run_proxy_with_session(
     fixture_exit: i32,
     session_id: Option<&str>,
 ) -> ProxyRun {
+    run_proxy_with_redaction(root, input, fixture_exit, session_id, Some("0"))
+}
+
+fn run_proxy_with_redaction(
+    root: &Path,
+    input: &str,
+    fixture_exit: i32,
+    session_id: Option<&str>,
+    unredacted: Option<&str>,
+) -> ProxyRun {
     let proxy = proxy_binary();
     let fixture = fixture_binary();
 
@@ -85,7 +96,13 @@ fn run_proxy_with_session(
         .arg("--")
         .arg(&fixture)
         .env(FIXTURE_ENV, "1")
-        .env(FIXTURE_EXIT_ENV, fixture_exit.to_string());
+        .env(FIXTURE_EXIT_ENV, fixture_exit.to_string())
+        .env_remove("ACP_LOG_MAX_BYTES")
+        .env_remove("ACP_LOG_MAX_AGE_DAYS")
+        .env_remove("ACP_LOG_UNREDACTED");
+    if let Some(unredacted) = unredacted {
+        command.env("ACP_LOG_UNREDACTED", unredacted);
+    }
     if let Some(session_id) = session_id {
         command.env(FIXTURE_SESSION_ENV, session_id);
     }
@@ -122,8 +139,89 @@ fn run_proxy_with_session(
 
     ProxyRun {
         stdout,
+        stderr,
         exit_code: status.code(),
         records: read_all_records(root),
+    }
+}
+
+#[test]
+fn proxy_redacts_actual_acp_payloads_without_changing_forwarded_bytes() {
+    let secret = "ACP_LOG_SECRET_SENTINEL";
+    let payload = serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "session/request_permission",
+    "params": {"sessionId": "session-fixture-0001", "toolCall": {
+        "toolCallId": "call-1", "status": "pending", "title": secret,
+        "rawInput": {"command": secret}, "rawOutput": {"stdout": secret},
+        "content": [{"type": "diff", "path": "/tmp/example", "oldText": secret, "newText": secret}]
+    }, "mcpServers": [
+        {"command": secret, "args": [secret], "env": [{"name": "KEY", "value": secret}]},
+        {"type": "http", "url": secret, "headers": [{"name": "Authorization", "value": secret}]}
+    ]}});
+    // The malformed line is forwarded inside the fixture's echo, producing a
+    // malformed outbound line too. Neither raw fallback may leak its text.
+    let input = format!("{SESSION_NEW}{payload}\nmalformed {secret}\n\"{secret}\"\n");
+    for unredacted in [None, Some("0"), Some("1")] {
+        let root = TempRoot::new("redaction");
+        let run = run_proxy_with_redaction(root.path(), &input, 0, None, unredacted);
+        assert_eq!(run.exit_code, Some(0));
+        assert!(
+            run.stdout.contains(&payload.to_string()),
+            "the live payload changed"
+        );
+        assert!(run.stdout.contains(&format!("malformed {secret}")));
+        assert!(run.stderr.contains(secret), "forwarded stderr changed");
+        assert!(!run.records.is_empty());
+        assert_eq!(frames(&run.records, Direction::ClientToAgent).len(), 4);
+        assert_eq!(frames(&run.records, Direction::AgentToClient).len(), 4);
+        for record in &run.records {
+            if unredacted != Some("1") {
+                assert!(
+                    !serde_json::to_string(record)
+                        .unwrap_or_default()
+                        .contains(secret),
+                    "secret leaked from {} record",
+                    record.kind
+                );
+            }
+        }
+        assert_eq!(
+            run.records
+                .iter()
+                .any(|record| record.payload.to_string().contains(secret)),
+            unredacted == Some("1")
+        );
+        let request = run.records.iter().find(|record| {
+            record.direction == Direction::ClientToAgent
+                && record
+                    .payload
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("session/request_permission")
+        });
+        let request = request.unwrap_or_else(|| unreachable!("permission frame was not recorded"));
+        assert_eq!(
+            request.payload.pointer("/params/toolCall/toolCallId"),
+            Some(&serde_json::json!("call-1"))
+        );
+        assert_eq!(
+            request.payload.pointer("/params/toolCall/status"),
+            Some(&serde_json::json!("pending"))
+        );
+        assert_eq!(
+            run.records.iter().any(
+                |record| record.kind == "stderr" && record.payload.to_string().contains(secret)
+            ),
+            unredacted == Some("1")
+        );
+        assert!(
+            session_records(root.path(), "session-fixture-0001")
+                .iter()
+                .any(|record| record
+                    .payload
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("session/request_permission"))
+        );
     }
 }
 
@@ -200,12 +298,21 @@ fn collect(dir: &Path, records: &mut Vec<LogRecord>) {
         let path = entry.path();
         if path.is_dir() {
             collect(&path, records);
-        } else if let Ok(contents) = std::fs::read_to_string(&path) {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                unreachable!("cannot read log {}: {error}", path.display())
+            });
             records.extend(
                 contents
                     .lines()
                     .filter(|line| !line.trim().is_empty())
-                    .filter_map(|line| serde_json::from_str::<LogRecord>(line).ok()),
+                    .map(|line| {
+                        serde_json::from_str::<LogRecord>(line)
+                            .unwrap_or_else(|error| unreachable!("invalid log envelope: {error}"))
+                    }),
             );
         }
     }
@@ -260,7 +367,7 @@ fn both_directions_are_recorded() {
 }
 
 #[test]
-fn agent_stderr_is_captured_as_text() {
+fn agent_stderr_is_captured_as_redacted_text() {
     let root = TempRoot::new("stderr");
 
     let run = run_proxy(root.path(), "{\"method\":\"initialize\"}\n", 0);
@@ -273,10 +380,8 @@ fn agent_stderr_is_captured_as_text() {
         .collect();
 
     assert!(
-        captured
-            .iter()
-            .any(|line| line.contains("fixture: started")),
-        "expected the agent's stderr in the log, got {captured:?}"
+        captured.contains(&"[REDACTED]"),
+        "expected redacted stderr records in the log, got {captured:?}"
     );
 }
 

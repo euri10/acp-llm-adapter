@@ -25,10 +25,9 @@ use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
 
 use acp_llm_adapter::error::AdapterError;
-use acp_llm_adapter::llm::FinishReason;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
-    SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
+    SessionNotification, SessionUpdate, UnstructuredCommandInput,
 };
 use clap::{Parser, Subcommand};
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -50,8 +49,10 @@ mod turn;
 
 pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
-    ToolProgressReporter, WriteTextFileRequester, serve_with_transport_and_state_dir_logging,
+    ToolProgressReporter, WriteTextFileRequester, request_tool_permission,
+    serve_with_transport_and_state_dir_logging,
 };
+pub(crate) use dev::initial_model;
 pub(crate) use dev::{
     Backend, build_dev_agent, exercise_permission_gate_smoke, llm_client_for_backend,
     print_dev_smoke_result, resolved_chat_config, run_smoke_flow,
@@ -59,17 +60,16 @@ pub(crate) use dev::{
 pub(crate) use mcp::{
     McpSession, connect_mcp_sessions, is_mcp_tool_name, mcp_tool_execution, mcp_tool_kind,
 };
-pub(crate) use session_store::FilesystemSessionStore;
+pub(crate) use session_store::{AdapterState, FilesystemSessionStore, SessionStore};
 use tools::AdapterToolRegistry;
 pub(crate) use turn::tool_raw_input;
 
 // Re-export session domain types so other modules can use `crate::*` imports.
 pub(crate) use session::{
-    AdapterState, DEFAULT_MAX_TURN_REQUESTS, PendingToolCalls, PermissionDecision, ReasoningEffort,
+    DEFAULT_MAX_TURN_REQUESTS, PendingToolCalls, PermissionDecision, ReasoningEffort,
     SESSION_CONFIG_MAX_TOKENS_ID, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
-    SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, SessionStore,
-    default_session_modes, derive_session_title, initial_model, iso_timestamp_now,
-    max_tokens_from_value_id, request_tool_permission, session_modes, validate_session_model,
+    SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, derive_session_title,
+    iso_timestamp_now, max_tokens_from_value_id, validate_session_model,
 };
 
 const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");
@@ -384,7 +384,6 @@ fn stdio_transport_with_eof(
         let log = outgoing_log.clone();
         async move {
             if let Some(log) = log {
-                bind_session_from_frame(&log, &line);
                 log.log(LogRecord::frame(Direction::AgentToClient, &line));
             }
             let mut bytes = line.into_bytes();
@@ -395,22 +394,6 @@ fn stdio_transport_with_eof(
     });
 
     Lines::new(outgoing, incoming)
-}
-
-fn bind_session_from_frame(connection: &ConnectionLog, line: &str) {
-    let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) else {
-        return;
-    };
-    let Some(session_id) = frame
-        .get("result")
-        .and_then(|result| result.get("sessionId"))
-        .and_then(serde_json::Value::as_str)
-    else {
-        return;
-    };
-    if let Err(error) = connection.bind_session(session_id) {
-        tracing::warn!(%error, "failed to bind serve log to ACP session");
-    }
 }
 
 fn serve_log() -> Result<Option<Arc<LogSink>>, agent_client_protocol::Error> {
@@ -429,29 +412,34 @@ fn serve_log() -> Result<Option<Arc<LogSink>>, agent_client_protocol::Error> {
         .map_err(agent_client_protocol::Error::into_internal_error)
 }
 
-/// Resolve when the process receives `SIGTERM`, `SIGINT`, or `SIGHUP`.
+/// Register immediately, then resolve on `SIGTERM`, `SIGINT`, or `SIGHUP`.
 ///
 /// # Errors
 ///
-/// Returns an internal ACP error if a signal listener cannot be registered.
+/// The returned future reports an internal ACP error if registration fails.
 #[cfg(unix)]
-async fn shutdown_signal() -> Result<(), agent_client_protocol::Error> {
+fn shutdown_signal() -> impl std::future::Future<Output = Result<(), agent_client_protocol::Error>>
+{
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigterm = signal(SignalKind::terminate())
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let mut sigint = signal(SignalKind::interrupt())
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let mut sighup =
-        signal(SignalKind::hangup()).map_err(agent_client_protocol::Error::into_internal_error)?;
+    // select! constructs every branch before polling any of them. Register
+    // here so discovery cannot expose startup before shutdown is handled.
+    let sigterm = signal(SignalKind::terminate());
+    let sigint = signal(SignalKind::interrupt());
+    let sighup = signal(SignalKind::hangup());
 
-    let which = tokio::select! {
-        _ = sigterm.recv() => "SIGTERM",
-        _ = sigint.recv() => "SIGINT",
-        _ = sighup.recv() => "SIGHUP",
-    };
-    tracing::info!(signal = which, "received termination signal");
-    Ok(())
+    async move {
+        let mut sigterm = sigterm.map_err(agent_client_protocol::Error::into_internal_error)?;
+        let mut sigint = sigint.map_err(agent_client_protocol::Error::into_internal_error)?;
+        let mut sighup = sighup.map_err(agent_client_protocol::Error::into_internal_error)?;
+        let which = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+            _ = sighup.recv() => "SIGHUP",
+        };
+        tracing::info!(signal = which, "received termination signal");
+        Ok(())
+    }
 }
 
 #[cfg(not(unix))]
@@ -492,33 +480,35 @@ async fn serve(
     );
     let state = Arc::new(Mutex::new(AdapterState::new(default_model.clone())));
 
-    // Fetch the live model list from the same endpoint the completions go to.
-    if let Some(ref config) = chat_config {
-        let models = acp_llm_adapter::llm::fetch_available_models(
-            config.base_url(),
-            config.api_key(),
-            &default_model,
-        )
-        .await;
-        if let Err(e) = state.lock().map(|mut g| g.model_catalog = models) {
-            tracing::warn!(%e, "failed to store fetched model list");
-        }
-    }
-
     let shutdown = CancellationToken::new();
     let logging_enabled = connection.is_some();
     let transport = stdio_transport_with_eof(shutdown.clone(), connection);
 
     let result = tokio::select! {
-        result = serve_with_transport_and_state_dir_logging(
-            transport,
-            state,
-            llm_client,
-            tool_registry,
-            max_turn_requests,
-            None,
-            logging_enabled,
-        ) => {
+        result = async {
+            // Discovery shares signal ownership with serving. Its two-second
+            // deadline also bounds the wait before the transport observes EOF.
+            if let Some(ref config) = chat_config {
+                let models = acp_llm_adapter::llm::fetch_available_models(
+                    config.base_url(),
+                    config.api_key(),
+                    &default_model,
+                )
+                .await;
+                if let Err(e) = state.lock().map(|mut g| g.model_catalog = models) {
+                    tracing::warn!(%e, "failed to store fetched model list");
+                }
+            }
+            serve_with_transport_and_state_dir_logging(
+                transport,
+                state,
+                llm_client,
+                tool_registry,
+                max_turn_requests,
+                None,
+                logging_enabled,
+            ).await
+        } => {
             tracing::info!("ACP serve loop returned");
             result
         }
@@ -544,7 +534,7 @@ async fn dev(backend: Backend, prompt: String) -> Result<(), agent_client_protoc
                 .data(format!("failed to locate current executable: {error}"))
         })?,
         backend,
-    )?;
+    );
     let result = run_smoke_flow(agent, prompt).await?;
     print_dev_smoke_result(&result);
     exercise_permission_gate_smoke().await?;
@@ -626,16 +616,6 @@ fn session_notification(
     SessionNotification::new(session_id, update)
 }
 
-fn stop_reason_from_finish(reason: &FinishReason) -> StopReason {
-    match reason {
-        FinishReason::EndTurn | FinishReason::ToolCalls | FinishReason::Other(_) => {
-            StopReason::EndTurn
-        }
-        FinishReason::MaxTokens => StopReason::MaxTokens,
-        FinishReason::Refusal => StopReason::Refusal,
-    }
-}
-
 /// Create a `SessionStore` backed by a fresh default adapter state.
 ///
 /// This is a convenience for tests that previously created
@@ -658,17 +638,56 @@ pub(crate) fn test_store() -> SessionStore {
 mod tests {
     use super::{
         Backend, Cli, Command, EofGuard, LogSink, SessionLogLayer, Uuid, attach_eof_guard,
-        bind_session_from_frame, text_from_prompt,
+        text_from_prompt,
     };
     use crate::acp::validate_session_paths;
+    use acp_llm_adapter::logsink::{Direction, LogRecord};
     use agent_client_protocol::schema::v1::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
-        ImageContent, NewSessionRequest, ResourceLink, StopReason, TextResourceContents,
+        ImageContent, NewSessionRequest, ResourceLink, TextResourceContents,
     };
     use clap::Parser;
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::prelude::*;
+
+    #[cfg(target_os = "linux")]
+    #[test_log::test(tokio::test)]
+    async fn shutdown_listener_captures_sigterm_before_polling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let child_marker = "ACP_TEST_SHUTDOWN_SIGNAL_CHILD";
+        if std::env::var_os(child_marker).is_some() {
+            let shutdown = super::shutdown_signal();
+            rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::TERM,
+            )?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), shutdown).await??;
+            return Ok(());
+        }
+
+        // Tokio retains installed handlers process-wide. Use a fresh process
+        // so another test cannot mask registration that happened too late.
+        let mut child = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::shutdown_listener_captures_sigterm_before_polling",
+                "--nocapture",
+            ])
+            .env(child_marker, "1")
+            .kill_on_drop(true)
+            .spawn()?;
+        let status =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(status) => status?,
+                Err(error) => {
+                    child.kill().await?;
+                    return Err(error.into());
+                }
+            };
+        assert!(status.success(), "isolated shutdown probe failed: {status}");
+        Ok(())
+    }
 
     #[test_log::test]
     fn rejects_serve_subcommand_without_backend() {
@@ -1020,7 +1039,7 @@ mod tests {
 
     #[test]
     fn stop_reason_from_finish_all_branches() {
-        use super::stop_reason_from_finish;
+        use crate::turn::{StopReason, stop_reason_from_finish};
         use acp_llm_adapter::llm::FinishReason;
 
         assert_eq!(
@@ -1110,10 +1129,14 @@ mod tests {
             return;
         };
 
-        bind_session_from_frame(
-            &connection,
+        connection.log(LogRecord::frame(
+            Direction::ClientToAgent,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#,
+        ));
+        connection.log(LogRecord::frame(
+            Direction::AgentToClient,
             r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session-test"}}"#,
-        );
+        ));
 
         assert_eq!(connection.session_id().as_deref(), Some("session-test"));
         drop(connection);
@@ -1133,15 +1156,15 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let first_span = tracing::info_span!("session", session_id = "session-first");
             let first_guard = first_span.enter();
-            tracing::info!(message = "first-only");
+            tracing::info!(route_marker = 101);
             drop(first_guard);
 
             let second_span = tracing::info_span!("session", session_id = "session-second");
             let second_guard = second_span.enter();
-            tracing::info!(message = "second-only");
+            tracing::info!(route_marker = 202);
             drop(second_guard);
 
-            tracing::info!(message = "fallback-only");
+            tracing::info!(route_marker = 303);
         });
 
         let Ok(first_path) = sink.session_log_path("session-first") else {
@@ -1161,13 +1184,13 @@ mod tests {
         let first_log = std::fs::read_to_string(first_path).unwrap_or_default();
         let second_log = std::fs::read_to_string(second_path).unwrap_or_default();
         let fallback_log = std::fs::read_to_string(connection_path).unwrap_or_default();
-        assert!(first_log.contains("first-only"));
-        assert!(!first_log.contains("second-only"));
-        assert!(second_log.contains("second-only"));
-        assert!(!second_log.contains("first-only"));
-        assert!(fallback_log.contains("fallback-only"));
-        assert!(!fallback_log.contains("first-only"));
-        assert!(!fallback_log.contains("second-only"));
+        assert!(first_log.contains("\"route_marker\":101"));
+        assert!(!first_log.contains("\"route_marker\":202"));
+        assert!(second_log.contains("\"route_marker\":202"));
+        assert!(!second_log.contains("\"route_marker\":101"));
+        assert!(fallback_log.contains("\"route_marker\":303"));
+        assert!(!fallback_log.contains("\"route_marker\":101"));
+        assert!(!fallback_log.contains("\"route_marker\":202"));
 
         let _ = std::fs::remove_dir_all(root);
     }
