@@ -7,23 +7,76 @@ use acp_llm_adapter::llm::{
     ToolCall as ChatToolCall, ToolDefinition, UsageData, context_window_for_model,
     model_cost_micros,
 };
-use agent_client_protocol::schema::v1::{
-    ConfigOptionUpdate, ContentBlock, ContentChunk, Cost, Diff, MessageId, Plan, PromptRequest,
-    PromptResponse, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
-    ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
-};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::acp::ToolCallRequester;
-use crate::tools::{ToolContext, ToolExecution, ToolRegistry};
-use crate::{
-    PendingToolCalls, ReasoningEffort, SessionBehavior, SessionStore, session_notification,
-    stop_reason_from_finish, text_from_prompt,
-};
+use crate::tools::{ToolContext, ToolExecution, ToolExecutor, ToolKind, ToolRegistry};
+use crate::{PendingToolCalls, ReasoningEffort, SessionBehavior, SessionStore};
 use acp_llm_adapter::error::AdapterError;
+
+/// Validated prompt translated by the editor adapter.
+#[derive(Debug)]
+pub(crate) struct PromptInput {
+    pub(crate) session_id: String,
+    pub(crate) text: String,
+    pub(crate) title: Option<String>,
+}
+
+/// Why the agent stopped its current turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurnRequests,
+    Refusal,
+    Cancelled,
+}
+
+/// Map a normalized provider finish reason into turn policy.
+pub(crate) fn stop_reason_from_finish(reason: &FinishReason) -> StopReason {
+    match reason {
+        FinishReason::MaxTokens => StopReason::MaxTokens,
+        FinishReason::Refusal => StopReason::Refusal,
+        FinishReason::EndTurn | FinishReason::ToolCalls | FinishReason::Other(_) => {
+            StopReason::EndTurn
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PromptResult {
+    pub(crate) stop_reason: StopReason,
+    pub(crate) usage: Option<UsageTotals>,
+}
+
+/// Facts emitted by turn orchestration; adapters decide their wire encoding.
+#[derive(Debug)]
+pub(crate) enum TurnEvent {
+    SessionInfo {
+        title: Option<String>,
+        updated_at: String,
+    },
+    Message {
+        text: String,
+        message_id: String,
+        thought: bool,
+    },
+    ToolCall {
+        call: ChatToolCall,
+        kind: ToolKind,
+    },
+    ToolResult {
+        call: ChatToolCall,
+        result: ToolExecution,
+    },
+    ModeChanged(SessionBehavior),
+    Usage {
+        used: u64,
+        size: u64,
+        cost_micros: Option<u64>,
+    },
+}
 
 /// Stable model settings applied to each streamed LLM request in a prompt turn.
 #[derive(Debug, Clone, Copy)]
@@ -42,10 +95,10 @@ struct PromptTurnEnvironment<'a> {
     store: &'a SessionStore,
     llm_client: &'a dyn LlmClient,
     tool_registry: &'a dyn ToolRegistry,
-    connection: Option<&'a dyn ToolCallRequester>,
+    executor: Option<&'a dyn ToolExecutor>,
     tool_context: ToolContext,
     behavior: SessionBehavior,
-    request: PromptRequest,
+    request: PromptInput,
     cancellation_token: CancellationToken,
     max_turn_requests: NonZeroUsize,
 }
@@ -312,7 +365,7 @@ fn estimate_message_size(msg: &ChatMessage) -> usize {
     base + content_overhead + tool_overhead
 }
 
-/// Run the full prompt-turn lifecycle for a single ACP `session/prompt` request.
+/// Run the full prompt-turn lifecycle for a translated editor prompt.
 ///
 /// This keeps ACP request translation in [`crate::acp`] while moving model
 /// streaming, tool-call execution, cancellation handling, plan streaming, and
@@ -320,7 +373,7 @@ fn estimate_message_size(msg: &ChatMessage) -> usize {
 ///
 /// # Errors
 ///
-/// Returns an ACP protocol error when the prompt is invalid, session setup
+/// Returns a domain error when session setup
 /// fails, a streamed model event fails, a tool notification fails, or the
 /// session store cannot be updated.
 #[tracing::instrument(skip_all, fields(session_id = %request.session_id))]
@@ -328,25 +381,13 @@ pub(crate) async fn handle_prompt_request(
     store: &SessionStore,
     llm_client: &dyn LlmClient,
     tool_registry: &dyn ToolRegistry,
-    connection: Option<&dyn ToolCallRequester>,
-    request: PromptRequest,
+    executor: Option<&dyn ToolExecutor>,
+    request: PromptInput,
     max_turn_requests: NonZeroUsize,
-    mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-) -> Result<PromptResponse, AdapterError> {
+    mut notify: impl FnMut(TurnEvent) -> Result<(), AdapterError>,
+) -> Result<PromptResult, AdapterError> {
     let selected_content = store.selected_content_limits(&request.session_id)?;
-    if selected_content.is_some()
-        && request
-            .prompt
-            .iter()
-            .any(|block| !matches!(block, ContentBlock::Text(_)))
-    {
-        return Err(AdapterError::InvalidParams(
-            "selected-content prompts require text snapshots".into(),
-        ));
-    }
-    let request_title = prompt_title(&request.prompt);
-    let user_text = text_from_prompt(&request.prompt)?;
-    let user_message = ChatMessage::user(user_text.clone());
+    let user_message = ChatMessage::user(request.text.clone());
     let session_id = request.session_id.clone();
     let cancellation_token = CancellationToken::new();
 
@@ -354,20 +395,18 @@ pub(crate) async fn handle_prompt_request(
         &request.session_id,
         cancellation_token.clone(),
         user_message,
-        request_title,
+        request.title.as_deref(),
     )?;
 
     let result = async {
         // A first-request failure must still leave a listable, replayable Session.
-        store.save_history(&session_id, &turn_setup.messages)?;
-        notify(session_notification(session_id.clone(), {
-            let mut session_info_update =
-                SessionInfoUpdate::new().updated_at(turn_setup.updated_at.clone());
-            if turn_setup.title_changed {
-                session_info_update = session_info_update.title(turn_setup.title.clone());
-            }
-            SessionUpdate::SessionInfoUpdate(session_info_update)
-        }))?;
+        store
+            .persist_history(&session_id, &turn_setup.messages)
+            .await?;
+        notify(TurnEvent::SessionInfo {
+            title: turn_setup.title_changed.then_some(turn_setup.title.clone()),
+            updated_at: turn_setup.updated_at.clone(),
+        })?;
 
         // Only the explicit Provider default selection omits the parameter.
         // An explicit High must not silently request another provider's default.
@@ -379,7 +418,7 @@ pub(crate) async fn handle_prompt_request(
                 store,
                 llm_client,
                 tool_registry,
-                connection,
+                executor,
                 tool_context: turn_setup.tool_context,
                 behavior: turn_setup.behavior,
                 request,
@@ -439,15 +478,6 @@ pub(crate) async fn handle_prompt_request(
     }
 }
 
-fn prompt_title(prompt: &[ContentBlock]) -> Option<&str> {
-    prompt.iter().rev().find_map(|block| {
-        let ContentBlock::Text(text) = block else {
-            return None;
-        };
-        (!text.text.trim().is_empty()).then_some(text.text.as_str())
-    })
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "Keep cancellation, paired tool history and mode transitions in one turn lifecycle."
@@ -456,8 +486,8 @@ async fn run_prompt_turn(
     env: PromptTurnEnvironment<'_>,
     mut messages: Vec<ChatMessage>,
     model_settings: ModelRequestSettings<'_>,
-    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-) -> Result<PromptResponse, AdapterError> {
+    notify: &mut impl FnMut(TurnEvent) -> Result<(), AdapterError>,
+) -> Result<PromptResult, AdapterError> {
     let selected_content = env
         .store
         .selected_content_limits(&env.request.session_id)?
@@ -521,14 +551,19 @@ async fn run_prompt_turn(
         if !matches!(turn.finish_reason, FinishReason::ToolCalls) || turn.tool_calls.is_empty() {
             stop_reason = turn.stop_reason;
             // Persist before exiting — this is the final assistant answer.
-            env.store.save_history(&env.request.session_id, &messages)?;
+            env.store
+                .persist_history(&env.request.session_id, &messages)
+                .await?;
             break;
         }
 
         let mut pending_mode_transition = None;
         for tool_call in &turn.tool_calls {
             let tool_kind = env.tool_registry.kind(tool_call.name());
-            report_tool_call(&env.request.session_id, notify, tool_call, tool_kind)?;
+            notify(TurnEvent::ToolCall {
+                call: tool_call.clone(),
+                kind: tool_kind,
+            })?;
             let tool_result = if env.cancellation_token.is_cancelled() {
                 // Preserve the provider's call/result pairing for resume, but
                 // never dispatch the remaining calls in a cancelled batch.
@@ -539,18 +574,21 @@ async fn run_prompt_turn(
                         tool_call,
                         &env.tool_context,
                         env.store,
-                        env.connection,
+                        env.executor,
                         env.cancellation_token.clone(),
                     )
                     .await
             } else {
                 ToolExecution::failed(format!(
                     "{} mode refuses {} tool calls",
-                    env.behavior.mode_id().0.as_ref(),
+                    env.behavior.mode_id(),
                     tool_call.name()
                 ))
             };
-            report_tool_result(&env.request.session_id, notify, tool_call, &tool_result)?;
+            notify(TurnEvent::ToolResult {
+                call: tool_call.clone(),
+                result: tool_result.clone(),
+            })?;
             if let Some(mode) = transition_mode_from_tool_result(tool_call, &tool_result)? {
                 pending_mode_transition = Some(mode);
             }
@@ -569,32 +607,37 @@ async fn run_prompt_turn(
         // Persist after every complete turn cycle (assistant text + tool results).
         // If the process crashes during the next LLM stream, history up to this
         // point is already on disk and can be resumed.
-        env.store.save_history(&env.request.session_id, &messages)?;
+        env.store
+            .persist_history(&env.request.session_id, &messages)
+            .await?;
 
         if env.cancellation_token.is_cancelled() {
             stop_reason = StopReason::Cancelled;
             break;
         }
         if let Some(mode) = pending_mode_transition {
-            emit_mode_transition_notifications(env.store, &env.request.session_id, mode, notify)?;
+            notify(TurnEvent::ModeChanged(mode))?;
             stop_reason = StopReason::EndTurn;
             break;
         }
     }
 
-    Ok(PromptResponse::new(stop_reason).usage(usage_totals.into_acp_usage()))
+    Ok(PromptResult {
+        stop_reason,
+        usage: usage_totals.into_usage(),
+    })
 }
 
 /// Accumulates [`UsageData`] across the sub-turns of a single prompt turn.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_field_names)]
-struct UsageTotals {
-    input_tokens: u64,
-    output_tokens: u64,
-    total_tokens: u64,
-    thought_tokens: Option<u64>,
-    cached_read_tokens: Option<u64>,
-    cached_write_tokens: Option<u64>,
+pub(crate) struct UsageTotals {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) total_tokens: u64,
+    pub(crate) thought_tokens: Option<u64>,
+    pub(crate) cached_read_tokens: Option<u64>,
+    pub(crate) cached_write_tokens: Option<u64>,
 }
 
 impl UsageTotals {
@@ -626,13 +669,8 @@ impl UsageTotals {
         Ok(())
     }
 
-    fn into_acp_usage(self) -> Option<Usage> {
-        (self.input_tokens > 0 || self.output_tokens > 0).then(|| {
-            Usage::new(self.total_tokens, self.input_tokens, self.output_tokens)
-                .thought_tokens(self.thought_tokens)
-                .cached_read_tokens(self.cached_read_tokens)
-                .cached_write_tokens(self.cached_write_tokens)
-        })
+    pub(crate) fn into_usage(self) -> Option<Self> {
+        (self.input_tokens > 0 || self.output_tokens > 0).then_some(self)
     }
 }
 
@@ -663,31 +701,11 @@ fn transition_mode_from_tool_result(
     Ok(Some(mode))
 }
 
-fn emit_mode_transition_notifications(
-    store: &SessionStore,
-    session_id: &SessionId,
-    mode: SessionBehavior,
-    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-) -> Result<(), agent_client_protocol::Error> {
-    notify(session_notification(
-        session_id.clone(),
-        SessionUpdate::CurrentModeUpdate(
-            agent_client_protocol::schema::v1::CurrentModeUpdate::new(mode.mode_id()),
-        ),
-    ))?;
-    let config_options = store.session_config_options(session_id)?;
-    notify(session_notification(
-        session_id.clone(),
-        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options)),
-    ))?;
-    Ok(())
-}
-
 /// Stream a single LLM turn, collecting assistant text and pending tool calls.
 ///
 /// # Errors
 ///
-/// Returns an ACP protocol error when the underlying LLM stream fails, when a
+/// Returns a domain error when the underlying LLM stream fails, when a
 /// streamed tool-call delta cannot be assembled into a complete call, or when
 /// usage counters or costs are invalid or unrepresentable, or a session update
 /// notification fails.
@@ -696,8 +714,8 @@ pub(crate) async fn stream_model_turn(
     context: StreamContext<'_>,
     model_settings: ModelRequestSettings<'_>,
     cancellation_token: CancellationToken,
-    session_id: &SessionId,
-    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+    session_id: &str,
+    notify: &mut impl FnMut(TurnEvent) -> Result<(), AdapterError>,
 ) -> Result<ModelTurn, AdapterError> {
     let selected_content = context
         .store
@@ -748,8 +766,8 @@ pub(crate) async fn stream_model_turn(
     let mut finish_reason = FinishReason::EndTurn;
     let mut tool_calls = PendingToolCalls::default();
     let mut usage: Option<UsageData> = None;
-    let mut thought_message_id: Option<MessageId> = None;
-    let mut assistant_message_id: Option<MessageId> = None;
+    let mut thought_message_id: Option<String> = None;
+    let mut assistant_message_id: Option<String> = None;
     let mut output_bytes = 0usize;
 
     loop {
@@ -793,26 +811,24 @@ pub(crate) async fn stream_model_turn(
                     .get_or_insert_with(String::new)
                     .push_str(&chunk);
                 let message_id = thought_message_id
-                    .get_or_insert_with(|| Uuid::new_v4().to_string().into())
+                    .get_or_insert_with(|| Uuid::new_v4().to_string())
                     .clone();
-                notify(session_notification(
-                    session_id.clone(),
-                    SessionUpdate::AgentThoughtChunk(
-                        ContentChunk::new(chunk.into()).message_id(message_id),
-                    ),
-                ))?;
+                notify(TurnEvent::Message {
+                    text: chunk,
+                    message_id,
+                    thought: true,
+                })?;
             }
             StreamEvent::Message(chunk) => {
                 assistant_text.push_str(&chunk);
                 let message_id = assistant_message_id
-                    .get_or_insert_with(|| Uuid::new_v4().to_string().into())
+                    .get_or_insert_with(|| Uuid::new_v4().to_string())
                     .clone();
-                notify(session_notification(
-                    session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(
-                        ContentChunk::new(chunk.into()).message_id(message_id),
-                    ),
-                ))?;
+                notify(TurnEvent::Message {
+                    text: chunk,
+                    message_id,
+                    thought: false,
+                })?;
             }
             StreamEvent::ToolCallDelta(delta) => tool_calls.push(&delta)?,
             StreamEvent::Finished(reason) => {
@@ -872,18 +888,11 @@ pub(crate) async fn stream_model_turn(
             .zip(context.store)
             .map(|(cost_micros, store)| store.add_cost_micros(session_id, cost_micros))
             .transpose()?;
-        let mut usage_update = UsageUpdate::new(used_tokens, usage_data.context_length);
-        if let Some(cost_micros) = cost {
-            let amount = cost_micros
-                .to_string()
-                .parse::<f64>()
-                .map_or(0.0, |value| value / 1_000_000.0);
-            usage_update = usage_update.cost(Cost::new(amount, "USD"));
-        }
-        notify(session_notification(
-            session_id.clone(),
-            SessionUpdate::UsageUpdate(usage_update),
-        ))?;
+        notify(TurnEvent::Usage {
+            used: used_tokens,
+            size: usage_data.context_length,
+            cost_micros: cost,
+        })?;
     }
 
     Ok(ModelTurn {
@@ -906,70 +915,8 @@ pub(crate) struct ModelTurn {
     pub(crate) tool_calls: Vec<ChatToolCall>,
     /// Raw finish reason reported by the LLM.
     pub(crate) finish_reason: FinishReason,
-    /// ACP stop reason derived for the client.
+    /// Domain reason for stopping this turn.
     pub(crate) stop_reason: StopReason,
-}
-
-fn report_tool_call(
-    session_id: &SessionId,
-    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-    call: &ChatToolCall,
-    kind: ToolKind,
-) -> Result<(), AdapterError> {
-    let title = tool_call_title(call);
-    notify(session_notification(
-        session_id.clone(),
-        SessionUpdate::ToolCall(
-            AcpToolCall::new(call.id().to_string(), title)
-                .kind(kind)
-                .status(ToolCallStatus::Pending)
-                .raw_input(tool_raw_input(call)),
-        ),
-    ))?;
-    Ok(())
-}
-
-fn report_tool_result(
-    session_id: &SessionId,
-    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-    call: &ChatToolCall,
-    result: &ToolExecution,
-) -> Result<(), AdapterError> {
-    let mut fields = ToolCallUpdateFields::new()
-        .status(result.status())
-        .content(tool_call_update_content(result))
-        .raw_output(result.raw_output.clone());
-
-    if let Some(edit) = &result.edit {
-        fields = fields.locations(vec![
-            ToolCallLocation::new(edit.path.clone()).line(edit.line),
-        ]);
-    }
-
-    notify(session_notification(
-        session_id.clone(),
-        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call.id().to_string(), fields)),
-    ))?;
-
-    if result.success && call.name() == "update_plan" {
-        let plan = serde_json::from_value::<Plan>(result.raw_output.clone()).map_err(|error| {
-            AdapterError::Internal(format!("invalid update_plan result: {error}"))
-        })?;
-        notify(session_notification(
-            session_id.clone(),
-            SessionUpdate::Plan(plan),
-        ))?;
-    }
-    Ok(())
-}
-
-fn tool_call_update_content(result: &ToolExecution) -> Vec<ToolCallContent> {
-    match &result.edit {
-        Some(edit) => vec![ToolCallContent::from(
-            Diff::new(edit.path.clone(), edit.new_text.clone()).old_text(edit.old_text.clone()),
-        )],
-        None => vec![ToolCallContent::from(result.content.clone())],
-    }
 }
 
 /// Build a human-readable display title for a tool call.

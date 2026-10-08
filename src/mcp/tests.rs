@@ -5,9 +5,8 @@ use super::{
     mcp_tool_mappings, mcp_tool_result_text,
 };
 use crate::acp::{handle_new_session_request, handle_set_session_mode_request};
-use crate::session::{
-    PERMISSION_ALLOW_ONCE_OPTION_ID, PermissionDecision, request_tool_permission,
-};
+use crate::request_tool_permission;
+use crate::session::{PERMISSION_ALLOW_ONCE_OPTION_ID, PermissionDecision};
 use crate::tools::{AdapterToolRegistry, ToolContext, ToolRegistry};
 use crate::{PermissionRequester, test_store};
 use acp_llm_adapter::llm::ToolCall as ChatToolCall;
@@ -259,22 +258,10 @@ async fn adapter_registry_exposes_mcp_tools_but_requires_permission_connection()
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let mcp_session = connected_echo_mcp_session().await?;
-    {
-        let mut guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&response.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing session")
-            })?;
-        session.mcp_sessions.push(mcp_session);
-    }
+    store.insert_mcp_session(&response.session_id.0, mcp_session)?;
 
     let context = ToolContext {
-        session_id: response.session_id.clone(),
+        session_id: response.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -317,7 +304,7 @@ async fn mcp_tools_use_explicit_execute_permission_kind() -> Result<(), agent_cl
         &SetSessionModeRequest::new(session.session_id.clone(), "accept-edits"),
     )?;
     let context = ToolContext {
-        session_id: session.session_id,
+        session_id: session.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -526,7 +513,7 @@ async fn mcp_tool_execution_unknown_tool() -> Result<(), agent_client_protocol::
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let context = ToolContext {
-        session_id: session.session_id.clone(),
+        session_id: session.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -828,7 +815,7 @@ fn is_mcp_tool_name_matches_prefixed_only() {
 
 #[test]
 fn mcp_tool_kind_is_execute() {
-    assert_eq!(super::mcp_tool_kind(), ToolKind::Execute);
+    assert_eq!(super::mcp_tool_kind(), crate::tools::ToolKind::Execute);
 }
 
 #[test]
@@ -898,22 +885,10 @@ async fn mcp_tool_execution_bad_arguments_for_registered_tool()
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let mcp_session = connected_echo_mcp_session().await?;
-    {
-        let mut guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&response.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing session")
-            })?;
-        session.mcp_sessions.push(mcp_session);
-    }
+    store.insert_mcp_session(&response.session_id.0, mcp_session)?;
 
     let context = ToolContext {
-        session_id: response.session_id.clone(),
+        session_id: response.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1005,22 +980,10 @@ async fn mcp_tool_execution_peer_call_tool_error() -> Result<(), agent_client_pr
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let mcp_session = connected_failing_mcp_session().await?;
-    {
-        let mut guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&response.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing session")
-            })?;
-        session.mcp_sessions.push(mcp_session);
-    }
+    store.insert_mcp_session(&response.session_id.0, mcp_session)?;
 
     let context = ToolContext {
-        session_id: response.session_id.clone(),
+        session_id: response.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1120,22 +1083,10 @@ async fn mcp_tool_execution_is_error_flag() -> Result<(), agent_client_protocol:
     let store = test_store();
     let response = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     let mcp_session = connected_error_flag_mcp_session().await?;
-    {
-        let mut guard = store
-            .state
-            .lock()
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
-        let session = guard
-            .sessions
-            .get_mut(&response.session_id)
-            .ok_or_else(|| {
-                agent_client_protocol::Error::internal_error().data("missing session")
-            })?;
-        session.mcp_sessions.push(mcp_session);
-    }
+    store.insert_mcp_session(&response.session_id.0, mcp_session)?;
 
     let context = ToolContext {
-        session_id: response.session_id.clone(),
+        session_id: response.session_id.0.to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1163,7 +1114,8 @@ async fn mcp_tool_execution_is_error_flag() -> Result<(), agent_client_protocol:
 async fn mcp_tool_execution_unknown_session() {
     let store = test_store();
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("nonexistent-session"),
+        session_id: agent_client_protocol::schema::v1::SessionId::new("nonexistent-session")
+            .to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,

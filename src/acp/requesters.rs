@@ -314,3 +314,152 @@ impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
         Box::pin(self.send_request(request).block_task())
     }
 }
+
+use crate::SessionStore;
+use crate::session::{
+    PERMISSION_ALLOW_ALWAYS_OPTION_ID, PERMISSION_ALLOW_ONCE_OPTION_ID,
+    PERMISSION_REJECT_ALWAYS_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision,
+};
+use crate::tools::ToolContext;
+use crate::turn::tool_raw_input;
+use acp_llm_adapter::error::AdapterError;
+use acp_llm_adapter::llm::ToolCall as ChatToolCall;
+use agent_client_protocol::schema::v1::{
+    PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
+};
+use tokio_util::sync::CancellationToken;
+
+/// Ask the client (or fall back to posture) whether a tool call is allowed.
+///
+/// # Errors
+///
+/// Returns an [`AdapterError`] when the session is unknown, the permission request
+/// cannot be sent, or the client returns an unrecognized outcome.
+pub(crate) async fn request_tool_permission(
+    store: &SessionStore,
+    context: &ToolContext,
+    call: &ChatToolCall,
+    kind: crate::tools::ToolKind,
+    requester: &dyn PermissionRequester,
+    cancellation: &CancellationToken,
+) -> Result<PermissionDecision, AdapterError> {
+    if cancellation.is_cancelled() {
+        return Ok(PermissionDecision::Cancelled);
+    }
+    if store.is_always_rejected(&context.session_id, call.name())? {
+        return Ok(PermissionDecision::RejectAlways);
+    }
+    if store.is_always_allowed(&context.session_id, call.name())? {
+        return Ok(PermissionDecision::AllowAlways);
+    }
+
+    let behavior = store.session_behavior(&context.session_id)?;
+
+    if behavior.allows_without_prompt(kind) {
+        return Ok(PermissionDecision::AllowByMode);
+    }
+
+    let request = RequestPermissionRequest::new(
+        context.session_id.clone(),
+        ToolCallUpdate::new(
+            call.id().to_string(),
+            ToolCallUpdateFields::new()
+                .kind(agent_client_protocol::schema::v1::ToolKind::from(kind))
+                .status(ToolCallStatus::Pending)
+                .title(crate::turn::tool_call_title(call))
+                .raw_input(tool_raw_input(call)),
+        ),
+        permission_options(),
+    );
+
+    let response = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Ok(PermissionDecision::Cancelled),
+        response = requester.request_permission(request) => response,
+    }
+    .map_err(|e| AdapterError::Internal(e.to_string()))?;
+    // Approval and cancellation can become ready together. A stale reply must
+    // neither authorize this call nor change remembered permission decisions.
+    if cancellation.is_cancelled() {
+        return Ok(PermissionDecision::Cancelled);
+    }
+    let decision = match response.outcome {
+        RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
+        RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
+            PERMISSION_ALLOW_ONCE_OPTION_ID => PermissionDecision::AllowOnce,
+            PERMISSION_ALLOW_ALWAYS_OPTION_ID => PermissionDecision::AllowAlways,
+            PERMISSION_REJECT_ONCE_OPTION_ID => PermissionDecision::RejectOnce,
+            PERMISSION_REJECT_ALWAYS_OPTION_ID => PermissionDecision::RejectAlways,
+            other => {
+                return Err(AdapterError::InvalidParams(format!(
+                    "unknown permission option selected: {other}"
+                )));
+            }
+        },
+        _ => {
+            return Err(AdapterError::InvalidParams(
+                "unsupported permission outcome variant".to_string(),
+            ));
+        }
+    };
+
+    if decision == PermissionDecision::AllowAlways {
+        store.add_always_allow(&context.session_id, call.name().to_string())?;
+    } else if decision == PermissionDecision::RejectAlways {
+        store.add_always_reject(&context.session_id, call.name().to_string())?;
+    }
+
+    Ok(decision)
+}
+
+fn permission_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption::new(
+            PERMISSION_ALLOW_ONCE_OPTION_ID,
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            PERMISSION_ALLOW_ALWAYS_OPTION_ID,
+            "Allow always",
+            PermissionOptionKind::AllowAlways,
+        ),
+        PermissionOption::new(
+            PERMISSION_REJECT_ONCE_OPTION_ID,
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        ),
+        PermissionOption::new(
+            PERMISSION_REJECT_ALWAYS_OPTION_ID,
+            "Reject always",
+            PermissionOptionKind::RejectAlways,
+        ),
+    ]
+}
+
+/// Bind the editor connection to the registry's domain executor seam.
+pub(crate) struct EditorTools<'a>(pub(crate) Option<&'a dyn ToolCallRequester>);
+
+impl crate::tools::ToolExecutor for EditorTools<'_> {
+    fn execute<'a>(
+        &'a self,
+        call: &'a ChatToolCall,
+        context: &'a ToolContext,
+        store: &'a SessionStore,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, crate::tools::ToolExecution> {
+        crate::tools::execution::execute_tools(call, context, store, self.0, cancellation)
+    }
+}
+
+impl<T: ToolCallRequester> crate::tools::ToolExecutor for T {
+    fn execute<'a>(
+        &'a self,
+        call: &'a ChatToolCall,
+        context: &'a ToolContext,
+        store: &'a SessionStore,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, crate::tools::ToolExecution> {
+        crate::tools::execution::execute_tools(call, context, store, Some(self), cancellation)
+    }
+}

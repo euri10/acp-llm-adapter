@@ -32,15 +32,16 @@ impl Workspace {
         fs::write(extra.join("extra.txt"), "extra")?;
         let store = crate::test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&cwd))?;
-        store.set_mode(&session.session_id, SessionBehavior::Yolo)?;
+        store.set_mode(&session.session_id.0, SessionBehavior::Yolo)?;
         let context = ToolContext {
-            session_id: session.session_id,
+            session_id: session.session_id.0.to_string(),
             cwd,
             additional_directories: vec![extra.clone()],
             client_capabilities: Some(
-                ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                (ClientCapabilities::new().fs(FileSystemCapabilities::new()
                     .read_text_file(delegated)
-                    .write_text_file(delegated)),
+                    .write_text_file(delegated)))
+                .into(),
             ),
         };
         Ok(Self {

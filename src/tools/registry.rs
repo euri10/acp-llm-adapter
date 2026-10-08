@@ -2,30 +2,25 @@
 
 use std::path::PathBuf;
 
+pub(crate) use crate::session::{ToolContext, ToolKind};
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
-use agent_client_protocol::schema::v1::{SessionId, ToolCallStatus, ToolKind};
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::execution::{
-    edit_file_tool_definition, edit_file_tool_execution, exit_plan_mode_tool_definition,
-    exit_plan_mode_tool_execution, glob_tool_definition, glob_tool_execution, grep_tool_definition,
-    grep_tool_execution, list_dir_tool_definition, list_dir_tool_execution,
-    read_file_tool_definition, read_file_tool_execution, run_command_tool_definition,
-    run_command_tool_execution, update_plan_tool_definition, update_plan_tool_execution,
-    write_file_tool_definition, write_file_tool_execution,
-};
-type ToolExecutionFuture<'a> = BoxFuture<'a, ToolExecution>;
-
-#[derive(Debug, Clone)]
-pub(crate) struct ToolContext {
-    pub(crate) session_id: SessionId,
-    pub(crate) cwd: PathBuf,
-    pub(crate) additional_directories: Vec<PathBuf>,
-    pub(crate) client_capabilities: Option<agent_client_protocol::schema::v1::ClientCapabilities>,
+/// Executor bound to a turn's external tool services.
+pub(crate) trait ToolExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        call: &'a ChatToolCall,
+        context: &'a ToolContext,
+        store: &'a crate::SessionStore,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionFuture<'a>;
 }
+
+type ToolExecutionFuture<'a> = BoxFuture<'a, ToolExecution>;
 
 /// Registry for tools the model can call during a turn.
 pub(crate) trait ToolRegistry: Send + Sync {
@@ -36,7 +31,7 @@ pub(crate) trait ToolRegistry: Send + Sync {
         store: &crate::SessionStore,
     ) -> Result<Vec<ToolDefinition>, AdapterError>;
 
-    /// Return the ACP kind used when displaying and gating a tool call.
+    /// Return the domain category used by planning and permission policy.
     fn kind(&self, name: &str) -> ToolKind;
 
     /// Execute a complete model-requested tool call.
@@ -49,7 +44,7 @@ pub(crate) trait ToolRegistry: Send + Sync {
         call: &'a ChatToolCall,
         context: &'a ToolContext,
         store: &'a crate::SessionStore,
-        connection: Option<&'a dyn crate::ToolCallRequester>,
+        executor: Option<&'a dyn ToolExecutor>,
         cancellation_token: CancellationToken,
     ) -> ToolExecutionFuture<'a>;
 }
@@ -77,7 +72,7 @@ impl ToolRegistry for EmptyToolRegistry {
         call: &'a ChatToolCall,
         _context: &'a ToolContext,
         _store: &'a crate::SessionStore,
-        _connection: Option<&'a dyn crate::ToolCallRequester>,
+        _executor: Option<&'a dyn ToolExecutor>,
         _cancellation_token: CancellationToken,
     ) -> ToolExecutionFuture<'a> {
         Box::pin(async move { ToolExecution::failed(format!("unknown tool: {}", call.name())) })
@@ -86,151 +81,6 @@ impl ToolRegistry for EmptyToolRegistry {
 
 #[derive(Debug)]
 pub(crate) struct AdapterToolRegistry;
-
-impl ToolRegistry for AdapterToolRegistry {
-    fn definitions(
-        &self,
-        context: &ToolContext,
-        store: &crate::SessionStore,
-    ) -> Result<Vec<ToolDefinition>, AdapterError> {
-        if store
-            .selected_content_limits(&context.session_id)?
-            .is_some()
-        {
-            return Ok(Vec::new());
-        }
-        let mut definitions = vec![
-            read_file_tool_definition(),
-            list_dir_tool_definition(),
-            glob_tool_definition(),
-            grep_tool_definition(),
-            write_file_tool_definition(),
-            edit_file_tool_definition(),
-            run_command_tool_definition(),
-            update_plan_tool_definition(),
-        ];
-        if store.session_behavior(&context.session_id)? == crate::SessionBehavior::Plan {
-            definitions.push(exit_plan_mode_tool_definition());
-        }
-        definitions.extend(store.mcp_definitions(&context.session_id)?);
-        Ok(definitions)
-    }
-
-    fn kind(&self, name: &str) -> ToolKind {
-        match name {
-            "read_file" | "list_dir" => ToolKind::Read,
-            "glob" | "grep" => ToolKind::Search,
-            "write_file" | "edit_file" => ToolKind::Edit,
-            "run_command" => ToolKind::Execute,
-            "update_plan" | "exit_plan_mode" => ToolKind::Think,
-            name if crate::is_mcp_tool_name(name) => crate::mcp_tool_kind(),
-            _ => ToolKind::Other,
-        }
-    }
-
-    fn execute<'a>(
-        &'a self,
-        call: &'a ChatToolCall,
-        context: &'a ToolContext,
-        store: &'a crate::SessionStore,
-        connection: Option<&'a dyn crate::ToolCallRequester>,
-        cancellation_token: CancellationToken,
-    ) -> ToolExecutionFuture<'a> {
-        Box::pin(async move {
-            if cancellation_token.is_cancelled() {
-                return ToolExecution::failed(format!("{} cancelled", call.name()));
-            }
-            match store.selected_content_limits(&context.session_id) {
-                Ok(Some(_)) => {
-                    return ToolExecution::failed(
-                        "selected-content Sessions refuse all tool calls",
-                    );
-                }
-                Err(error) => return ToolExecution::failed(error.to_string()),
-                Ok(None) => {}
-            }
-            match call.name() {
-                "read_file" => {
-                    read_file_tool_execution(
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
-                    )
-                    .await
-                }
-                "list_dir" => {
-                    let call = call.clone();
-                    let context = context.clone();
-                    blocking::unblock(move || list_dir_tool_execution(&call, &context)).await
-                }
-                "glob" | "grep" => {
-                    let call = call.clone();
-                    let context = context.clone();
-                    let cancellation = cancellation_token.child_token();
-                    // Dropping the ACP turn also stops its blocking traversal.
-                    let _cancel_on_drop = cancellation.clone().drop_guard();
-                    blocking::unblock(move || {
-                        if call.name() == "glob" {
-                            glob_tool_execution(&call, &context, &cancellation)
-                        } else {
-                            grep_tool_execution(&call, &context, &cancellation)
-                        }
-                    })
-                    .await
-                }
-                "write_file" => {
-                    write_file_tool_execution(
-                        store,
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
-                        connection.map(|requester| requester as &dyn crate::WriteTextFileRequester),
-                        connection.map(|requester| requester as &dyn crate::PermissionRequester),
-                        &cancellation_token,
-                    )
-                    .await
-                }
-                "edit_file" => {
-                    edit_file_tool_execution(
-                        store,
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
-                        connection.map(|requester| requester as &dyn crate::WriteTextFileRequester),
-                        connection.map(|requester| requester as &dyn crate::PermissionRequester),
-                        &cancellation_token,
-                    )
-                    .await
-                }
-                "run_command" => {
-                    run_command_tool_execution(
-                        store,
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn crate::PermissionRequester),
-                        connection.map(|requester| requester as &dyn crate::TerminalRequester),
-                        connection.map(|requester| requester as &dyn crate::ToolProgressReporter),
-                        &cancellation_token,
-                    )
-                    .await
-                }
-                "update_plan" => update_plan_tool_execution(call),
-                "exit_plan_mode" => exit_plan_mode_tool_execution(store, call, context).await,
-                name if crate::is_mcp_tool_name(name) => {
-                    crate::mcp_tool_execution(
-                        store,
-                        call,
-                        context,
-                        connection.map(|requester| requester as &dyn crate::PermissionRequester),
-                        &cancellation_token,
-                    )
-                    .await
-                }
-                _ => ToolExecution::failed(format!("unknown tool: {}", call.name())),
-            }
-        })
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolExecution {
@@ -271,14 +121,6 @@ impl ToolExecution {
 
     pub(crate) fn content_for_model(&self) -> &str {
         &self.content
-    }
-
-    pub(crate) fn status(&self) -> ToolCallStatus {
-        if self.success {
-            ToolCallStatus::Completed
-        } else {
-            ToolCallStatus::Failed
-        }
     }
 }
 
@@ -448,7 +290,8 @@ mod tests {
 
     fn registry_context(cwd: std::path::PathBuf) -> ToolContext {
         ToolContext {
-            session_id: agent_client_protocol::schema::v1::SessionId::new("session-registry-test"),
+            session_id: agent_client_protocol::schema::v1::SessionId::new("session-registry-test")
+                .to_string(),
             cwd,
             additional_directories: Vec::new(),
             client_capabilities: None,
@@ -485,14 +328,15 @@ mod tests {
                 let store = test_store();
                 let session = handle_new_session_request(&store, &NewSessionRequest::new(&root))?;
                 let mut context = registry_context(root.clone());
-                context.session_id = session.session_id;
+                context.session_id = session.session_id.0.to_string();
                 if client_io {
                     context.client_capabilities = Some(
-                        ClientCapabilities::new()
+                        (ClientCapabilities::new()
                             .fs(FileSystemCapabilities::new()
                                 .read_text_file(true)
                                 .write_text_file(true))
-                            .terminal(true),
+                            .terminal(true))
+                        .into(),
                     );
                 }
                 let token = CancellationToken::new();
@@ -580,9 +424,9 @@ mod tests {
         let registry = AdapterToolRegistry;
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        store.set_mode(&session.session_id, crate::SessionBehavior::Plan)?;
+        store.set_mode(&session.session_id.0, crate::SessionBehavior::Plan)?;
         let context = ToolContext {
-            session_id: session.session_id,
+            session_id: session.session_id.0.to_string(),
             cwd: std::path::PathBuf::from("/tmp"),
             additional_directories: Vec::new(),
             client_capabilities: None,
@@ -629,7 +473,7 @@ mod tests {
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let mut context = registry_context(temp_root.clone());
-        context.session_id = session.session_id;
+        context.session_id = session.session_id.0.to_string();
         let call = ChatToolCall::new(
             "reg-read",
             "read_file",
@@ -655,13 +499,14 @@ mod tests {
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let requester = RecordingToolCallRequester::default();
         let context = ToolContext {
-            session_id: session.session_id.clone(),
+            session_id: session.session_id.0.to_string(),
             cwd: temp_root,
             additional_directories: Vec::new(),
             client_capabilities: Some(
-                ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                (ClientCapabilities::new().fs(FileSystemCapabilities::new()
                     .read_text_file(true)
-                    .write_text_file(true)),
+                    .write_text_file(true)))
+                .into(),
             ),
         };
         let registry = AdapterToolRegistry;
@@ -740,7 +585,7 @@ mod tests {
 
         let registry = AdapterToolRegistry;
         let context = ToolContext {
-            session_id: session.session_id.clone(),
+            session_id: session.session_id.0.to_string(),
             cwd: temp_root.clone(),
             additional_directories: Vec::new(),
             client_capabilities: None,
@@ -772,7 +617,7 @@ mod tests {
 
         let registry = AdapterToolRegistry;
         let context = ToolContext {
-            session_id: session.session_id.clone(),
+            session_id: session.session_id.0.to_string(),
             cwd: temp_root.clone(),
             additional_directories: Vec::new(),
             client_capabilities: None,
@@ -808,7 +653,7 @@ mod tests {
 
         let registry = AdapterToolRegistry;
         let context = ToolContext {
-            session_id: session.session_id.clone(),
+            session_id: session.session_id.0.to_string(),
             cwd: temp_root.clone(),
             additional_directories: Vec::new(),
             client_capabilities: None,
@@ -838,13 +683,14 @@ mod tests {
         let session = handle_new_session_request(&store, &NewSessionRequest::new(&temp_root))?;
         let requester = RecordingToolCallRequester::default();
         let context = ToolContext {
-            session_id: session.session_id.clone(),
+            session_id: session.session_id.0.to_string(),
             cwd: temp_root,
             additional_directories: Vec::new(),
             client_capabilities: Some(
-                ClientCapabilities::new()
+                (ClientCapabilities::new()
                     .terminal(true)
-                    .fs(FileSystemCapabilities::new()),
+                    .fs(FileSystemCapabilities::new()))
+                .into(),
             ),
         };
         let call = ChatToolCall::new(
@@ -879,7 +725,7 @@ mod tests {
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
         let mut context = registry_context(std::path::PathBuf::from("/tmp"));
-        context.session_id = session.session_id;
+        context.session_id = session.session_id.0.to_string();
         let call = ChatToolCall::new("bogus-call", "no_such_tool", "{}");
         let result = registry
             .execute(&call, &context, &store, None, CancellationToken::new())
@@ -896,7 +742,7 @@ mod tests {
         assert_eq!(exec.content, "done");
         assert_eq!(exec.raw_output, serde_json::json!({"ok": true}));
         assert!(exec.edit.is_none());
-        assert_eq!(exec.status(), ToolCallStatus::Completed);
+        assert!(exec.success);
         assert_eq!(exec.content_for_model(), "done");
     }
 
@@ -910,30 +756,30 @@ mod tests {
             serde_json::json!({"error": "error message"})
         );
         assert!(exec.edit.is_none());
-        assert_eq!(exec.status(), ToolCallStatus::Failed);
+        assert!(!exec.success);
         assert_eq!(exec.content_for_model(), "error message");
     }
 
     #[test]
-    fn tool_execution_status_returns_completed_when_success() {
+    fn tool_execution_completed_result_is_successful() {
         let exec = ToolExecution {
             content: String::new(),
             raw_output: serde_json::Value::Null,
             success: true,
             edit: None,
         };
-        assert_eq!(exec.status(), ToolCallStatus::Completed);
+        assert!(exec.success);
     }
 
     #[test]
-    fn tool_execution_status_returns_failed_when_not_success() {
+    fn tool_execution_failed_result_is_unsuccessful() {
         let exec = ToolExecution {
             content: String::new(),
             raw_output: serde_json::Value::Null,
             success: false,
             edit: None,
         };
-        assert_eq!(exec.status(), ToolCallStatus::Failed);
+        assert!(!exec.success);
     }
 
     #[test]

@@ -5,11 +5,11 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    ReadTextFileRequest, SessionId, TerminalOutputRequest, ToolKind, WaitForTerminalExitRequest,
-    WriteTextFileRequest,
+    ReadTextFileRequest, TerminalOutputRequest, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use globset::{Glob, GlobSetBuilder};
 use grep::regex::RegexMatcher;
@@ -19,12 +19,15 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::filesystem::ConfinedPath;
-use super::registry::{ToolContext, ToolEdit, ToolExecution};
+use super::registry::{
+    AdapterToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolKind, ToolRegistry,
+};
 use super::search::{SearchReader, walk_files};
 use crate::{
     PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionBehavior, SessionStore,
     TerminalRequester, ToolProgressReporter, WriteTextFileRequester, request_tool_permission,
 };
+use futures_util::future::BoxFuture;
 
 const TOOL_OUTPUT_LIMIT: usize = 200;
 const TOOL_OUTPUT_LIMIT_U32: u32 = 200;
@@ -273,7 +276,7 @@ pub(crate) fn update_plan_tool_execution(call: &ChatToolCall) -> ToolExecution {
     }
 }
 
-pub(crate) async fn exit_plan_mode_tool_execution(
+pub(crate) fn exit_plan_mode_tool_execution(
     store: &SessionStore,
     call: &ChatToolCall,
     context: &ToolContext,
@@ -302,7 +305,7 @@ pub(crate) async fn exit_plan_mode_tool_execution(
     ToolExecution {
         content: format!("switched to {} mode", SessionBehavior::AcceptEdits.name()),
         raw_output: serde_json::json!({
-            "mode_id": SessionBehavior::AcceptEdits.mode_id().0,
+            "mode_id": SessionBehavior::AcceptEdits.mode_id(),
             "mode_name": SessionBehavior::AcceptEdits.name(),
         }),
         success: true,
@@ -341,7 +344,7 @@ pub(crate) async fn read_file_tool_execution(
     let file_result = if context
         .client_capabilities
         .as_ref()
-        .is_some_and(|capabilities| capabilities.fs.read_text_file)
+        .is_some_and(|capabilities| capabilities.read_text_file)
     {
         match connection {
             Some(connection) => {
@@ -374,7 +377,7 @@ pub(crate) async fn read_file_tool_execution(
                 "source": if context
                     .client_capabilities
                     .as_ref()
-                    .is_some_and(|capabilities| capabilities.fs.read_text_file)
+                    .is_some_and(|capabilities| capabilities.read_text_file)
                 {
                     "client"
                 } else {
@@ -425,7 +428,7 @@ pub(crate) async fn write_file_tool_execution(
     let use_client_write = context
         .client_capabilities
         .as_ref()
-        .is_some_and(|capabilities| capabilities.fs.write_text_file);
+        .is_some_and(|capabilities| capabilities.write_text_file);
     let old_text = match tokio::select! {
         biased;
         () = cancellation.cancelled() => return ToolExecution::failed("write_file cancelled"),
@@ -512,7 +515,7 @@ pub(crate) async fn edit_file_tool_execution(
     let use_client_read = context
         .client_capabilities
         .as_ref()
-        .is_some_and(|capabilities| capabilities.fs.read_text_file);
+        .is_some_and(|capabilities| capabilities.read_text_file);
     let original_result = if use_client_read {
         match read_connection {
             Some(connection) => {
@@ -577,7 +580,7 @@ pub(crate) async fn edit_file_tool_execution(
     let use_client_write = context
         .client_capabilities
         .as_ref()
-        .is_some_and(|capabilities| capabilities.fs.write_text_file);
+        .is_some_and(|capabilities| capabilities.write_text_file);
     let write_result = if use_client_write {
         match write_connection {
             Some(connection) => {
@@ -758,7 +761,10 @@ pub(crate) async fn run_command_tool_execution(
     };
 
     if let Some(progress) = progress {
-        progress.report_in_progress(&context.session_id, call.id());
+        progress.report_in_progress(
+            &agent_client_protocol::schema::v1::SessionId::new(context.session_id.clone()),
+            call.id(),
+        );
     }
 
     // Read before the wait future takes ownership of the child. That future
@@ -806,7 +812,7 @@ pub(crate) async fn run_command_tool_execution(
 }
 
 pub(crate) async fn run_command_via_terminal(
-    session_id: &SessionId,
+    session_id: &str,
     tool_call_id: &str,
     cwd: &Path,
     command: &str,
@@ -818,7 +824,7 @@ pub(crate) async fn run_command_via_terminal(
         return ToolExecution::failed("terminal support advertised but no connection available");
     };
 
-    let create_request = CreateTerminalRequest::new(session_id.clone(), command)
+    let create_request = CreateTerminalRequest::new(session_id.to_string(), command)
         .cwd(Some(cwd.to_path_buf()))
         .output_byte_limit(Some(COMMAND_OUTPUT_LIMIT as u64));
     let create_response = tokio::select! {
@@ -837,17 +843,20 @@ pub(crate) async fn run_command_via_terminal(
     // The client has the command running now; before this the call was queued
     // behind the permission prompt above.
     if let Some(progress) = progress {
-        progress.report_in_progress(session_id, tool_call_id);
+        progress.report_in_progress(
+            &agent_client_protocol::schema::v1::SessionId::new(session_id),
+            tool_call_id,
+        );
     }
 
-    let wait_request = WaitForTerminalExitRequest::new(session_id.clone(), terminal_id.clone());
+    let wait_request = WaitForTerminalExitRequest::new(session_id.to_string(), terminal_id.clone());
     let wait_response = tokio::select! {
         biased;
         // Turn cancelled while the command is running: kill it, then release the
         // terminal so the client frees its resources.
         () = cancellation_token.cancelled() => {
             // Cleanup logs failed/unanswered RPCs and attempts both operations.
-            let _ = crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, true).await;
+            let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::schema::v1::SessionId::new(session_id), &terminal_id, true).await;
             return ToolExecution::failed("run_command cancelled");
         }
         result = terminal_requester.wait_for_terminal_exit(wait_request) => match result {
@@ -855,33 +864,38 @@ pub(crate) async fn run_command_via_terminal(
             Err(error) => {
                 tracing::warn!(code = ?error.code, "terminal/wait_for_exit failed");
                 // An unsuccessful wait does not prove the command exited.
-                let _ = crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, true).await;
+                let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::schema::v1::SessionId::new(session_id), &terminal_id, true).await;
                 return ToolExecution::failed("terminal/wait_for_exit failed");
             }
         },
     };
 
-    let output_request = TerminalOutputRequest::new(session_id.clone(), terminal_id.clone());
+    let output_request = TerminalOutputRequest::new(session_id.to_string(), terminal_id.clone());
     let output_response = tokio::select! {
         biased;
         () = cancellation_token.cancelled() => {
             // Keep cancellation cleanup consistent even after exit notification.
-            let _ = crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, true).await;
+            let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::schema::v1::SessionId::new(session_id), &terminal_id, true).await;
             return ToolExecution::failed("run_command cancelled");
         }
         result = terminal_requester.terminal_output(output_request) => match result {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(code = ?error.code, "terminal/output failed");
-                let _ = crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, false).await;
+                let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::schema::v1::SessionId::new(session_id), &terminal_id, false).await;
                 return ToolExecution::failed("terminal/output failed");
             }
         },
     };
 
-    if crate::acp::cleanup_terminal(terminal_requester, session_id, &terminal_id, false)
-        .await
-        .is_err()
+    if crate::acp::cleanup_terminal(
+        terminal_requester,
+        &agent_client_protocol::schema::v1::SessionId::new(session_id),
+        &terminal_id,
+        false,
+    )
+    .await
+    .is_err()
     {
         return ToolExecution::failed("terminal/release failed");
     }
@@ -1086,7 +1100,7 @@ pub(crate) async fn require_tool_permission(
 
 async fn read_file_from_client<'a>(
     connection: &'a dyn ReadTextFileRequester,
-    session_id: &'a SessionId,
+    session_id: &'a str,
     path: &'a ConfinedPath,
     line: u32,
     limit: u32,
@@ -1094,7 +1108,7 @@ async fn read_file_from_client<'a>(
     let path = client_file_path(path).await?;
     let response = connection
         .read_text_file(
-            ReadTextFileRequest::new(session_id.clone(), path.clone())
+            ReadTextFileRequest::new(session_id.to_string(), path.clone())
                 .line(line)
                 .limit(limit),
         )
@@ -1106,12 +1120,15 @@ async fn read_file_from_client<'a>(
 
 async fn read_full_file_from_client<'a>(
     connection: &'a dyn ReadTextFileRequester,
-    session_id: &'a SessionId,
+    session_id: &'a str,
     path: &'a ConfinedPath,
 ) -> Result<String, String> {
     let path = client_file_path(path).await?;
     let response = connection
-        .read_text_file(ReadTextFileRequest::new(session_id.clone(), path.clone()))
+        .read_text_file(ReadTextFileRequest::new(
+            session_id.to_string(),
+            path.clone(),
+        ))
         .await
         .map_err(|error| read_file_client_error(&path, &error.to_string()))?;
 
@@ -1128,7 +1145,7 @@ async fn read_existing_text(
         let can_client_read = context
             .client_capabilities
             .as_ref()
-            .is_some_and(|capabilities| capabilities.fs.read_text_file);
+            .is_some_and(|capabilities| capabilities.read_text_file);
         if !can_client_read {
             return Ok(None);
         }
@@ -1151,7 +1168,7 @@ async fn read_existing_text(
 
 pub(crate) async fn write_file_to_client(
     connection: &dyn WriteTextFileRequester,
-    session_id: &SessionId,
+    session_id: &str,
     path: &ConfinedPath,
     content: &str,
     cancellation: &CancellationToken,
@@ -1162,7 +1179,7 @@ pub(crate) async fn write_file_to_client(
     }
     connection
         .write_text_file(WriteTextFileRequest::new(
-            session_id.clone(),
+            session_id.to_string(),
             path.clone(),
             content.to_owned(),
         ))
@@ -1443,6 +1460,163 @@ fn collect_grep_matches(
     })?;
 
     Ok((grep_hits, truncated))
+}
+
+impl ToolRegistry for AdapterToolRegistry {
+    fn definitions(
+        &self,
+        context: &ToolContext,
+        store: &crate::SessionStore,
+    ) -> Result<Vec<ToolDefinition>, AdapterError> {
+        if store
+            .selected_content_limits(&context.session_id)?
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let mut definitions = vec![
+            read_file_tool_definition(),
+            list_dir_tool_definition(),
+            glob_tool_definition(),
+            grep_tool_definition(),
+            write_file_tool_definition(),
+            edit_file_tool_definition(),
+            run_command_tool_definition(),
+            update_plan_tool_definition(),
+        ];
+        if store.session_behavior(&context.session_id)? == crate::SessionBehavior::Plan {
+            definitions.push(exit_plan_mode_tool_definition());
+        }
+        definitions.extend(store.mcp_definitions(&context.session_id)?);
+        Ok(definitions)
+    }
+
+    fn kind(&self, name: &str) -> ToolKind {
+        match name {
+            "read_file" | "list_dir" => ToolKind::Read,
+            "glob" | "grep" => ToolKind::Search,
+            "write_file" | "edit_file" => ToolKind::Edit,
+            "run_command" => ToolKind::Execute,
+            "update_plan" | "exit_plan_mode" => ToolKind::Think,
+            name if crate::is_mcp_tool_name(name) => crate::mcp_tool_kind(),
+            _ => ToolKind::Other,
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ChatToolCall,
+        context: &'a ToolContext,
+        store: &'a crate::SessionStore,
+        executor: Option<&'a dyn super::registry::ToolExecutor>,
+        cancellation_token: CancellationToken,
+    ) -> BoxFuture<'a, ToolExecution> {
+        match executor {
+            Some(executor) => executor.execute(call, context, store, cancellation_token),
+            None => execute_tools(call, context, store, None, cancellation_token),
+        }
+    }
+}
+
+/// Execute built-in/MCP effects at the tool I/O boundary.
+pub(crate) fn execute_tools<'a>(
+    call: &'a ChatToolCall,
+    context: &'a ToolContext,
+    store: &'a crate::SessionStore,
+    connection: Option<&'a dyn crate::ToolCallRequester>,
+    cancellation_token: CancellationToken,
+) -> BoxFuture<'a, ToolExecution> {
+    Box::pin(async move {
+        if cancellation_token.is_cancelled() {
+            return ToolExecution::failed(format!("{} cancelled", call.name()));
+        }
+        match store.selected_content_limits(&context.session_id) {
+            Ok(Some(_)) => {
+                return ToolExecution::failed("selected-content Sessions refuse all tool calls");
+            }
+            Err(error) => return ToolExecution::failed(error.to_string()),
+            Ok(None) => {}
+        }
+        match call.name() {
+            "read_file" => {
+                read_file_tool_execution(
+                    call,
+                    context,
+                    connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
+                )
+                .await
+            }
+            "list_dir" => {
+                let call = call.clone();
+                let context = context.clone();
+                blocking::unblock(move || list_dir_tool_execution(&call, &context)).await
+            }
+            "glob" | "grep" => {
+                let call = call.clone();
+                let context = context.clone();
+                let cancellation = cancellation_token.child_token();
+                // Dropping the ACP turn also stops its blocking traversal.
+                let _cancel_on_drop = cancellation.clone().drop_guard();
+                blocking::unblock(move || {
+                    if call.name() == "glob" {
+                        glob_tool_execution(&call, &context, &cancellation)
+                    } else {
+                        grep_tool_execution(&call, &context, &cancellation)
+                    }
+                })
+                .await
+            }
+            "write_file" => {
+                write_file_tool_execution(
+                    store,
+                    call,
+                    context,
+                    connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
+                    connection.map(|requester| requester as &dyn crate::WriteTextFileRequester),
+                    connection.map(|requester| requester as &dyn crate::PermissionRequester),
+                    &cancellation_token,
+                )
+                .await
+            }
+            "edit_file" => {
+                edit_file_tool_execution(
+                    store,
+                    call,
+                    context,
+                    connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
+                    connection.map(|requester| requester as &dyn crate::WriteTextFileRequester),
+                    connection.map(|requester| requester as &dyn crate::PermissionRequester),
+                    &cancellation_token,
+                )
+                .await
+            }
+            "run_command" => {
+                run_command_tool_execution(
+                    store,
+                    call,
+                    context,
+                    connection.map(|requester| requester as &dyn crate::PermissionRequester),
+                    connection.map(|requester| requester as &dyn crate::TerminalRequester),
+                    connection.map(|requester| requester as &dyn crate::ToolProgressReporter),
+                    &cancellation_token,
+                )
+                .await
+            }
+            "update_plan" => update_plan_tool_execution(call),
+            "exit_plan_mode" => exit_plan_mode_tool_execution(store, call, context),
+            name if crate::is_mcp_tool_name(name) => {
+                crate::mcp_tool_execution(
+                    store,
+                    call,
+                    context,
+                    connection.map(|requester| requester as &dyn crate::PermissionRequester),
+                    &cancellation_token,
+                )
+                .await
+            }
+            _ => ToolExecution::failed(format!("unknown tool: {}", call.name())),
+        }
+    })
 }
 
 #[cfg(test)]

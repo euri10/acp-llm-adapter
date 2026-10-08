@@ -1,5 +1,7 @@
 #![allow(clippy::indexing_slicing)]
-use super::{ModelRequestSettings, StreamContext, handle_prompt_request, stream_model_turn};
+use super::{
+    ModelRequestSettings, PromptInput, StopReason as DomainStop, StreamContext, TurnEvent,
+};
 use crate::acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
     WriteTextFileRequester, handle_delete_session_request, handle_list_sessions_request,
@@ -8,14 +10,15 @@ use crate::acp::{
 };
 use crate::session::{
     DEFAULT_MAX_TURN_REQUESTS, ReasoningEffort, SESSION_CONFIG_MODE_ID, SessionBehavior,
-    SessionStore,
+    SessionRecord,
 };
 use crate::session_store::FilesystemSessionStore;
-use crate::test_store;
 use crate::test_utils::{FakePermissionRequester, select_current_value};
 use crate::tools::{
-    AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolRegistry,
+    AdapterToolRegistry, EmptyToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolExecutor,
+    ToolKind, ToolRegistry,
 };
+use crate::{SessionStore, test_store};
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{
     ChatError, ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
@@ -25,7 +28,7 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, DeleteSessionRequest, ListSessionsRequest,
     LoadSessionRequest, NewSessionRequest, PromptRequest, RequestPermissionRequest,
     RequestPermissionResponse, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    StopReason, ToolCallContent, ToolCallStatus, ToolKind,
+    StopReason, ToolCallContent, ToolCallStatus,
 };
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
@@ -34,6 +37,186 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+fn domain_store() -> Result<SessionStore, AdapterError> {
+    let store = test_store();
+    store.insert_session(
+        "domain".into(),
+        SessionRecord {
+            selected_content: None,
+            selected_content_used: false,
+            cwd: PathBuf::from("/workspace"),
+            additional_directories: Vec::new(),
+            history: Vec::new(),
+            active_turn: None,
+            mode: SessionBehavior::Ask,
+            model: "mock".into(),
+            reasoning_effort: ReasoningEffort::Default,
+            max_tokens: None,
+            permission_allow_always: std::collections::HashSet::new(),
+            permission_reject_always: std::collections::HashSet::new(),
+            title: String::new(),
+            updated_at: String::new(),
+            cost_micros: 0,
+        },
+    )?;
+
+    Ok(store)
+}
+
+// The whole harness lifecycle is exercised using domain inputs/events only.
+// No ACP handshake, schema value, filesystem, socket or editor is constructed.
+#[test_log::test(tokio::test)]
+async fn domain_turn_pairs_tool_history_and_cancels_remaining_calls() -> Result<(), AdapterError> {
+    let store = domain_store()?;
+    let call = |index, id: &str| {
+        FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+            index,
+            Some(id.into()),
+            Some("echo".into()),
+            Some("{}".into()),
+        ))))
+    };
+    let finished = |reason| FakeStreamStep::Event(Ok(StreamEvent::Finished(reason)));
+    let client = FakeLlmClient::with_streams(vec![
+        vec![call(0, "first"), finished(FinishReason::ToolCalls)],
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::Message("done".into()))),
+            finished(FinishReason::EndTurn),
+        ],
+        vec![
+            call(0, "second"),
+            call(1, "third"),
+            finished(FinishReason::ToolCalls),
+        ],
+    ]);
+    let tools = FakeToolRegistry::new();
+    let mut events = Vec::new();
+    let result = super::handle_prompt_request(
+        &store,
+        &client,
+        &tools,
+        None,
+        PromptInput {
+            session_id: "domain".into(),
+            text: "start".into(),
+            title: Some("start".into()),
+        },
+        DEFAULT_MAX_TURN_REQUESTS,
+        |event| {
+            events.push(event);
+            Ok(())
+        },
+    )
+    .await?;
+    assert_eq!(result.stop_reason, DomainStop::EndTurn);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ToolCall { call, .. } if call.id() == "first"))
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, TurnEvent::Message { text, thought: false, .. } if text == "done")
+    ));
+    {
+        let requests = client
+            .requests
+            .lock()
+            .map_err(|e| AdapterError::Internal(e.to_string()))?;
+        assert_eq!(requests.len(), 2);
+        let feedback = requests[1]
+            .messages()
+            .last()
+            .ok_or_else(|| AdapterError::Internal("missing feedback".into()))?;
+        assert_eq!(feedback.role(), MessageRole::Tool);
+        assert_eq!(feedback.tool_call_id(), Some("first"));
+        assert_eq!(feedback.content(), "tool says hi");
+    }
+    let result = super::handle_prompt_request(
+        &store,
+        &client,
+        &tools,
+        None,
+        PromptInput {
+            session_id: "domain".into(),
+            text: "continue".into(),
+            title: None,
+        },
+        DEFAULT_MAX_TURN_REQUESTS,
+        |event| {
+            if matches!(event, TurnEvent::ToolResult { .. }) {
+                store.cancel_active_turn("domain")?;
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    assert_eq!(result.stop_reason, DomainStop::Cancelled);
+    let calls = tools
+        .calls
+        .lock()
+        .map_err(|e| AdapterError::Internal(e.to_string()))?;
+    assert_eq!(calls.len(), 2);
+    store.with_session("domain", |record| {
+        assert!(record.active_turn.is_none());
+        assert_eq!(record.history.len(), 8);
+        assert_eq!(record.history[6].tool_call_id(), Some("second"));
+        assert_eq!(record.history[7].tool_call_id(), Some("third"));
+        assert!(record.history[7].content().contains("cancelled"));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+async fn handle_prompt_request(
+    store: &SessionStore,
+    client: &dyn LlmClient,
+    tools: &dyn ToolRegistry,
+    connection: Option<&dyn ToolCallRequester>,
+    request: PromptRequest,
+    limit: std::num::NonZeroUsize,
+    mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<agent_client_protocol::schema::v1::PromptResponse, AdapterError> {
+    let input = crate::acp::translate_prompt(
+        &request,
+        store
+            .selected_content_limits(&request.session_id.0)?
+            .is_some(),
+    )?;
+    let executor = crate::acp::EditorTools(connection);
+    super::handle_prompt_request(
+        store,
+        client,
+        tools,
+        Some(&executor),
+        input,
+        limit,
+        |event| {
+            crate::acp::turn_events::encode_event(store, &request.session_id, event, &mut notify)
+        },
+    )
+    .await
+    .map(crate::acp::turn_events::encode_result)
+}
+
+async fn stream_model_turn(
+    context: StreamContext<'_>,
+    settings: ModelRequestSettings<'_>,
+    cancellation: CancellationToken,
+    session_id: &agent_client_protocol::schema::v1::SessionId,
+    notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
+) -> Result<super::ModelTurn, AdapterError> {
+    let temporary = test_store();
+    let store = context.store.unwrap_or(&temporary);
+    super::stream_model_turn(
+        context,
+        settings,
+        cancellation,
+        &session_id.0,
+        &mut |event| crate::acp::turn_events::encode_event(store, session_id, event, notify),
+    )
+    .await
+}
 
 struct FakeLlmClient {
     requests: Arc<Mutex<Vec<ChatRequest>>>,
@@ -182,12 +365,12 @@ async fn selected_content_denies_every_tool_and_never_requests_a_followup()
     ] {
         let store = test_store();
         let session = handle_new_session_request(&store, &selected_request())?;
-        store.set_mode(&session.session_id, SessionBehavior::Yolo)?;
+        store.set_mode(&session.session_id.0, SessionBehavior::Yolo)?;
         let direct = AdapterToolRegistry
             .execute(
                 &ChatToolCall::new("direct", tool, "{}"),
                 &ToolContext {
-                    session_id: session.session_id.clone(),
+                    session_id: session.session_id.0.to_string(),
                     cwd: "/tmp".into(),
                     additional_directories: Vec::new(),
                     client_capabilities: None,
@@ -330,7 +513,7 @@ async fn selected_content_deadline_ends_an_unresponsive_stream() -> Result<(), A
         matches!(result, Err(AdapterError::InvalidRequest(ref message))
         if message == "selected-content deadline exceeded")
     );
-    assert!(store.with_session(&session.session_id, |record| Ok(
+    assert!(store.with_session(&session.session_id.0, |record| Ok(
         record.active_turn.is_none()
     ))?);
     Ok(())
@@ -673,7 +856,7 @@ impl ToolRegistry for PlanModeToolRegistry {
         call: &'a ChatToolCall,
         _context: &'a ToolContext,
         _store: &'a SessionStore,
-        _connection: Option<&'a dyn ToolCallRequester>,
+        _connection: Option<&'a dyn ToolExecutor>,
         _cancellation_token: CancellationToken,
     ) -> BoxFuture<'a, ToolExecution> {
         Box::pin(async move {
@@ -728,7 +911,7 @@ impl ToolRegistry for FakeToolRegistry {
         call: &'a ChatToolCall,
         _context: &'a ToolContext,
         _store: &'a SessionStore,
-        _connection: Option<&'a dyn ToolCallRequester>,
+        _connection: Option<&'a dyn ToolExecutor>,
         _cancellation_token: CancellationToken,
     ) -> BoxFuture<'a, ToolExecution> {
         Box::pin(async move {
@@ -904,7 +1087,7 @@ async fn plan_mode_injects_instructions_and_filters_mutating_tools()
         &store,
         &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
     )?;
-    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+    store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
 
     let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
     let requests = client.requests();
@@ -949,7 +1132,7 @@ async fn plan_mode_injects_instructions_and_filters_mutating_tools()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let stored = state_guard
         .sessions
-        .get(&session.session_id)
+        .get(session.session_id.0.as_ref())
         .ok_or_else(|| {
             agent_client_protocol::Error::internal_error().data("missing stored session")
         })?;
@@ -969,7 +1152,7 @@ async fn plan_mode_refuses_disallowed_tool_calls_before_execution()
         &store,
         &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
     )?;
-    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+    store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
 
     let client = FakeLlmClient::with_streams(vec![
         vec![
@@ -1032,7 +1215,7 @@ async fn leaving_plan_mode_restores_normal_request_assembly()
     let requests = client.requests();
     let registry = PlanModeToolRegistry::new();
 
-    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+    store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
     handle_prompt_request(
         &store,
         &client,
@@ -1047,7 +1230,7 @@ async fn leaving_plan_mode_restores_normal_request_assembly()
     )
     .await?;
 
-    store.set_mode(&session.session_id, SessionBehavior::Ask)?;
+    store.set_mode(&session.session_id.0, SessionBehavior::Ask)?;
     handle_prompt_request(
         &store,
         &client,
@@ -1102,7 +1285,7 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
         &store,
         &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
     )?;
-    store.set_mode(&session.session_id, SessionBehavior::Plan)?;
+    store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
 
     let client = FakeLlmClient::with_streams(vec![
         vec![
@@ -1167,7 +1350,7 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
             .map_err(agent_client_protocol::Error::into_internal_error)?;
         let stored = state_guard
             .sessions
-            .get(&session.session_id)
+            .get(session.session_id.0.as_ref())
             .ok_or_else(|| {
                 agent_client_protocol::Error::internal_error()
                     .data("missing stored session after transition")
@@ -1395,7 +1578,7 @@ async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let stored = state_guard
         .sessions
-        .get(&session.session_id)
+        .get(session.session_id.0.as_ref())
         .ok_or_else(|| {
             agent_client_protocol::Error::internal_error().data("missing stored session")
         })?;
@@ -1666,7 +1849,7 @@ async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_pr
     };
     assert_eq!(text.text, "partial");
 
-    store.cancel_active_turn(&CancelNotification::new(session_id.clone()).session_id)?;
+    store.cancel_active_turn(&CancelNotification::new(session_id.clone()).session_id.0)?;
     let response = prompt_task
         .await
         .map_err(agent_client_protocol::Error::into_internal_error)??;
@@ -1678,7 +1861,7 @@ async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_pr
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let session = guard
         .sessions
-        .get(&session_id)
+        .get(session_id.0.as_ref())
         .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing session"))?;
     assert!(session.active_turn.is_none());
     // Cancellation retains the accepted prompt, but not an incomplete assistant reply.
@@ -1735,7 +1918,7 @@ async fn delete_session_cancels_prompt_without_failing_cleanup()
         .state
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    assert!(!guard.sessions.contains_key(&session_id));
+    assert!(!guard.sessions.contains_key(session_id.0.as_ref()));
 
     Ok(())
 }
@@ -1781,7 +1964,7 @@ async fn stream_model_turn_respects_cancellation_token() -> Result<(), agent_cli
         .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))?
         .map_err(agent_client_protocol::Error::into_internal_error)??;
 
-    assert_eq!(turn.stop_reason, StopReason::Cancelled);
+    assert_eq!(turn.stop_reason, super::StopReason::Cancelled);
     assert_eq!(turn.assistant_text, "");
     assert!(turn.tool_calls.is_empty());
 
@@ -1837,7 +2020,9 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
     .await?;
 
     assert_eq!(
-        usage_totals.into_acp_usage(),
+        usage_totals
+            .into_usage()
+            .map(crate::acp::turn_events::encode_usage),
         Some(agent_client_protocol::schema::v1::Usage::new(10, 3, 4))
     );
 
@@ -1872,14 +2057,14 @@ fn session_cost_overflow_leaves_previous_total_unchanged() -> Result<(), Adapter
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
     assert_eq!(
-        store.add_cost_micros(&session.session_id, u64::MAX)?,
+        store.add_cost_micros(&session.session_id.0, u64::MAX)?,
         u64::MAX
     );
     assert!(matches!(
-        store.add_cost_micros(&session.session_id, 1),
+        store.add_cost_micros(&session.session_id.0, 1),
         Err(AdapterError::Llm(ChatError::InvalidResponse(_)))
     ));
-    assert_eq!(store.add_cost_micros(&session.session_id, 0)?, u64::MAX);
+    assert_eq!(store.add_cost_micros(&session.session_id.0, 0)?, u64::MAX);
     Ok(())
 }
 
@@ -1888,7 +2073,7 @@ async fn prompt_rejects_invalid_usage_before_state_changes() -> Result<(), Adapt
     for model in ["deepseek-v4-pro", "unknown-model"] {
         let store = test_store();
         let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-        store.set_model(&session.session_id, model.to_string())?;
+        store.set_model(&session.session_id.0, model.to_string())?;
         let client = FakeLlmClient::new(vec![
             Ok(StreamEvent::Usage(UsageData {
                 input_tokens: 3,
@@ -1925,7 +2110,7 @@ async fn prompt_rejects_invalid_usage_before_state_changes() -> Result<(), Adapt
                 .iter()
                 .any(|update| matches!(update, SessionUpdate::UsageUpdate(_)))
         );
-        store.with_session(&session.session_id, |record| {
+        store.with_session(&session.session_id.0, |record| {
             assert_eq!(record.history, vec![ChatMessage::user("hi")]);
             assert_eq!(record.cost_micros, 0);
             assert!(record.active_turn.is_none());
@@ -1939,7 +2124,7 @@ async fn prompt_rejects_invalid_usage_before_state_changes() -> Result<(), Adapt
 async fn prompt_cumulative_usage_overflow_precedes_updates_and_tools() -> Result<(), AdapterError> {
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
-    store.set_model(&session.session_id, "unknown-model".to_string())?;
+    store.set_model(&session.session_id.0, "unknown-model".to_string())?;
     let client = FakeLlmClient::with_streams(
         [u64::MAX, 1]
             .into_iter()
@@ -2002,7 +2187,7 @@ async fn prompt_cumulative_usage_overflow_precedes_updates_and_tools() -> Result
             .len(),
         1
     );
-    store.with_session(&session.session_id, |record| {
+    store.with_session(&session.session_id.0, |record| {
         assert_eq!(record.history.len(), 3);
         assert_eq!(record.cost_micros, 0);
         assert!(record.active_turn.is_none());
@@ -2060,7 +2245,7 @@ fn usage_totals_preserve_provider_total_and_sum_optional_fields() -> Result<(), 
         cached_write_tokens: Some(2),
     })?;
 
-    let usage = totals.into_acp_usage();
+    let usage = totals.into_usage();
     assert!(usage.is_some());
     let Some(usage) = usage else {
         return Ok(());
@@ -2180,7 +2365,9 @@ async fn stream_model_turn_skips_usage_update_for_unknown_model()
     .await?;
 
     assert_eq!(
-        usage_totals.into_acp_usage(),
+        usage_totals
+            .into_usage()
+            .map(crate::acp::turn_events::encode_usage),
         Some(agent_client_protocol::schema::v1::Usage::new(7, 3, 4))
     );
     assert!(
@@ -2351,7 +2538,7 @@ async fn prompt_tool_loop_stops_at_max_turn_requests() -> Result<(), agent_clien
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     let record = guard
         .sessions
-        .get(&session.session_id)
+        .get(session.session_id.0.as_ref())
         .ok_or_else(|| agent_client_protocol::Error::internal_error().data("missing session"))?;
     assert_eq!(record.history.len(), 1 + (limit * 2));
 
@@ -2391,7 +2578,7 @@ async fn cancellation_between_batched_tools_stops_execution_on_the_last_cycle()
         std::num::NonZeroUsize::MIN,
         |notification| {
             if matches!(notification.update, SessionUpdate::ToolCallUpdate(_)) {
-                store.cancel_active_turn(&session.session_id)?;
+                store.cancel_active_turn(&session.session_id.0)?;
             }
             Ok(())
         },
@@ -2412,7 +2599,7 @@ async fn cancellation_between_batched_tools_stops_execution_on_the_last_cycle()
         .map_err(|error| AdapterError::Internal(error.to_string()))?;
     let record = state
         .sessions
-        .get(&session.session_id)
+        .get(session.session_id.0.as_ref())
         .ok_or_else(|| AdapterError::Internal("missing session".into()))?;
     assert!(record.active_turn.is_none());
     assert_eq!(
@@ -2488,14 +2675,14 @@ async fn report_tool_call_generates_correct_notification()
         serde_json::json!({"path": "f"}).to_string(),
     );
     let mut notifications = Vec::new();
-    super::report_tool_call(
+    crate::acp::turn_events::report_tool_call(
         &session_id,
         &mut |n| {
             notifications.push(n);
             Ok(())
         },
         &call,
-        ToolKind::Edit,
+        ToolKind::Edit.into(),
     )?;
     assert_eq!(notifications.len(), 1);
     let SessionUpdate::ToolCall(ref tc) = notifications[0].update else {
@@ -2523,7 +2710,7 @@ async fn report_tool_result_with_edit_generates_diff_and_location()
         }),
     };
     let mut notifications = Vec::new();
-    super::report_tool_result(
+    crate::acp::turn_events::report_tool_result(
         &session_id,
         &mut |n| {
             notifications.push(n);
@@ -2559,7 +2746,6 @@ async fn report_tool_result_with_edit_generates_diff_and_location()
 #[test]
 fn helper_raw_input_and_finish_reason_cover_branches() {
     use acp_llm_adapter::llm::FinishReason;
-    use agent_client_protocol::schema::v1::StopReason;
 
     let valid_raw_input = ChatToolCall::new(
         "valid-raw-input",
@@ -2577,24 +2763,24 @@ fn helper_raw_input_and_finish_reason_cover_branches() {
     );
 
     assert_eq!(
-        crate::stop_reason_from_finish(&FinishReason::EndTurn),
-        StopReason::EndTurn
+        super::stop_reason_from_finish(&FinishReason::EndTurn),
+        DomainStop::EndTurn
     );
     assert_eq!(
-        crate::stop_reason_from_finish(&FinishReason::ToolCalls),
-        StopReason::EndTurn
+        super::stop_reason_from_finish(&FinishReason::ToolCalls),
+        DomainStop::EndTurn
     );
     assert_eq!(
-        crate::stop_reason_from_finish(&FinishReason::Other("rate_limit".to_string())),
-        StopReason::EndTurn
+        super::stop_reason_from_finish(&FinishReason::Other("rate_limit".to_string())),
+        DomainStop::EndTurn
     );
     assert_eq!(
-        crate::stop_reason_from_finish(&FinishReason::MaxTokens),
-        StopReason::MaxTokens
+        super::stop_reason_from_finish(&FinishReason::MaxTokens),
+        DomainStop::MaxTokens
     );
     assert_eq!(
-        crate::stop_reason_from_finish(&FinishReason::Refusal),
-        StopReason::Refusal
+        super::stop_reason_from_finish(&FinishReason::Refusal),
+        DomainStop::Refusal
     );
 }
 

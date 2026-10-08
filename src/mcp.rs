@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::schema::v1::{
-    HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio, ToolKind,
+    HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
@@ -21,6 +21,7 @@ use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 
 use crate::SessionStore;
+use crate::tools::ToolKind;
 use crate::tools::{ToolContext, ToolExecution, require_tool_permission};
 use acp_llm_adapter::error::AdapterError;
 

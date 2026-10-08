@@ -25,10 +25,9 @@ use agent_client_protocol::{Agent, ConnectTo, Lines};
 use tokio_util::sync::CancellationToken;
 
 use acp_llm_adapter::error::AdapterError;
-use acp_llm_adapter::llm::FinishReason;
 use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, ContentBlock, EmbeddedResourceResource,
-    SessionNotification, SessionUpdate, StopReason, UnstructuredCommandInput,
+    SessionNotification, SessionUpdate, UnstructuredCommandInput,
 };
 use clap::{Parser, Subcommand};
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -50,8 +49,10 @@ mod turn;
 
 pub(crate) use acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolCallRequester,
-    ToolProgressReporter, WriteTextFileRequester, serve_with_transport_and_state_dir_logging,
+    ToolProgressReporter, WriteTextFileRequester, request_tool_permission,
+    serve_with_transport_and_state_dir_logging,
 };
+pub(crate) use dev::initial_model;
 pub(crate) use dev::{
     Backend, build_dev_agent, exercise_permission_gate_smoke, llm_client_for_backend,
     print_dev_smoke_result, resolved_chat_config, run_smoke_flow,
@@ -59,17 +60,16 @@ pub(crate) use dev::{
 pub(crate) use mcp::{
     McpSession, connect_mcp_sessions, is_mcp_tool_name, mcp_tool_execution, mcp_tool_kind,
 };
-pub(crate) use session_store::FilesystemSessionStore;
+pub(crate) use session_store::{AdapterState, FilesystemSessionStore, SessionStore};
 use tools::AdapterToolRegistry;
 pub(crate) use turn::tool_raw_input;
 
 // Re-export session domain types so other modules can use `crate::*` imports.
 pub(crate) use session::{
-    AdapterState, DEFAULT_MAX_TURN_REQUESTS, PendingToolCalls, PermissionDecision, ReasoningEffort,
+    DEFAULT_MAX_TURN_REQUESTS, PendingToolCalls, PermissionDecision, ReasoningEffort,
     SESSION_CONFIG_MAX_TOKENS_ID, SESSION_CONFIG_MODE_ID, SESSION_CONFIG_MODEL_ID,
-    SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, SessionStore,
-    default_session_modes, derive_session_title, initial_model, iso_timestamp_now,
-    max_tokens_from_value_id, request_tool_permission, session_modes, validate_session_model,
+    SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord, derive_session_title,
+    iso_timestamp_now, max_tokens_from_value_id, validate_session_model,
 };
 
 const ADAPTER_NAME: &str = env!("CARGO_PKG_NAME");
@@ -626,16 +626,6 @@ fn session_notification(
     SessionNotification::new(session_id, update)
 }
 
-fn stop_reason_from_finish(reason: &FinishReason) -> StopReason {
-    match reason {
-        FinishReason::EndTurn | FinishReason::ToolCalls | FinishReason::Other(_) => {
-            StopReason::EndTurn
-        }
-        FinishReason::MaxTokens => StopReason::MaxTokens,
-        FinishReason::Refusal => StopReason::Refusal,
-    }
-}
-
 /// Create a `SessionStore` backed by a fresh default adapter state.
 ///
 /// This is a convenience for tests that previously created
@@ -663,7 +653,7 @@ mod tests {
     use crate::acp::validate_session_paths;
     use agent_client_protocol::schema::v1::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
-        ImageContent, NewSessionRequest, ResourceLink, StopReason, TextResourceContents,
+        ImageContent, NewSessionRequest, ResourceLink, TextResourceContents,
     };
     use clap::Parser;
     use futures_util::StreamExt;
@@ -1020,7 +1010,7 @@ mod tests {
 
     #[test]
     fn stop_reason_from_finish_all_branches() {
-        use super::stop_reason_from_finish;
+        use crate::turn::{StopReason, stop_reason_from_finish};
         use acp_llm_adapter::llm::FinishReason;
 
         assert_eq!(

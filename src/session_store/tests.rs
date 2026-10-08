@@ -2,7 +2,6 @@
 use super::{FilesystemSessionStore, PersistedSessionMeta};
 use crate::{ReasoningEffort, SessionBehavior};
 use acp_llm_adapter::llm::ChatMessage;
-use agent_client_protocol::schema::v1::SessionId;
 use uuid::Uuid;
 
 #[test_log::test]
@@ -36,7 +35,7 @@ fn round_trips_session_metadata_and_history()
 
     let listed = store.list_persisted(None)?;
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].session_id, SessionId::new("session-roundtrip"));
+    assert_eq!(listed[0].session_id, "session-roundtrip");
     assert_eq!(listed[0].cwd, cwd);
 
     Ok(())
@@ -86,7 +85,7 @@ fn persisted_session_meta_deserializes_existing_modes()
             "title": null,
             "updated_at": null,
         }))?;
-        assert_eq!(meta.mode.mode_id().0.as_ref(), mode_id);
+        assert_eq!(meta.mode.mode_id(), mode_id);
     }
 
     Ok(())
@@ -135,7 +134,7 @@ fn proxy_logs_never_surface_as_resumable_sessions()
         1,
         "a proxied agent's session is not an adapter session and must not be offered for resume"
     );
-    assert_eq!(listed[0].session_id, SessionId::new("session-mine"));
+    assert_eq!(listed[0].session_id, "session-mine");
 
     let _ = std::fs::remove_dir_all(&state_dir);
     Ok(())

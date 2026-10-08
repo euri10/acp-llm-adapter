@@ -270,15 +270,15 @@ The adapter bridges two independent channels:
 | Module                                     | Responsibility                                                                                       |
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
 | [`acp/`](src/acp/)                         | ACP transport registration, request handler dispatch, response builders, permission requesters       |
-| [`session.rs`](src/session.rs)             | Session state, permission model, in-memory session store, session lifecycle                          |
+| [`session.rs`](src/session.rs)             | Adapter-owned session data, mode/permission policy, tool-call accumulation                          |
 | [`turn.rs`](src/turn.rs)                   | Prompt-turn orchestration: LLM streaming, tool-call accumulation, loop control, cancellation         |
 | [`tools/`](src/tools/)                     | Built-in tool registration, execution and filesystem boundaries                                      |
-| [`registry.rs`](src/tools/registry.rs)     | `ToolRegistry` trait, `ToolContext`, `AdapterToolRegistry` impl, tool metadata                       |
+| [`registry.rs`](src/tools/registry.rs)     | Domain tool registry/executor interfaces, context, categories and results                           |
 | [`execution/`](src/tools/execution)        | Tool definitions, argument parsing, execution (read/write/edit/grep/glob/command), output truncation |
 | [`filesystem.rs`](src/tools/filesystem.rs) | Approved-root path resolution, directory-capability I/O, editor-path validation                     |
 | [`search.rs`](src/tools/search.rs)         | Confined cwd traversal, in-root ignore rules and cancellable file reads                              |
 | [`mcp.rs`](src/mcp.rs)                     | MCP server connection (stdio + HTTP streamable), tool-name mapping, invocation, result rendering     |
-| [`session_store.rs`](src/session_store.rs) | Filesystem-backed session metadata and JSONL chat-history persistence                                |
+| [`session_store.rs`](src/session_store.rs) | Shared session lifecycle, MCP resource ownership, metadata and JSONL history persistence              |
 | [`dev.rs`](src/dev.rs)                     | Development utilities, smoke tests, CLI testing backends                                             |
 | [`error.rs`](src/error.rs)                 | Unified domain error type (adapter crate root)                                                       |
 
@@ -307,10 +307,10 @@ Fragmented and interleaved calls within the limit remain supported.
 
 ### Design Principles
 
-- **Translation boundary**: ACP and HTTP types stay at their respective edges. Business logic in the adapter core (`turn`, `tools`, `session_store`) depends only on the adapter's own types — not on `agent-client-protocol` schema types or raw HTTP types.
+- **Translation boundary**: `session`, `turn` and the tool registry interface use adapter-owned inputs, events, capabilities, categories and results. ACP prompt validation, notification encoding, config selectors and permission dialogs live in `acp/`; concrete filesystem/terminal RPCs live at the tool execution edge. The session store owns persistence and MCP handles separately from domain session records.
 - **Error presentation**: ACP errors retain their JSON-RPC classification and return fixed provider, storage, or validation diagnostics. Private response values, credentials, URLs, paths, and raw internal causes are omitted; domain errors retain their diagnostic detail internally.
-- **Testable seams**: The `LlmClient` trait lets prompt-turn tests run against canned SSE fixtures without a network. The `ToolRegistry` trait lets tool-loop tests inject fake tools. ACP handler tests use in-memory fake client connections.
-- **Single async runtime**: Tokio multi-thread throughout. No lock is held across `.await`. No mixing of async runtimes.
+- **Testable seams**: `LlmClient` and `ToolRegistry` let a complete prompt/tool/history/cancellation test run with domain inputs and events, without constructing ACP values or an editor connection. Tool executors bind external services at the existing registry boundary. ACP handler tests separately verify wire shapes and editor behavior.
+- **Single async runtime**: Tokio multi-thread throughout. Local file access, search, and history persistence run on the blocking pool. No lock is held across `.await`. No mixing of async runtimes.
 - **No unsafe code**: `#![forbid(unsafe_code)]` at every crate root.
 
 ## Requirements
