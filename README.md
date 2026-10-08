@@ -166,6 +166,11 @@ The two binaries provide adapter-owned logging without a shell wrapper:
 - `acp-llm-adapter serve --backend <backend>` writes both ACP wire records and internal tracing events for the adapter. Set `ACP_LOG=1` to enable structured logging. Session records are written to `$XDG_STATE_HOME/acp-llm-adapter/sessions/<session-id>/log.jsonl` (or `~/.local/state/acp-llm-adapter/sessions/<session-id>/log.jsonl` when `XDG_STATE_HOME` is unset); records before a session exists use `connections/<connection-id>.jsonl`.
 - `acp-proxy -- <agent> [args...]` records both directions of a foreign ACP agent's traffic and its stderr. Proxy logs use the separate `.../acp-llm-adapter/proxy/` root, with the same `connections/` and `sessions/` layout. This keeps foreign sessions out of the adapter's session store.
 
+Both binaries route session-scoped wire frames to their actual session and
+correlate replies with requests independently in each direction. Interleaved
+sessions do not inherit the most recently created session's log destination.
+Unscoped wire records remain in the connection log after sessions are created.
+
 On Linux, the proxy watches its parent's death and adopts orphaned Agent
 descendants. Client exit, proxy SIGTERM/SIGINT, or Agent exit terminates and reaps
 the remaining tree, including descendants that create their own Unix sessions.
@@ -309,6 +314,8 @@ An oversized SSE event or a malformed stream fails the completion, including
 errors after its finish reason. Lost deltas never become executable tool calls
 or completed assistant/tool history. Clean EOF after a valid finish remains
 supported, as does valid trailing usage accounting.
+Text, thought, or tool deltas and repeated finish reasons after the terminal
+finish are rejected. Output in the same chunk as its finish remains valid.
 
 Each completion accepts at most 128 tool calls, with indices from 0 through 127.
 This is a local defensive limit that bounds allocation and work driven by provider
@@ -375,9 +382,20 @@ truncated. A subsequent smaller prompt can proceed normally.
 
 - `ask`
 - `accept-edits`
+- `plan`
 - `yolo`
 
 `session/set_mode` switches posture live during a session. In `accept-edits`, edit actions auto-approve while shell actions still prompt. In `yolo`, mutating tools auto-approve.
+
+The current mode governs each subsequent provider request and tool dispatch.
+Switching to Plan also prevents pending approvals and file preflight reads from
+authorizing a later mutation; an operation already started is not undone.
+
+Ordinary session mode, model, reasoning effort and output-token settings are
+persisted before an update succeeds, including changes made between prompts.
+Load and resume retain those settings without requiring another prompt first.
+A failed save reports a storage error and leaves the previous settings intact.
+Selected-content helpers remain ephemeral and retain their immutable limits.
 
 MCP tools are external executors and use the same Execute permission policy as shell commands: `ask` and `accept-edits` request editor approval, while `yolo` auto-approves. Explicit “allow always” and “reject always” decisions apply to that tool name for the current session; a remembered rejection takes precedence over `yolo`. Restoring a session starts with fresh permission decisions. Plan mode and selected-content sessions prohibit MCP execution even with a remembered approval.
 
@@ -419,6 +437,11 @@ replies cannot execute the cancelled call or change remembered permissions.
 Cancellation also skips remaining calls in the same batch and prevents a file
 write after a cancelled preflight read. It cannot undo an operation already sent
 to an editor or a write that has already started.
+
+Cancellation during a fragmented provider tool call discards the incomplete
+call and returns `cancelled`. A pending editor-backed file read does not keep the
+turn active after cancellation: its late reply is ignored and the session can
+accept another prompt.
 
 Editor-backed terminal creation, exit waits, and output waits are cancellable.
 Kill and release each have a one-second response deadline; release is attempted

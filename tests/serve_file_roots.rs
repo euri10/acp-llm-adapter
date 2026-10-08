@@ -172,6 +172,154 @@ async fn serve_file_roots_reject_outside_paths_before_editor_io_and_recover()
 }
 
 #[test_log::test(tokio::test)]
+async fn cancelling_editor_read_releases_turn_and_ignores_late_replies()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new().await?;
+    for late_error in [false, true] {
+        let mut serve = fixture.start(true).await?;
+        let id = serve
+            .start_prompt(
+                &json!({"name":"read_file", "arguments":{"path":"inside.txt"}}).to_string(),
+            )
+            .await?;
+        let pending = serve
+            .pump(Duration::from_secs(5), Some(id), || false)
+            .await?;
+        let Stopped::ClientRequest(request) = pending else {
+            return Err(format!("expected delegated read, got {pending:?}").into());
+        };
+        assert_eq!(request.get("method"), Some(&json!("fs/read_text_file")));
+        serve
+            .notify("session/cancel", &json!({"sessionId":serve.session_id()}))
+            .await?;
+        let cancelled = serve
+            .pump(Duration::from_secs(2), Some(id), || false)
+            .await?;
+        assert!(
+            matches!(&cancelled, Stopped::Response(response)
+            if response.pointer("/result/stopReason") == Some(&json!("cancelled"))),
+            "cancellation must finish without the read response: {cancelled:?}"
+        );
+        assert!(serve.position_of_status("completed").is_none());
+        assert!(serve.position_of_status("failed").is_some());
+        // Reuse the session before replying to the abandoned read.
+        let recovered = serve
+            .request(
+                "session/prompt",
+                &json!({"sessionId":serve.session_id(),
+            "prompt":[{"type":"text","text":"recover without editor read"}]}),
+            )
+            .await?;
+        assert_eq!(
+            recovered.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        if late_error {
+            serve
+                .respond_error(
+                    &request,
+                    json!({"code":-32603,"message":"late read failure"}),
+                )
+                .await?;
+        } else {
+            serve
+                .respond(&request, json!({"content":"late read content"}))
+                .await?;
+        }
+        let response = serve
+            .request(
+                "session/prompt",
+                &json!({"sessionId":serve.session_id(),
+            "prompt":[{"type":"text","text":"still usable after late reply"}]}),
+            )
+            .await?;
+        assert_eq!(
+            response.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        assert!(serve.position_of_status("completed").is_none());
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn plan_mode_during_editor_preflight_prevents_file_mutation() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new().await?;
+    for (name, arguments) in [
+        (
+            "write_file",
+            json!({"path":"inside.txt", "content":"changed"}),
+        ),
+        (
+            "edit_file",
+            json!({"path":"inside.txt", "old_text":"allowed", "new_text":"changed"}),
+        ),
+    ] {
+        let mut serve = fixture.start(true).await?;
+        let id = serve
+            .start_prompt(&json!({"name":name,"arguments":arguments}).to_string())
+            .await?;
+        let mut approved = false;
+        let mut switched = false;
+        loop {
+            match serve
+                .pump_with_permission(Duration::from_secs(5), Some(id), || false, None)
+                .await?
+            {
+                Stopped::Permission(permission) => {
+                    approved = true;
+                    serve
+                        .select_permission(
+                            permission.get("id").ok_or("missing permission id")?,
+                            "allow_once",
+                        )
+                        .await?;
+                }
+                Stopped::ClientRequest(request) => {
+                    assert_eq!(
+                        request.get("method"),
+                        Some(&json!("fs/read_text_file")),
+                        "Plan must prevent the write: {request}"
+                    );
+                    if approved {
+                        let changed = serve
+                            .request(
+                                "session/set_mode",
+                                &json!({"sessionId":serve.session_id(),"modeId":"plan"}),
+                            )
+                            .await?;
+                        assert!(changed.get("error").is_none(), "{changed}");
+                        switched = true;
+                    }
+                    serve
+                        .respond(&request, json!({"content":"allowed text"}))
+                        .await?;
+                }
+                Stopped::Response(response) => {
+                    assert_eq!(
+                        response.pointer("/result/stopReason"),
+                        Some(&json!("end_turn"))
+                    );
+                    break;
+                }
+                other => return Err(format!("file turn did not finish: {other:?}").into()),
+            }
+        }
+        assert!(switched, "never exercised the post-approval read");
+        assert!(serve.position_of_status("failed").is_some());
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("project/inside.txt"))?,
+            "allowed text"
+        );
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn serve_file_edits_reject_approval_time_changes() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new().await?;
     let path = fixture.root.join("project/inside.txt");

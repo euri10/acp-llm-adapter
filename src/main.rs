@@ -384,7 +384,6 @@ fn stdio_transport_with_eof(
         let log = outgoing_log.clone();
         async move {
             if let Some(log) = log {
-                bind_session_from_frame(&log, &line);
                 log.log(LogRecord::frame(Direction::AgentToClient, &line));
             }
             let mut bytes = line.into_bytes();
@@ -395,22 +394,6 @@ fn stdio_transport_with_eof(
     });
 
     Lines::new(outgoing, incoming)
-}
-
-fn bind_session_from_frame(connection: &ConnectionLog, line: &str) {
-    let Ok(frame) = serde_json::from_str::<serde_json::Value>(line) else {
-        return;
-    };
-    let Some(session_id) = frame
-        .get("result")
-        .and_then(|result| result.get("sessionId"))
-        .and_then(serde_json::Value::as_str)
-    else {
-        return;
-    };
-    if let Err(error) = connection.bind_session(session_id) {
-        tracing::warn!(%error, "failed to bind serve log to ACP session");
-    }
 }
 
 fn serve_log() -> Result<Option<Arc<LogSink>>, agent_client_protocol::Error> {
@@ -655,9 +638,10 @@ pub(crate) fn test_store() -> SessionStore {
 mod tests {
     use super::{
         Backend, Cli, Command, EofGuard, LogSink, SessionLogLayer, Uuid, attach_eof_guard,
-        bind_session_from_frame, text_from_prompt,
+        text_from_prompt,
     };
     use crate::acp::validate_session_paths;
+    use acp_llm_adapter::logsink::{Direction, LogRecord};
     use agent_client_protocol::schema::v1::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
         ImageContent, NewSessionRequest, ResourceLink, TextResourceContents,
@@ -1145,10 +1129,14 @@ mod tests {
             return;
         };
 
-        bind_session_from_frame(
-            &connection,
+        connection.log(LogRecord::frame(
+            Direction::ClientToAgent,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#,
+        ));
+        connection.log(LogRecord::frame(
+            Direction::AgentToClient,
             r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session-test"}}"#,
-        );
+        ));
 
         assert_eq!(connection.session_id().as_deref(), Some("session-test"));
         drop(connection);

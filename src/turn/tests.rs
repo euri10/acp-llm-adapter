@@ -1080,6 +1080,75 @@ async fn prompt_omits_max_tokens_by_default() -> Result<(), agent_client_protoco
 }
 
 #[test_log::test(tokio::test)]
+async fn live_mode_changes_control_dispatch_and_next_request() -> Result<(), AdapterError> {
+    for (before, after) in [
+        (SessionBehavior::Ask, SessionBehavior::Plan),
+        (SessionBehavior::Plan, SessionBehavior::Ask),
+    ] {
+        let store = domain_store()?;
+        store.set_mode("domain", before)?;
+        let client = FakeLlmClient::with_streams(vec![
+            vec![
+                FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                    0,
+                    Some("call".into()),
+                    Some("run_command".into()),
+                    Some("{}".into()),
+                )))),
+                FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::ToolCalls))),
+            ],
+            vec![FakeStreamStep::Event(Ok(StreamEvent::Finished(
+                FinishReason::EndTurn,
+            )))],
+        ]);
+        let registry = PlanModeToolRegistry::new();
+        super::handle_prompt_request(
+            &store,
+            &client,
+            &registry,
+            None,
+            PromptInput {
+                session_id: "domain".into(),
+                text: "work".into(),
+                title: None,
+            },
+            DEFAULT_MAX_TURN_REQUESTS,
+            |event| {
+                if matches!(event, TurnEvent::ToolCall { .. }) {
+                    store.set_mode("domain", after)?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        let calls = registry
+            .calls
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?;
+        assert_eq!(calls.is_empty(), after == SessionBehavior::Plan);
+        let requests = client
+            .requests
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?;
+        assert_eq!(requests.len(), 2);
+        for (request, behavior) in requests.iter().zip([before, after]) {
+            assert_eq!(
+                request.messages()[0].content().contains("Plan mode"),
+                behavior == SessionBehavior::Plan
+            );
+            assert_eq!(
+                request
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.name() == "run_command"),
+                behavior != SessionBehavior::Plan
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn plan_mode_injects_instructions_and_filters_mutating_tools()
 -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
@@ -1920,6 +1989,116 @@ async fn delete_session_cancels_prompt_without_failing_cleanup()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
     assert!(!guard.sessions.contains_key(session_id.0.as_ref()));
 
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn cancelled_stream_discards_pending_tools_and_retains_usage() -> Result<(), AdapterError> {
+    let fragments = [
+        ToolCallDelta::new(0, Some("partial".into()), None, None),
+        ToolCallDelta::new(0, None, Some("echo".into()), None),
+        ToolCallDelta::new(
+            0,
+            Some("partial".into()),
+            Some("echo".into()),
+            Some("{".into()),
+        ),
+    ];
+    for fragment in fragments {
+        for terminal in [
+            None,
+            Some(FakeStreamStep::WaitForCancel),
+            Some(FakeStreamStep::Event(Err(ChatError::InvalidResponse(
+                "provider error ready alongside cancellation".into(),
+            )))),
+        ] {
+            let token = CancellationToken::new();
+            let mut steps = vec![
+                FakeStreamStep::Event(Ok(StreamEvent::ToolCallDelta(fragment.clone()))),
+                FakeStreamStep::Event(Ok(StreamEvent::Usage(UsageData {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    context_length: 100,
+                    total_tokens: None,
+                    thought_tokens: None,
+                    cached_read_tokens: None,
+                    cached_write_tokens: None,
+                }))),
+                FakeStreamStep::Event(Ok(StreamEvent::Message("partial".into()))),
+            ];
+            if let Some(terminal) = terminal {
+                steps.push(terminal);
+            }
+            let client = FakeLlmClient::with_steps(steps);
+            let mut totals = super::UsageTotals::default();
+            let mut events = Vec::new();
+            let turn = super::stream_model_turn(
+                StreamContext {
+                    llm_client: &client,
+                    store: None,
+                    messages: &[],
+                    tool_definitions: &[],
+                    usage_totals: &mut totals,
+                },
+                ModelRequestSettings {
+                    model: "mock",
+                    reasoning_effort: None,
+                    max_tokens: None,
+                },
+                token.clone(),
+                "cancel-fragment",
+                &mut |event| {
+                    if matches!(event, TurnEvent::Message { .. }) {
+                        token.cancel();
+                    }
+                    events.push(event);
+                    Ok(())
+                },
+            )
+            .await?;
+            assert_eq!(turn.stop_reason, DomainStop::Cancelled);
+            assert!(turn.tool_calls.is_empty());
+            assert_eq!(turn.assistant_text, "partial");
+            assert_eq!(totals.total_tokens, 3);
+            assert!(matches!(
+                events.as_slice(),
+                [TurnEvent::Message { .. }, TurnEvent::Usage { used: 3, .. }]
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn incomplete_uncancelled_tool_metadata_still_fails() -> Result<(), AdapterError> {
+    for fragment in [
+        ToolCallDelta::new(0, Some("partial".into()), None, None),
+        ToolCallDelta::new(0, None, Some("echo".into()), None),
+    ] {
+        let client = FakeLlmClient::new(vec![
+            Ok(StreamEvent::ToolCallDelta(fragment)),
+            Ok(StreamEvent::Finished(FinishReason::ToolCalls)),
+        ]);
+        let result = super::stream_model_turn(
+            StreamContext {
+                llm_client: &client,
+                store: None,
+                messages: &[],
+                tool_definitions: &[],
+                usage_totals: &mut super::UsageTotals::default(),
+            },
+            ModelRequestSettings {
+                model: "mock",
+                reasoning_effort: None,
+                max_tokens: None,
+            },
+            CancellationToken::new(),
+            "invalid-fragment",
+            &mut |_| Ok(()),
+        )
+        .await;
+        assert!(matches!(result, Err(AdapterError::InvalidParams(_))));
+    }
     Ok(())
 }
 

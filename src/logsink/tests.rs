@@ -169,25 +169,26 @@ fn acp_payloads_and_trace_fields_redact_content_before_persistence()
             payload.clone(),
             true,
         ));
-        connection.log(LogRecord::new_with_redaction(
+        connection.log(
+            LogRecord::new_with_redaction(Direction::Internal, "trace-event", payload, true)
+                .with_session("session-safe"),
+        );
+    }
+    connection.log(
+        LogRecord::new_with_redaction(
             Direction::Internal,
             "trace-event",
-            payload,
+            json!({"level": "WARN", "target": "adapter", "fields": {
+                "raw_input": secret, "raw_output": secret, "old_text": secret, "new_text": secret,
+                "message": secret, "error": secret, "api_key": secret, "accessToken": secret,
+                "stdout": secret, "stderr": secret,
+                "elapsed_ms": 12, "status": "completed"
+            }}),
             true,
-        ));
-    }
-    connection.log(LogRecord::new_with_redaction(
-        Direction::Internal,
-        "trace-event",
-        json!({"level": "WARN", "target": "adapter", "fields": {
-            "raw_input": secret, "raw_output": secret, "old_text": secret, "new_text": secret,
-            "message": secret, "error": secret, "api_key": secret, "accessToken": secret,
-            "stdout": secret, "stderr": secret,
-            "elapsed_ms": 12, "status": "completed"
-        }}),
-        true,
-    ));
-    let path = sink.connection_log_path("redacted")?;
+        )
+        .with_session("session-safe"),
+    );
+    let path = sink.session_log_path("session-safe")?;
     drain(sink, connection, writer);
     let contents = fs::read_to_string(&path)?;
     assert!(
@@ -367,10 +368,7 @@ fn binding_a_session_reroutes_subsequent_records() {
         connection.bind_session("session-xyz").is_ok(),
         "binding a valid session id must succeed"
     );
-    connection.log(LogRecord::frame(
-        Direction::ClientToAgent,
-        r#"{"method":"session/prompt"}"#,
-    ));
+    connection.log(LogRecord::text(Direction::Internal, "stderr", "diagnostic"));
 
     let connection_path = sink.connection_log_path("conn-2").unwrap_or_default();
     let session_path = sink.session_log_path("session-xyz").unwrap_or_default();
@@ -380,7 +378,7 @@ fn binding_a_session_reroutes_subsequent_records() {
     assert_eq!(
         session_records.len(),
         1,
-        "only the post-bind record belongs to the session"
+        "the non-frame record inherits the session binding"
     );
     assert_eq!(
         session_records.first().map(|r| r.session_id.clone()),
@@ -404,6 +402,42 @@ fn binding_a_session_reroutes_subsequent_records() {
         connection_records.get(1).map(|r| r.kind.clone()),
         Some(KIND_SESSION_BOUND.to_string()),
         "the mapping from connection to session is recorded"
+    );
+}
+
+#[test]
+fn unscoped_frames_never_inherit_a_previous_session_binding() {
+    let root = TempRoot::new("unscoped-frames");
+    let (sink, writer) = LogSink::channel(root.path(), 16);
+    let connection = open(&sink, "connection");
+    assert!(connection.bind_session("previous-session").is_ok());
+    for frame in [
+        r#"{"id":1,"method":"initialize"}"#,
+        r#"{"id":1,"result":{"sessionId":"not-a-created-session"}}"#,
+        r#"{"id":2,"method":"session/list"}"#,
+        r#"{"id":2,"result":{}}"#,
+        r#"{"id":99,"result":{}}"#,
+        "malformed frame",
+        r#"{"method":"session/update","params":{"sessionId":"../escape"}}"#,
+    ] {
+        connection.log(LogRecord::frame(Direction::AgentToClient, frame));
+    }
+    let path = sink.connection_log_path("connection").unwrap_or_default();
+    let previous = sink
+        .session_log_path("previous-session")
+        .unwrap_or_default();
+    drain(sink, connection, writer);
+    let records = read_records(&path);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.kind == KIND_FRAME)
+            .count(),
+        7
+    );
+    assert!(
+        !previous.exists(),
+        "unscoped wire frames created a session log"
     );
 }
 
