@@ -28,9 +28,16 @@ use rmcp::{ServerHandler, ServiceExt};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const RUN_STDIO_FIXTURE_ENV: &str = "ACP_LLM_ADAPTER_RUN_MCP_FIXTURE";
+
+#[path = "../../tests/mcp_sse_fixture/mod.rs"]
+mod mcp_sse_fixture;
+
+use mcp_sse_fixture::{Behavior, LegacyServer, TOKEN};
 
 #[derive(Debug, Clone)]
 struct EchoMcpServer;
@@ -401,11 +408,16 @@ fn mcp_tool_result_text_returns_empty_for_no_content() {
 }
 
 #[test_log::test(tokio::test)]
-async fn connect_mcp_sessions_connects_sse_fake_server() -> Result<(), agent_client_protocol::Error>
+async fn connect_mcp_sessions_connects_legacy_sse_server() -> Result<(), Box<dyn std::error::Error>>
 {
-    let (url, cancellation) = spawn_http_echo_mcp_server().await?;
-    let sessions =
-        connect_mcp_sessions(&[McpServer::Sse(McpServerSse::new("Remote SSE Echo", url))]).await?;
+    let server = mcp_sse_fixture::LegacyServer::start(None).await?;
+    let sessions = connect_mcp_sessions(&[McpServer::Sse(
+        McpServerSse::new("Remote SSE Echo", &server.url).headers(vec![HttpHeader::new(
+            "Authorization",
+            mcp_sse_fixture::TOKEN,
+        )]),
+    )])
+    .await?;
 
     assert_eq!(sessions.len(), 1);
     assert_eq!(
@@ -418,7 +430,7 @@ async fn connect_mcp_sessions_connects_sse_fake_server() -> Result<(), agent_cli
             .iter()
             .any(|mapping| mapping.exposed_name == "mcp__remote_sse_echo__echo")
     }));
-    cancellation.cancel();
+    drop(sessions);
     Ok(())
 }
 
@@ -697,12 +709,18 @@ async fn mcp_sse_session_reports_initialization_failure() {
 }
 
 #[test_log::test(tokio::test)]
-async fn mcp_sse_session_discovers_and_executes_fake_server()
--> Result<(), agent_client_protocol::Error> {
-    let (url, cancellation) = spawn_http_echo_mcp_server().await?;
-    let sse = McpServerSse::new("Remote SSE Echo", url)
-        .headers(vec![HttpHeader::new("X-Test-Trace", "trace")]);
-    let session = connect_mcp_sse_session(&sse).await?;
+async fn mcp_sse_session_discovers_and_executes_legacy_server()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = mcp_sse_fixture::LegacyServer::start(None).await?;
+    let sse = McpServerSse::new("Remote SSE Echo", &server.url).headers(vec![HttpHeader::new(
+        "Authorization",
+        mcp_sse_fixture::TOKEN,
+    )]);
+    let session = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        connect_mcp_sse_session(&sse),
+    )
+    .await??;
 
     assert_eq!(session.name, "Remote SSE Echo");
     assert!(
@@ -728,7 +746,64 @@ async fn mcp_sse_session_discovers_and_executes_fake_server()
         mcp_tool_result_text(&result.content),
         "echo: hello over sse"
     );
-    cancellation.cancel();
+    assert_eq!(
+        server
+            .observed
+            .gets
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        server
+            .observed
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    drop(session);
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn legacy_sse_setup_failures_release_the_event_stream()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (endpoint, behavior) in [
+        (Some("http://other.invalid/messages"), Behavior::Normal),
+        (Some(""), Behavior::Normal),
+        (None, Behavior::MalformedMessage),
+        (None, Behavior::RedirectPost),
+        (None, Behavior::RedirectGet),
+        (None, Behavior::MissingEndpoint),
+        (None, Behavior::SilentInitialize),
+        (None, Behavior::SilentToolsList),
+    ] {
+        let server = LegacyServer::with_behavior(endpoint, behavior).await?;
+        let sse = McpServerSse::new("legacy", &server.url)
+            .headers(vec![HttpHeader::new("Authorization", TOKEN)]);
+        let result =
+            tokio::time::timeout(Duration::from_secs(7), connect_mcp_sse_session(&sse)).await?;
+        assert!(result.is_err(), "unsafe or failed setup was accepted");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while server.observed.active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            server.observed.gets.load(Ordering::SeqCst),
+            1,
+            "unexpected SSE replay"
+        );
+        assert_eq!(server.observed.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            server.observed.redirects.load(Ordering::SeqCst),
+            0,
+            "credentials followed a redirect"
+        );
+        if endpoint.is_some() {
+            assert_eq!(server.observed.posts.load(Ordering::SeqCst), 0);
+        }
+    }
     Ok(())
 }
 

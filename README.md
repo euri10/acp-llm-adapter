@@ -365,6 +365,18 @@ MCP tools are external executors and use the same Execute permission policy as s
 
 Cancelling a turn during MCP approval prevents invocation. Cancelling an in-flight MCP call stops the local wait and sends an MCP cancellation notification, with delivery bounded to one second. A remote server may ignore cancellation, and cancellation cannot undo a side effect that already occurred.
 
+MCP supports stdio, Streamable HTTP, and legacy HTTP+SSE. An SSE server entry
+opens its URL with GET, receives the `endpoint` event, posts JSON-RPC to that
+message endpoint, and receives responses on the original event stream. Custom
+headers apply to both channels. URLs must be HTTP(S) without userinfo or
+fragments; the message endpoint must stay on the configured origin, and
+redirects are rejected so credentials cannot be forwarded elsewhere. SSE
+connection setup, initialization, and tool discovery share a five-second
+deadline; each POST acknowledgement has the same bound. Tool execution may
+continue until its response or cancellation. The SDK session owns and closes
+the event stream. A dropped stream fails instead of reconnecting into a new
+legacy session or replaying a potentially mutating tool call.
+
 ## Supported Tools
 
 In ordinary sessions, sending `/clear` as the only text block clears both the
@@ -464,7 +476,7 @@ from an editor session as much as from the test suite.
 | `terminal/*`                                                                                | ✅ Used for `run_command` when the client advertises terminal support |
 | MCP tools (stdio)                                                                           | ✅ Full                                                               |
 | MCP tools (streamable HTTP)                                                                 | ✅ Full                                                               |
-| MCP tools (SSE)                                                                             | ✅ Full                                                               |
+| MCP tools (SSE)                                                                             | ✅ Legacy HTTP+SSE: GET events and separate POST messages             |
 
 ## Current Limitations
 
