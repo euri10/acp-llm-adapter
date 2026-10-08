@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/euri10/acp-llm-adapter/compare/v0.9.0...v0.9.1) - 2026-10-08
+
+### Changed
+
+- **Breaking for Rust library integrations:** upgrade the ACP SDK to 3.1.0. Public `AdapterError` conversions use the updated ACP error type; integrations that depend directly on an older ACP SDK must align that dependency. The adapter continues to speak stable ACP v1 ([#66](https://github.com/euri10/acp-llm-adapter/pull/66)).
+- Upgrade rmcp to 3.5.1 and retain the existing MCP transport, permission, and cancellation behavior ([#51](https://github.com/euri10/acp-llm-adapter/pull/51)).
+- Use Rust 1.99 for release automation; development, CI, and the tested MSRV remain on Rust 1.95 ([#63](https://github.com/euri10/acp-llm-adapter/pull/63)).
+
+### Fixed
+
+- Preserve the dev harness's child-agent launch with the ACP SDK's explicit process feature.
+- *(ci)* reject lockfile rewrites
+- close reality-check execution gaps
+- *(deps)* update Tokio and repair Dependabot ([#65](https://github.com/euri10/acp-llm-adapter/pull/65))
+- *(deps)* update rust crate uuid to ^1.27.0 ([#64](https://github.com/euri10/acp-llm-adapter/pull/64))
+- *(deps)* update rust crate thiserror to ^2.0.21 ([#62](https://github.com/euri10/acp-llm-adapter/pull/62))
+- register shutdown signals before discovery ([#68](https://github.com/euri10/acp-llm-adapter/pull/68))
+- close agent execution and lifecycle gaps
+
 ## [0.9.0](https://github.com/euri10/acp-llm-adapter/compare/v0.8.0...v0.9.0) - 2026-10-08
 
 ### Added
