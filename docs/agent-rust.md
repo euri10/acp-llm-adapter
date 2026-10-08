@@ -11,7 +11,9 @@ together with [testing](agent-testing.md).
   explicit in the manifest.
 - Declare an MSRV only when it is actually tested. Do not claim compatibility
   from an untested `rust-version` field.
-- Dependencies are pinned deliberately and updated by Renovate. A major bump on
+- Dependencies are pinned deliberately and updated by Dependabot, with daily
+  Cargo and GitHub Actions checks in `.github/dependabot.yml`. `renovate.json`
+  disables the previous updater. A major bump on
   a protocol crate (`agent-client-protocol`, `rmcp`) is a deliberate change with
   a full regression pass, not a routine update.
 
