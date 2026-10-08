@@ -3064,6 +3064,41 @@ fn persistence_without_logging_omits_log_path() -> Result<(), agent_client_proto
     Ok(())
 }
 
+#[test_log::test]
+fn selected_content_metadata_keeps_log_path_and_omits_history()
+-> Result<(), agent_client_protocol::Error> {
+    for logging in [false, true] {
+        let state_dir = std::env::temp_dir().join(format!("acp-helper-meta-{}", Uuid::new_v4()));
+        let store = test_store()
+            .with_persistence(FilesystemSessionStore::new(&state_dir))
+            .with_logging_enabled(logging);
+        let limits = serde_json::json!({"version":1,"input_bytes":1024,
+            "output_bytes":1024,"max_tokens":64,"timeout_ms":1000});
+        let response = handle_new_session_request(
+            &store,
+            &NewSessionRequest::new("/tmp").meta(serde_json::Map::from_iter([(
+                crate::selected_content::META_KEY.to_string(),
+                limits.clone(),
+            )])),
+        )?;
+        let meta = response.meta.ok_or_else(|| {
+            agent_client_protocol::Error::internal_error().data("missing helper metadata")
+        })?;
+        assert_eq!(meta.get(crate::selected_content::META_KEY), Some(&limits));
+        assert!(!meta.contains_key("historyJsonlPath"));
+        if logging {
+            assert_log_meta(&meta, response.session_id.0.as_ref())?;
+        } else {
+            assert!(!meta.contains_key("logJsonlPath"));
+        }
+        assert!(
+            !state_dir.exists(),
+            "creation must not persist helper history"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn new_session_with_persistence_includes_history_jsonl_path_in_meta()
 -> Result<(), agent_client_protocol::Error> {

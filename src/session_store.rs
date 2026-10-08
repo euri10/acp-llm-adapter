@@ -341,13 +341,14 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Set the session behavior (mode) for a session.
+    /// Persist the session behavior before publishing the change.
+    /// Production callers run settings updates on the blocking pool.
     pub(crate) fn set_mode(
         &self,
         session_id: &str,
         mode: SessionBehavior,
     ) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
+        self.update_settings(session_id, |session| {
             session.mode = mode;
             Ok(())
         })
@@ -355,7 +356,7 @@ impl SessionStore {
 
     /// Set the model for a session.
     pub(crate) fn set_model(&self, session_id: &str, model: String) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
+        self.update_settings(session_id, |session| {
             session.reasoning_effort = session.reasoning_effort.for_model(&model);
             session.model = model;
             Ok(())
@@ -368,7 +369,7 @@ impl SessionStore {
         session_id: &str,
         effort: ReasoningEffort,
     ) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
+        self.update_settings(session_id, |session| {
             if !ReasoningEffort::supported_for_model(&session.model).contains(&effort) {
                 return Err(AdapterError::InvalidParams(
                     "unsupported reasoning effort for selected model".into(),
@@ -385,10 +386,46 @@ impl SessionStore {
         session_id: &str,
         max_tokens: Option<u32>,
     ) -> Result<(), AdapterError> {
-        self.with_session_mut(session_id, |session| {
+        self.update_settings(session_id, |session| {
             session.max_tokens = max_tokens;
             Ok(())
         })
+    }
+
+    /// Serialize settings with history saves and removal, publishing only after
+    /// the atomic metadata write succeeds. The synchronous transaction runs on
+    /// the blocking pool in production, like `save_history`.
+    fn update_settings(
+        &self,
+        session_id: &str,
+        update: impl FnOnce(&mut PersistedSessionMeta) -> Result<(), AdapterError>,
+    ) -> Result<(), AdapterError> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?;
+        let state = &mut *guard;
+        let session = state.sessions.get_mut(session_id).ok_or_else(|| {
+            AdapterError::InvalidParams(format!("unknown session id: {session_id}"))
+        })?;
+        let mut meta = session.persisted_meta(
+            session_id,
+            state
+                .resources
+                .get(session_id)
+                .map_or(&[], |resources| resources.servers.as_slice()),
+        );
+        update(&mut meta)?;
+        if session.selected_content.is_none()
+            && let Some(persistence) = &self.persistence
+        {
+            persistence.persist_turn(&meta, &[])?;
+        }
+        session.mode = meta.mode;
+        session.model = meta.model;
+        session.reasoning_effort = meta.reasoning_effort;
+        session.max_tokens = meta.max_tokens;
+        Ok(())
     }
 
     /// Prepare a session for a new prompt turn.
@@ -460,7 +497,6 @@ impl SessionStore {
                 additional_directories: session.additional_directories.clone(),
                 client_capabilities,
             },
-            behavior: session.mode,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort,
             max_tokens: session.max_tokens,
@@ -804,18 +840,39 @@ impl SessionStore {
             .and_then(|p| p.history_jsonl_path(session_id).ok())
     }
 
-    /// Build a `serde_json::Map` for the `_meta` field containing the history
-    /// JSONL path, if persistence is available.
+    /// Build available history/log metadata, omitting history for ephemeral helpers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session-state lock is poisoned.
     pub(crate) fn session_meta(
         &self,
         session_id: &str,
+    ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, AdapterError> {
+        let selected_content = self
+            .state
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.selected_content.is_some());
+        Ok(self.session_meta_for(session_id, selected_content))
+    }
+
+    /// Build paths from a session snapshot without reentering the state lock.
+    fn session_meta_for(
+        &self,
+        session_id: &str,
+        selected_content: bool,
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
         let path = self.history_jsonl_path(session_id)?;
         let mut meta = serde_json::Map::new();
-        meta.insert(
-            "historyJsonlPath".to_string(),
-            serde_json::Value::String(path.to_string_lossy().to_string()),
-        );
+        if !selected_content {
+            meta.insert(
+                "historyJsonlPath".to_string(),
+                serde_json::Value::String(path.to_string_lossy().to_string()),
+            );
+        }
         if self.logging_enabled
             && let Some(log_path) = self
                 .persistence
@@ -827,7 +884,7 @@ impl SessionStore {
                 serde_json::Value::String(log_path.to_string_lossy().to_string()),
             );
         }
-        Some(meta)
+        (!meta.is_empty()).then_some(meta)
     }
 
     /// Return a snapshot of matching sessions for the `session/list` handler.
@@ -852,6 +909,8 @@ impl SessionStore {
                             info = info.title(record.title.clone());
                         }
                         info = info.updated_at(record.updated_at.clone());
+                        info.meta =
+                            self.session_meta_for(session_id, record.selected_content.is_some());
                         info
                     })
                     .collect::<Vec<_>>(),
@@ -863,25 +922,13 @@ impl SessionStore {
             let persisted_list = persistence
                 .list_persisted(cwd_filter)
                 .map_err(|e| AdapterError::Internal(e.to_string()))?;
-            for persisted in persisted_list {
+            for mut persisted in persisted_list {
                 if !sessions
                     .iter()
                     .any(|session| session.session_id == persisted.session_id)
                 {
+                    persisted.meta = self.session_meta_for(&persisted.session_id, false);
                     sessions.push(persisted);
-                }
-            }
-        }
-
-        // Attach _meta with the history JSONL path for every session that has
-        // a filesystem persistence store configured.
-        if self.persistence.is_some() {
-            for session in &mut sessions {
-                if let Some(meta) = self.session_meta(&session.session_id) {
-                    // `meta` is a public field on SessionInfo; direct assignment
-                    // is allowed despite `#[non_exhaustive]` (which only restricts
-                    // struct literal construction and exhaustive matching).
-                    session.meta = Some(meta);
                 }
             }
         }

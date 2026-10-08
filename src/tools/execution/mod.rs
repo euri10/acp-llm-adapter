@@ -445,6 +445,7 @@ pub(crate) async fn write_file_tool_execution(
             Some(connection) => {
                 write_file_to_client(
                     connection,
+                    store,
                     &context.session_id,
                     &resolved_path,
                     &parsed_arguments.content,
@@ -455,7 +456,14 @@ pub(crate) async fn write_file_tool_execution(
             None => Err("write_file needs a client connection for fs/write_text_file".to_owned()),
         }
     } else {
-        write_file_to_local(&resolved_path, &parsed_arguments.content, cancellation).await
+        write_file_to_local(
+            store,
+            &context.session_id,
+            &resolved_path,
+            &parsed_arguments.content,
+            cancellation,
+        )
+        .await
     };
 
     match write_result {
@@ -576,6 +584,7 @@ pub(crate) async fn edit_file_tool_execution(
             Some(connection) => {
                 write_file_to_client(
                     connection,
+                    store,
                     &context.session_id,
                     &resolved_path,
                     &updated,
@@ -586,7 +595,14 @@ pub(crate) async fn edit_file_tool_execution(
             None => Err("edit_file needs a client connection for fs/write_text_file".to_owned()),
         }
     } else {
-        write_file_to_local(&resolved_path, &updated, cancellation).await
+        write_file_to_local(
+            store,
+            &context.session_id,
+            &resolved_path,
+            &updated,
+            cancellation,
+        )
+        .await
     };
 
     match write_result {
@@ -1195,6 +1211,7 @@ async fn read_existing_text(
 
 pub(crate) async fn write_file_to_client(
     connection: &dyn WriteTextFileRequester,
+    store: &SessionStore,
     session_id: &str,
     path: &ConfinedPath,
     content: &str,
@@ -1204,6 +1221,7 @@ pub(crate) async fn write_file_to_client(
     if cancellation.is_cancelled() {
         return Err("file write cancelled".to_owned());
     }
+    require_tool_access(store, session_id, "write_file")?;
     connection
         .write_text_file(WriteTextFileRequest::new(
             session_id.to_string(),
@@ -1222,6 +1240,8 @@ pub(crate) async fn write_file_to_client(
 }
 
 async fn write_file_to_local(
+    store: &SessionStore,
+    session_id: &str,
     path: &ConfinedPath,
     content: &str,
     cancellation: &CancellationToken,
@@ -1229,14 +1249,44 @@ async fn write_file_to_local(
     let path = path.clone();
     let content = content.to_owned();
     let cancellation = cancellation.clone();
+    let store = store.clone();
+    let session_id = session_id.to_owned();
     blocking::unblock(move || {
         if cancellation.is_cancelled() {
             return Err("file write cancelled".to_owned());
         }
+        require_tool_access(&store, &session_id, "write_file")?;
         path.write(&content)
             .map_err(|error| format!("failed to write {}: {error}", path.path.display()))
     })
     .await
+}
+
+// Preflight reads and path verification may yield after the original approval.
+// Apply this backstop both at dispatch and immediately before file mutation.
+fn require_tool_access(
+    store: &SessionStore,
+    session_id: &str,
+    tool_name: &str,
+) -> Result<(), String> {
+    if store
+        .selected_content_limits(session_id)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("selected-content Sessions refuse all tool calls".to_owned());
+    }
+    let mode = store
+        .session_behavior(session_id)
+        .map_err(|error| error.to_string())?;
+    if mode.allows_tool_kind(AdapterToolRegistry.kind(tool_name)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} mode refuses {tool_name} tool calls",
+            mode.mode_id()
+        ))
+    }
 }
 
 fn line_number_for_offset(text: &str, offset: usize) -> u32 {
@@ -1557,21 +1607,25 @@ pub(crate) fn execute_tools<'a>(
         if cancellation_token.is_cancelled() {
             return ToolExecution::failed(format!("{} cancelled", call.name()));
         }
-        match store.selected_content_limits(&context.session_id) {
-            Ok(Some(_)) => {
-                return ToolExecution::failed("selected-content Sessions refuse all tool calls");
-            }
-            Err(error) => return ToolExecution::failed(error.to_string()),
-            Ok(None) => {}
+        if let Err(error) = require_tool_access(store, &context.session_id, call.name()) {
+            return ToolExecution::failed(error);
         }
         match call.name() {
             "read_file" => {
-                read_file_tool_execution(
-                    call,
-                    context,
-                    connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
-                )
-                .await
+                let result = tokio::select! {
+                    biased;
+                    () = cancellation_token.cancelled() => return ToolExecution::failed("read_file cancelled"),
+                    result = read_file_tool_execution(
+                        call, context,
+                        connection.map(|requester| requester as &dyn crate::ReadTextFileRequester),
+                    ) => result,
+                };
+                // Cancellation may become ready during the response's final poll.
+                if cancellation_token.is_cancelled() {
+                    ToolExecution::failed("read_file cancelled")
+                } else {
+                    result
+                }
             }
             "list_dir" => {
                 let call = call.clone();
@@ -1630,7 +1684,13 @@ pub(crate) fn execute_tools<'a>(
                 .await
             }
             "update_plan" => update_plan_tool_execution(call),
-            "exit_plan_mode" => exit_plan_mode_tool_execution(store, call, context),
+            "exit_plan_mode" => {
+                let store = store.clone();
+                let call = call.clone();
+                let context = context.clone();
+                blocking::unblock(move || exit_plan_mode_tool_execution(&store, &call, &context))
+                    .await
+            }
             name if crate::is_mcp_tool_name(name) => {
                 crate::mcp_tool_execution(
                     store,

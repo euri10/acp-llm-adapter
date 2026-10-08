@@ -100,7 +100,6 @@ struct PromptTurnEnvironment<'a> {
     tool_registry: &'a dyn ToolRegistry,
     executor: Option<&'a dyn ToolExecutor>,
     tool_context: ToolContext,
-    behavior: SessionBehavior,
     request: PromptInput,
     cancellation_token: CancellationToken,
     max_turn_requests: NonZeroUsize,
@@ -459,7 +458,6 @@ pub(crate) async fn handle_prompt_request(
                 tool_registry,
                 executor,
                 tool_context: turn_setup.tool_context,
-                behavior: turn_setup.behavior,
                 request,
                 cancellation_token: cancellation_token.clone(),
                 max_turn_requests: if selected_content.is_some() {
@@ -527,19 +525,6 @@ async fn run_prompt_turn(
         .store
         .selected_content_limits(&env.request.session_id)?
         .is_some();
-    let tool_definitions = if selected_content {
-        Vec::new()
-    } else {
-        env.tool_registry
-            .definitions(&env.tool_context, env.store)?
-            .into_iter()
-            .filter(|definition| {
-                env.behavior
-                    .allows_tool_kind(env.tool_registry.kind(definition.name()))
-            })
-            .collect::<Vec<_>>()
-    };
-
     let mut stop_reason = StopReason::MaxTurnRequests;
     let mut usage_totals = UsageTotals::default();
 
@@ -548,8 +533,19 @@ async fn run_prompt_turn(
             stop_reason = StopReason::Cancelled;
             break;
         }
-        let request_messages =
-            request_messages_for_behavior(env.behavior, selected_content, &messages);
+        let behavior = env.store.session_behavior(&env.request.session_id)?;
+        let tool_definitions = if selected_content {
+            Vec::new()
+        } else {
+            env.tool_registry
+                .definitions(&env.tool_context, env.store)?
+                .into_iter()
+                .filter(|definition| {
+                    behavior.allows_tool_kind(env.tool_registry.kind(definition.name()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let request_messages = request_messages_for_behavior(behavior, selected_content, &messages);
         let turn = stream_model_turn(
             StreamContext {
                 llm_client: env.llm_client,
@@ -603,22 +599,25 @@ async fn run_prompt_turn(
                 // Preserve the provider's call/result pairing for resume, but
                 // never dispatch the remaining calls in a cancelled batch.
                 ToolExecution::failed("tool call cancelled")
-            } else if env.behavior.allows_tool_kind(tool_kind) {
-                env.tool_registry
-                    .execute(
-                        tool_call,
-                        &env.tool_context,
-                        env.store,
-                        env.executor,
-                        env.cancellation_token.clone(),
-                    )
-                    .await
             } else {
-                ToolExecution::failed(format!(
-                    "{} mode refuses {} tool calls",
-                    env.behavior.mode_id(),
-                    tool_call.name()
-                ))
+                let behavior = env.store.session_behavior(&env.request.session_id)?;
+                if behavior.allows_tool_kind(tool_kind) {
+                    env.tool_registry
+                        .execute(
+                            tool_call,
+                            &env.tool_context,
+                            env.store,
+                            env.executor,
+                            env.cancellation_token.clone(),
+                        )
+                        .await
+                } else {
+                    ToolExecution::failed(format!(
+                        "{} mode refuses {} tool calls",
+                        behavior.mode_id(),
+                        tool_call.name()
+                    ))
+                }
             };
             notify(TurnEvent::ToolResult {
                 call: tool_call.clone(),
@@ -636,7 +635,9 @@ async fn run_prompt_turn(
         if let Some(mode) =
             pending_mode_transition.filter(|_| !env.cancellation_token.is_cancelled())
         {
-            env.store.set_mode(&env.request.session_id, mode)?;
+            let store = env.store.clone();
+            let session_id = env.request.session_id.clone();
+            blocking::unblock(move || store.set_mode(&session_id, mode)).await?;
         }
 
         // Persist after every complete turn cycle (assistant text + tool results).
@@ -806,6 +807,7 @@ pub(crate) async fn stream_model_turn(
 
     loop {
         let event = tokio::select! {
+            biased;
             () = cancellation_token.cancelled() => {
                 stop_reason = StopReason::Cancelled;
                 break;
@@ -882,7 +884,13 @@ pub(crate) async fn stream_model_turn(
         }
     }
 
-    let tool_calls = tool_calls.finish()?;
+    let tool_calls = if stop_reason == StopReason::Cancelled {
+        // Cancellation can interrupt any metadata or argument fragment; these
+        // pending calls are abandoned, not completed provider output.
+        Vec::new()
+    } else {
+        tool_calls.finish()?
+    };
 
     // Send usage update if available
     if let Some(mut usage_data) = usage {

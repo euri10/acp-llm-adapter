@@ -308,6 +308,7 @@ mod tests {
         let file = root.join("sample.txt");
         for client_io in [false, true] {
             for (tool, arguments) in [
+                ("read_file", serde_json::json!({"path":"sample.txt"})),
                 (
                     "write_file",
                     serde_json::json!({"path":"sample.txt", "content":"changed"}),
@@ -321,6 +322,9 @@ mod tests {
                     serde_json::json!({"command":"printf changed > sample.txt"}),
                 ),
             ] {
+                if tool == "read_file" && !cancel_before && !cancel_on_read {
+                    continue;
+                }
                 if cancel_on_read && (!client_io || tool == "run_command") {
                     continue;
                 }
@@ -372,6 +376,7 @@ mod tests {
                 assert!(!store.is_always_allowed(&context.session_id, tool)?);
                 if cancel_before {
                     assert_eq!(requester.permission_calls(), 0);
+                    assert_eq!(requester.read_calls(), 0);
                 }
             }
         }
@@ -398,7 +403,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn cancellation_during_edit_preflight_prevents_writing()
+    async fn cancellation_during_file_reads_prevents_completion_and_writing()
     -> Result<(), Box<dyn std::error::Error>> {
         check_cancelled_mutations(false, false, true).await
     }

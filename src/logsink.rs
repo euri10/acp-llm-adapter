@@ -59,7 +59,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::timestamp::iso_timestamp_millis_now;
+
+mod routing;
 
 const CONNECTIONS_DIR: &str = "connections";
 const SESSIONS_DIR: &str = "sessions";
@@ -441,6 +443,7 @@ impl LogSink {
             sink: Arc::clone(self),
             connection_id,
             session_id: Arc::new(RwLock::new(None)),
+            sniffer: Arc::new(Mutex::new(routing::SessionSniffer::default())),
         })
     }
 
@@ -842,6 +845,7 @@ pub struct ConnectionLog {
     sink: Arc<LogSink>,
     connection_id: String,
     session_id: Arc<RwLock<Option<String>>>,
+    sniffer: Arc<Mutex<routing::SessionSniffer>>,
 }
 
 impl ConnectionLog {
@@ -861,9 +865,28 @@ impl ConnectionLog {
     ///
     /// A record carrying its own session id goes to that session, which is what
     /// lets one connection serving several sessions keep them in separate
-    /// files. Otherwise the record inherits the connection's binding, and falls
-    /// back to the connection file when there is none.
-    pub fn log(&self, record: LogRecord) {
+    /// files. Wire frames use their explicit session or the matching request's
+    /// session, with independent request IDs for each direction. Unscoped wire
+    /// frames stay in the connection file. Other records inherit the connection's
+    /// binding and fall back to the connection file when there is none.
+    pub fn log(&self, mut record: LogRecord) {
+        if record.kind == KIND_FRAME {
+            let sniffed = self
+                .sniffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(record.direction, &record.payload);
+            if let Some(session_id) = sniffed.established
+                && let Err(error) = self.bind_session(&session_id)
+            {
+                tracing::warn!(%error, "ACP frame returned an unusable session id");
+            }
+            record.session_id = record.session_id.or(sniffed.session_id);
+            if record.session_id.is_none() {
+                self.log_fallback(record);
+                return;
+            }
+        }
         // A session id lifted off the wire is untrusted input. Routing on one
         // that is not a safe path component would let a hostile agent choose
         // where this process writes, so such a record is kept but filed under

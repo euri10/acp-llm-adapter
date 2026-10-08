@@ -45,6 +45,237 @@ impl Drop for LogRoot {
 }
 
 #[test_log::test(tokio::test)]
+async fn serve_wire_logs_follow_interleaved_sessions_and_global_frames()
+-> Result<(), Box<dyn Error>> {
+    for logging in [false, true] {
+        let root = LogRoot(
+            std::env::temp_dir().join(format!("acp-serve-routing-{}", uuid::Uuid::new_v4())),
+        );
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+        command
+            .args(["serve", "--backend", "mock"])
+            .env("XDG_STATE_HOME", &root.0)
+            .env("ACP_LOG", if logging { "1" } else { "0" })
+            .env("ACP_LOG_UNREDACTED", "0")
+            .env("RUST_LOG", "error")
+            .env_remove("ACP_LOG_MAX_BYTES")
+            .env_remove("ACP_LOG_MAX_AGE_DAYS");
+        let mut serve =
+            Serve::start_with(command, json!({"cwd": "/tmp", "mcpServers": []})).await?;
+        let first = serve.session_id().to_string();
+        let second = serve
+            .request("session/new", &json!({"cwd": "/tmp", "mcpServers": []}))
+            .await?
+            .pointer("/result/sessionId")
+            .and_then(Value::as_str)
+            .ok_or("second session missing")?
+            .to_string();
+        let pending = serve
+            .start_prompt("!tool run_command printf SHOULD_NOT_RUN")
+            .await?;
+        assert!(matches!(
+            serve
+                .pump_with_permission(Duration::from_secs(10), Some(pending), || false, None)
+                .await?,
+            Stopped::Permission(_)
+        ));
+        let other = serve
+            .request(
+                "session/prompt",
+                &json!({
+                    "sessionId": second, "prompt": [{"type":"text", "text":"second session"}]
+                }),
+            )
+            .await?;
+        assert_eq!(
+            other.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        let configured = serve
+            .request(
+                "session/set_mode",
+                &json!({
+                    "sessionId": first, "modeId": "plan"
+                }),
+            )
+            .await?;
+        assert!(configured.get("result").is_some());
+        serve
+            .notify("session/cancel", &json!({"sessionId": first}))
+            .await?;
+        assert!(matches!(
+            serve.pump(Duration::from_secs(10), Some(pending), || false).await?,
+            Stopped::Response(response) if response.pointer("/result/stopReason") == Some(&json!("cancelled"))
+        ));
+        let listed = serve.request("session/list", &json!({})).await?;
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(10)).await?.success());
+        let logs = root.0.join("acp-llm-adapter");
+        if !logging {
+            assert!(!logs.join("connections").exists());
+            assert!(
+                !logs
+                    .join("sessions")
+                    .join(&first)
+                    .join("log.jsonl")
+                    .exists()
+            );
+            continue;
+        }
+        assert_routed_frames(&logs, [(&first, &configured), (&second, &other)], &listed)?;
+    }
+    Ok(())
+}
+
+fn assert_routed_frames(
+    logs: &std::path::Path,
+    sessions: [(&str, &Value); 2],
+    listed: &Value,
+) -> Result<(), Box<dyn Error>> {
+    for (session, response) in sessions {
+        let records =
+            std::fs::read_to_string(logs.join("sessions").join(session).join("log.jsonl"))?
+                .lines()
+                .map(serde_json::from_str::<acp_llm_adapter::logsink::LogRecord>)
+                .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            records.iter().any(|record| {
+                record.direction == acp_llm_adapter::logsink::Direction::AgentToClient
+                    && record.payload.get("id") == response.get("id")
+                    && record.payload.get("result").is_some()
+            }),
+            "response missing from {session}"
+        );
+        for record in records {
+            assert_eq!(record.session_id.as_deref(), Some(session));
+            if let Some(wire_session) = record
+                .payload
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str)
+            {
+                assert_eq!(
+                    wire_session, session,
+                    "another session's traffic was misfiled"
+                );
+            }
+            assert_ne!(
+                record.payload.get("id"),
+                listed.get("id"),
+                "global reply inherited a session"
+            );
+        }
+    }
+    let connection = std::fs::read_dir(logs.join("connections"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .ok_or("missing connection log")?;
+    let fallback = std::fs::read_to_string(connection)?;
+    assert!(
+        fallback
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|record| record.pointer("/payload/id") == listed.get("id")
+                && record.pointer("/payload/result").is_some()
+                && record.get("session_id").is_none())
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn selected_content_new_and_list_expose_only_available_log_metadata()
+-> Result<(), Box<dyn Error>> {
+    for logging in [false, true] {
+        let root =
+            LogRoot(std::env::temp_dir().join(format!("acp-helper-log-{}", uuid::Uuid::new_v4())));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+        command
+            .args(["serve", "--backend", "mock"])
+            .env("XDG_STATE_HOME", &root.0)
+            .env("ACP_LOG", if logging { "1" } else { "0" })
+            .env("ACP_LOG_UNREDACTED", "0")
+            .env("RUST_LOG", "error")
+            .env_remove("ACP_LOG_MAX_BYTES")
+            .env_remove("ACP_LOG_MAX_AGE_DAYS");
+        let mut serve = Serve::start_with(command, json!({"cwd":"/tmp", "mcpServers":[]})).await?;
+        let key = "io.github.euri10.louiselm.selectedContent";
+        let limits = json!({"version":1,"input_bytes":1024,"output_bytes":1024,"max_tokens":64,"timeout_ms":1000});
+        let response = serve
+            .request(
+                "session/new",
+                &json!({"cwd":"/tmp","mcpServers":[],
+            "_meta":{key:limits}}),
+            )
+            .await?;
+        let meta = response
+            .pointer("/result/_meta")
+            .ok_or("missing helper metadata")?;
+        assert_eq!(meta.get(key), Some(&limits));
+        assert!(meta.get("historyJsonlPath").is_none());
+        let log_path = meta.get("logJsonlPath").and_then(Value::as_str);
+        assert_eq!(log_path.is_some(), logging);
+        let session = response
+            .pointer("/result/sessionId")
+            .and_then(Value::as_str)
+            .ok_or("missing helper session")?;
+        let listed = serve.request("session/list", &json!({})).await?;
+        let sessions = listed
+            .pointer("/result/sessions")
+            .and_then(Value::as_array)
+            .ok_or("missing listed sessions")?;
+        let helper = sessions
+            .iter()
+            .find(|entry| entry.get("sessionId").and_then(Value::as_str) == Some(session))
+            .ok_or("active helper missing from list")?;
+        assert!(helper.pointer("/_meta/historyJsonlPath").is_none());
+        assert_eq!(
+            helper
+                .pointer("/_meta/logJsonlPath")
+                .and_then(Value::as_str),
+            log_path
+        );
+        let ordinary = sessions
+            .iter()
+            .find(|entry| {
+                entry.get("sessionId").and_then(Value::as_str) == Some(serve.session_id())
+            })
+            .ok_or("ordinary session missing from list")?;
+        assert!(ordinary.pointer("/_meta/historyJsonlPath").is_some());
+        assert_eq!(ordinary.pointer("/_meta/logJsonlPath").is_some(), logging);
+        let prompt = serve
+            .request(
+                "session/prompt",
+                &json!({"sessionId":session,
+            "prompt":[{"type":"text","text":"helper audit marker"}]}),
+            )
+            .await?;
+        assert_eq!(
+            prompt.pointer("/result/stopReason"),
+            Some(&json!("end_turn"))
+        );
+        serve.disconnect();
+        assert!(serve.wait(Duration::from_secs(10)).await?.success());
+        if let Some(log_path) = log_path {
+            let path = std::path::Path::new(log_path);
+            assert!(path.is_absolute());
+            assert!(std::fs::read_to_string(path)?.contains("session/prompt"));
+        }
+        assert!(
+            !root
+                .0
+                .join("acp-llm-adapter/sessions")
+                .join(session)
+                .join("history.jsonl")
+                .exists()
+        );
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn serve_redacts_command_content_in_every_log_but_preserves_the_editor_payload()
 -> Result<(), Box<dyn Error>> {
     let secret = "ACP_LOG_SECRET_SENTINEL";
@@ -121,6 +352,52 @@ async fn run_prompt(serve: &mut Serve, text: &str) -> Result<Value, Box<dyn Erro
         Stopped::Response(response) => Ok(*response),
         other => Err(format!("prompt never finished: {other:?}").into()),
     }
+}
+
+#[test_log::test(tokio::test)]
+async fn plan_mode_during_builtin_approval_prevents_execution() -> Result<(), Box<dyn Error>> {
+    let root =
+        LogRoot(std::env::temp_dir().join(format!("acp-plan-approval-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir(&root.0)?;
+    let marker = root.0.join("executed");
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+    command
+        .args(["serve", "--backend", "mock"])
+        .env("XDG_STATE_HOME", &root.0)
+        .env_remove("ACP_LOG");
+    let mut serve = Serve::start_with(command, json!({"cwd": root.0, "mcpServers": []})).await?;
+    let id = serve
+        .start_prompt("!tool run_command printf executed > executed")
+        .await?;
+    let pending = serve
+        .pump_with_permission(Duration::from_secs(5), Some(id), || false, None)
+        .await?;
+    let Stopped::Permission(permission) = pending else {
+        return Err(format!("expected built-in approval, got {pending:?}").into());
+    };
+    let changed = serve
+        .request(
+            "session/set_mode",
+            &json!({"sessionId": serve.session_id(), "modeId": "plan"}),
+        )
+        .await?;
+    assert!(changed.get("error").is_none(), "{changed}");
+    serve
+        .select_permission(
+            permission.get("id").ok_or("missing approval id")?,
+            "allow_always",
+        )
+        .await?;
+    let result = serve
+        .pump(Duration::from_secs(5), Some(id), || false)
+        .await?;
+    assert!(matches!(result, Stopped::Response(_)), "{result:?}");
+    assert!(!marker.exists(), "Plan accepted a pending mutating command");
+    assert!(serve.position_of_status("in_progress").is_none());
+    assert!(serve.position_of_status("failed").is_some());
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    Ok(())
 }
 
 #[test_log::test(tokio::test)]

@@ -889,6 +889,77 @@ async fn network_failure_after_finish_is_not_clean_eof() -> Result<(), Box<dyn s
 }
 
 #[test_log::test(tokio::test)]
+async fn rejects_generation_events_after_finish() -> Result<(), Box<dyn std::error::Error>> {
+    let finish = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+    let trailing_chunks = [
+        json!({"choices":[{"delta":{"content":"too late"}}]}),
+        json!({"choices":[{"delta":{"reasoning_content":"too late"}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"late-call",
+            "function":{"name":"run_command","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        finish.clone(),
+        json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+    ];
+    for single_send in [false, true] {
+        for trailing in &trailing_chunks {
+            let body = format!("data: {finish}\n\ndata: {trailing}\n\ndata: [DONE]\n\n");
+            let (url, server) = spawn_sse_server(body, Arc::new(Mutex::new(None))).await?;
+            let client = ChatClient::new(ChatConfig::new("fixture-key", url, "fixture-model"));
+            let mut request = ChatRequest::new(vec![ChatMessage::user("hello")]);
+            if single_send {
+                request = request.without_retries();
+            }
+            let mut response = client.stream_chat(request, CancellationToken::new())?;
+            assert!(matches!(
+                response.next().await,
+                Some(Ok(StreamEvent::Finished(FinishReason::EndTurn)))
+            ));
+            assert!(
+                matches!(
+                    response.next().await,
+                    Some(Err(ChatError::InvalidResponse(_)))
+                ),
+                "generation event accepted after finish: {trailing}, single_send={single_send}"
+            );
+            assert!(response.next().await.is_none());
+            server.await??;
+        }
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn final_chunk_output_and_trailing_usage_remain_valid()
+-> Result<(), Box<dyn std::error::Error>> {
+    let final_chunk = json!({"choices":[{"delta":{"content":"answer","reasoning_content":"thought"},
+        "finish_reason":"stop","future_field":true}],"future_metadata":{"value":1}});
+    let accounting = json!({"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2},
+        "future_metadata":{"value":2}});
+    for done in ["", "data: [DONE]\n\n"] {
+        let body = format!("data: {final_chunk}\n\ndata: {accounting}\n\n{done}");
+        let (url, server) = spawn_sse_server(body, Arc::new(Mutex::new(None))).await?;
+        let client = ChatClient::new(ChatConfig::new("fixture-key", url, "fixture-model"));
+        let mut response =
+            client.stream_chat(ChatRequest::new(vec![]), CancellationToken::new())?;
+        assert!(
+            matches!(response.next().await, Some(Ok(StreamEvent::Thought(text))) if text == "thought")
+        );
+        assert!(
+            matches!(response.next().await, Some(Ok(StreamEvent::Message(text))) if text == "answer")
+        );
+        assert!(matches!(
+            response.next().await,
+            Some(Ok(StreamEvent::Finished(FinishReason::EndTurn)))
+        ));
+        assert!(
+            matches!(response.next().await, Some(Ok(StreamEvent::Usage(data))) if data.input_tokens == 5 && data.output_tokens == 2)
+        );
+        assert!(response.next().await.is_none());
+        server.await??;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn trailing_usage_is_validated_after_finish_without_done()
 -> Result<(), Box<dyn std::error::Error>> {
     for single_send in [false, true] {

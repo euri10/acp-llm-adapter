@@ -253,6 +253,66 @@ async fn accept_edits_still_asks_for_mcp_and_yolo_allows_it() -> Result<(), Box<
 }
 
 #[test_log::test(tokio::test)]
+async fn plan_mode_during_mcp_approval_refuses_execution_and_refreshes_request()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = Fixture::new().await?;
+    let mut serve = fixture.start("ask").await?;
+    let id = serve.start_prompt("echo").await?;
+    let pending = serve
+        .pump_with_permission(LIMIT, Some(id), || false, None)
+        .await?;
+    let Stopped::Permission(permission) = pending else {
+        return Err(format!("expected MCP approval, got {pending:?}").into());
+    };
+    assert_tool_advertised(&mut fixture).await?;
+    let changed = serve
+        .request(
+            "session/set_mode",
+            &json!({"sessionId": serve.session_id(), "modeId": "plan"}),
+        )
+        .await?;
+    assert!(changed.get("error").is_none(), "{changed}");
+    serve
+        .select_permission(
+            permission.get("id").ok_or("missing permission id")?,
+            "allow_always",
+        )
+        .await?;
+    complete(&mut serve, id, None, "end_turn").await?;
+    assert!(
+        fixture.events().is_empty(),
+        "Plan invoked the pending MCP tool"
+    );
+    let next = fixture.request().await?;
+    assert!(
+        next.pointer("/messages/0/content")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("Plan mode"))
+    );
+    assert!(
+        !next
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| tools.iter().any(|tool| tool
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                == Some(TOOL_NAME)))
+    );
+    // The approval invalidated by Plan must not become a remembered decision.
+    serve
+        .request(
+            "session/set_mode",
+            &json!({"sessionId": serve.session_id(), "modeId": "ask"}),
+        )
+        .await?;
+    let id = serve.start_prompt("echo").await?;
+    complete(&mut serve, id, Some("allow_once"), "end_turn").await?;
+    assert_eq!(permission_count(&serve), 2);
+    assert_eq!(fixture.events(), ["invoked"]);
+    stop(&mut serve).await
+}
+
+#[test_log::test(tokio::test)]
 async fn remembered_allow_skips_approval_but_cannot_override_plan() -> Result<(), Box<dyn Error>> {
     let mut fixture = Fixture::new().await?;
     let mut serve = fixture.start("ask").await?;

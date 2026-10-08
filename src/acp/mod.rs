@@ -204,23 +204,31 @@ async fn serve_with_transport_impl(
         )
         .on_receive_request(
             async move |request: SetSessionModeRequest, responder, cx| {
+                let store = set_mode_store.clone();
                 let connection = cx.clone();
-                responder.respond(handle_set_session_mode_request_notifying(
-                    &set_mode_store,
-                    &request,
-                    |notification| connection.send_notification(notification),
-                )?)
+                let response = blocking::unblock(move || {
+                    handle_set_session_mode_request_notifying(&store, &request, |notification| {
+                        connection.send_notification(notification)
+                    })
+                })
+                .await;
+                responder.respond_with_result(response)
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |request: SetSessionConfigOptionRequest, responder, cx| {
+                let store = set_config_store.clone();
                 let connection = cx.clone();
-                responder.respond(handle_set_session_config_option_request_notifying(
-                    &set_config_store,
-                    &request,
-                    |notification| connection.send_notification(notification),
-                )?)
+                let response = blocking::unblock(move || {
+                    handle_set_session_config_option_request_notifying(
+                        &store,
+                        &request,
+                        |notification| connection.send_notification(notification),
+                    )
+                })
+                .await;
+                responder.respond_with_result(response)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -433,7 +441,7 @@ pub(crate) async fn handle_load_session_request(
     let mut response = LoadSessionResponse::new()
         .modes(session_modes(store.session_behavior(&session_id.0)?))
         .config_options(store.session_config_options(&session_id.0)?);
-    if let Some(meta) = store.session_meta(&session_id.0) {
+    if let Some(meta) = store.session_meta(&session_id.0)? {
         response = response.meta(meta);
     }
     Ok(response)
@@ -451,7 +459,7 @@ pub(crate) async fn handle_resume_session_request(
     let mut response = ResumeSessionResponse::new()
         .modes(session_modes(store.session_behavior(&session_id.0)?))
         .config_options(store.session_config_options(&session_id.0)?);
-    if let Some(meta) = store.session_meta(&session_id.0) {
+    if let Some(meta) = store.session_meta(&session_id.0)? {
         response = response.meta(meta);
     }
     Ok(response)
@@ -575,14 +583,15 @@ fn insert_session_record(
     let mut response = NewSessionResponse::new(session_id)
         .modes(default_session_modes())
         .config_options(store.session_config_options(&sid.0)?);
-    if let Some(meta) = store.session_meta(&sid.0) {
+    if let Some(meta) = store.session_meta(&sid.0)? {
         response = response.meta(meta);
     }
     if let Some(limits) = selected_content {
-        response = response.meta(serde_json::Map::from_iter([(
+        let meta = response.meta.get_or_insert_with(serde_json::Map::new);
+        meta.insert(
             crate::selected_content::META_KEY.to_string(),
             serde_json::to_value(limits).map_err(AdapterError::from)?,
-        )]));
+        );
     }
     Ok(response)
 }
