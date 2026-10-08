@@ -268,7 +268,7 @@ The adapter bridges two independent channels:
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Left side** — the adapter speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio as JSON-RPC 2.0 frames. The `agent-client-protocol` crate handles the wire protocol; [`acp/`](src/acp/) registers request handlers and translates between ACP schema types and the adapter's internal types.
+**Left side** — the adapter speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio as JSON-RPC 2.0 frames. The `agent-client-protocol` 2.x SDK handles the stable ACP v1 wire protocol; [`acp/`](src/acp/) registers request handlers and translates between ACP schema types and the adapter's internal types.
 
 **Right side** — the adapter speaks HTTPS + Server-Sent Events to the provider's OpenAI-compatible `/chat/completions` endpoint via a thin client owned by this crate in [`src/llm/`](src/llm/). A [`LlmClient`](src/llm/client.rs) trait provides the mock seam for testing without a live API key.
 
