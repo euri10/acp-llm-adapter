@@ -6,9 +6,10 @@ together with [testing](agent-testing.md).
 
 ## Toolchain and manifests
 
-- Stable toolchain only, matching `RUST_VERSION` in CI and `rust-version` in
-  `Cargo.toml` (currently 1.95, edition 2024). Default rustfmt; the edition stays
-  explicit in the manifest.
+- Stable toolchain only. Development and CI use `RUST_VERSION`, matching
+  `rust-version` in `Cargo.toml` (currently 1.95, edition 2024). The release-plz
+  workflow uses Rust 1.99 for release automation; this does not raise the MSRV
+  tested by CI. Default rustfmt; the edition stays explicit in the manifest.
 - Declare an MSRV only when it is actually tested. Do not claim compatibility
   from an untested `rust-version` field.
 - Dependencies are pinned deliberately and updated by Dependabot, with daily
