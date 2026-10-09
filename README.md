@@ -87,7 +87,7 @@ In the Agent Panel's new-thread menu, pick the external agent
 "DeepSeek (acp-llm-adapter)", not Zed's built-in agent. Tested with Zed 1.23.2,
 2026-10-09.
 
-![Zed Agent Panel running the DeepSeek (acp-llm-adapter) external agent, which reads and searches hello.py and answers](https://raw.githubusercontent.com/euri10/acp-llm-adapter/main/docs/images/zed.png)
+![Zed Agent Panel running the DeepSeek (acp-llm-adapter) external agent: the permission prompt shows the docstring diff for hello.py before approval](https://raw.githubusercontent.com/euri10/acp-llm-adapter/main/docs/images/zed.png)
 
 ### CodeCompanion
 
@@ -124,7 +124,7 @@ Then `:CodeCompanionChat`. Tested with CodeCompanion `v19.27.0` on Neovim
 > contents are sent to your provider. To opt out, add
 > `rules = { opts = { chat = { enabled = false } } }` to the setup table.
 
-![CodeCompanion chat with acp-llm-adapter: tool calls, an Approval Required prompt for the edit, and the updated hello.py](https://raw.githubusercontent.com/euri10/acp-llm-adapter/main/docs/images/codecompanion.png)
+![CodeCompanion chat with acp-llm-adapter: the approval step shows the proposed docstring diff for hello.py, then the accepted edit](https://raw.githubusercontent.com/euri10/acp-llm-adapter/main/docs/images/codecompanion.png)
 
 ## What you get
 
