@@ -26,6 +26,13 @@ mkdir -p "$work/plugins"
 
 fetch() { # name url rev -> prints checkout path
   local dir="$work/plugins/$1-$3"
+  # A directory is not a checkout: CI's rust-cache restores target/ with every
+  # file deleted. Reuse it only when it is its own git repository (a pruned .git
+  # makes git find this repo instead) and git reports nothing missing.
+  if [ -d "$dir" ] && ! { [ "$(git -C "$dir" rev-parse --git-dir 2>/dev/null)" = .git ] &&
+    [ -z "$(git -C "$dir" status --porcelain)" ]; }; then
+    rm -rf "$dir"
+  fi
   if [ ! -d "$dir" ]; then
     git init -q "$dir.tmp"
     git -C "$dir.tmp" fetch -q --depth 1 "$2" "$3"
