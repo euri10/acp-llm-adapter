@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3](https://github.com/euri10/acp-llm-adapter/compare/v0.9.2...v0.9.3) - 2026-10-09
+
+### Added
+
+- preview file edits in permission requests
+
+### Other
+
+- track README screenshot refresh for diff previews
+- record verified 0.9.2 release
+
 ## [0.9.2](https://github.com/euri10/acp-llm-adapter/compare/v0.9.1...v0.9.2) - 2026-10-09
 
 ### Fixed
