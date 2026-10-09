@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/euri10/acp-llm-adapter/compare/v0.9.1...v0.9.2) - 2026-10-09
+
+### Fixed
+
+- *(ci)* refetch editor plugins pruned by rust-cache
+
+### Other
+
+- close editor-snippets cache bug
+- name euri10 as copyright holder
+- license under MIT
+- rewrite README around tested editor setup
+- *(deps)* remove unused Renovate config
+- record verified 0.9.1 release
+
 ## [0.9.1](https://github.com/euri10/acp-llm-adapter/compare/v0.9.0...v0.9.1) - 2026-10-08
 
 ### Changed
