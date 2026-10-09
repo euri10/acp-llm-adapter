@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Run the README editor snippets in examples/ against a local fake provider.
+#
+# Each snippet is used unchanged with its real `deepseek` backend; the adapter
+# is redirected to examples/fake_provider.rs through LLM_BASE_URL, so no key or
+# network is needed beyond fetching the pinned plugins once. Editor state lives
+# in a throwaway directory under target/, never in your own configuration.
+#
+# Usage: scripts/test-editor-snippets [louiselm|codecompanion|zed]...
+#
+# louiselm and codecompanion run headless (Neovim 0.12+, git, sqlite3 3.38+)
+# and are the default. zed is interactive: it opens Zed (installed per
+# https://zed.dev/docs/linux) with examples/zed-settings.json; in the Agent
+# Panel's new-thread menu pick the external agent "DeepSeek (acp-llm-adapter)"
+# (not Zed's built-in agent), send any prompt, check the reply, and quit Zed.
+set -Eeuo pipefail
+cd "$(dirname "$0")/.."
+
+# Bump deliberately; the README "Tested with" lines name these versions.
+LOUISELM_REV=plugin-v0.2.0
+CODECOMPANION_REV=v19.27.0
+PLENARY_REV=74b06c6c75e4eeb3108ec01852001636d85a932b
+
+work="$PWD/target/editor-snippets"
+mkdir -p "$work/plugins"
+
+fetch() { # name url rev -> prints checkout path
+  local dir="$work/plugins/$1-$3"
+  if [ ! -d "$dir" ]; then
+    git init -q "$dir.tmp"
+    git -C "$dir.tmp" fetch -q --depth 1 "$2" "$3"
+    git -C "$dir.tmp" checkout -q FETCH_HEAD
+    mv "$dir.tmp" "$dir"
+  fi
+  printf '%s' "$dir"
+}
+
+cargo build --locked -q --bin acp-llm-adapter --example fake_provider
+# The snippets call `acp-llm-adapter`; resolve it to this checkout's build.
+export PATH="$PWD/target/debug:$PATH"
+
+run_dir=$(mktemp -d "$work/run.XXXXXX")
+trap 'printf "editor state kept in %s\n" "$run_dir" >&2' ERR
+export XDG_CONFIG_HOME="$run_dir/config" XDG_DATA_HOME="$run_dir/data"
+export XDG_STATE_HOME="$run_dir/state" XDG_CACHE_HOME="$run_dir/cache"
+
+# An inherited key, URL or model would mask a snippet that fails to set them.
+unset LLM_API_KEY LLM_BASE_URL LLM_MODEL
+# Each Neovim must use its own runtime, not one exported for another build.
+unset VIM VIMRUNTIME
+# The Zed snippet's placeholder key, so that file is also used unchanged.
+export FAKE_PROVIDER_KEY=your-deepseek-api-key
+export FAKE_PROVIDER_REPLY="Hello from acp-llm-adapter."
+
+# Closing our end of its stdin when this script exits stops the provider.
+coproc PROVIDER { exec target/debug/examples/fake_provider 2>"$run_dir/provider.log"; }
+read -r base_url <&"${PROVIDER[0]}"
+export LLM_BASE_URL="$base_url"
+
+check_neovim() { # name plugins...
+  local name=$1
+  shift
+  DEEPSEEK_API_KEY=$FAKE_PROVIDER_KEY SNIPPET_PLUGINS=$(IFS=:; printf '%s' "$*") \
+    nvim --headless --noplugin -u NONE -l "tests/editors/$name.lua"
+}
+
+check_zed() {
+  # With --user-data-dir, Zed reads its settings from <dir>/config/.
+  mkdir -p "$run_dir/zed/config" "$run_dir/project"
+  cp examples/zed-settings.json "$run_dir/zed/config/settings.json"
+  printf 'zed: start a "DeepSeek (acp-llm-adapter)" thread, send a prompt, quit Zed\n'
+  # Zed's built-in DeepSeek provider reads DEEPSEEK_API_KEY itself; it must
+  # never see one, or a thread on the wrong agent reaches the real API.
+  env -u DEEPSEEK_API_KEY zed --foreground --user-data-dir "$run_dir/zed" "$run_dir/project" \
+    >"$run_dir/zed.log" 2>&1
+  if ! grep -q '^completion authorized$' "$run_dir/provider.log"; then
+    printf 'zed: the provider served no authorized completion\n' >&2
+    return 1
+  fi
+  printf 'zed: authorized completion served\n'
+}
+
+[ $# -gt 0 ] || set -- louiselm codecompanion
+for client in "$@"; do
+  case $client in
+    louiselm)
+      check_neovim louiselm \
+        "$(fetch louiselm https://github.com/euri10/louiselm "$LOUISELM_REV")" ;;
+    codecompanion)
+      check_neovim codecompanion \
+        "$(fetch plenary https://github.com/nvim-lua/plenary.nvim "$PLENARY_REV")" \
+        "$(fetch codecompanion https://github.com/olimorris/codecompanion.nvim "$CODECOMPANION_REV")" ;;
+    zed)
+      check_zed ;;
+    *)
+      printf 'unknown client: %s\n' "$client" >&2
+      exit 2 ;;
+  esac
+done
+rm -rf "$run_dir"

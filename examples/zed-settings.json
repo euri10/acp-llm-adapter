@@ -1,0 +1,10 @@
+{
+  "agent_servers": {
+    "DeepSeek (acp-llm-adapter)": {
+      "type": "custom",
+      "command": "acp-llm-adapter",
+      "args": ["serve", "--backend", "deepseek"],
+      "env": { "LLM_API_KEY": "your-deepseek-api-key" }
+    }
+  }
+}

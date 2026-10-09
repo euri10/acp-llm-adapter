@@ -78,6 +78,11 @@
 /// LLM client primitives and streaming SSE adapter.
 pub mod llm;
 
+/// Compiles the examples in `docs/library.md` as doc-tests.
+#[cfg(doctest)]
+#[doc = include_str!("../docs/library.md")]
+pub struct LibraryDocs;
+
 /// Unified domain error type for the adapter crate.
 pub mod error;
 

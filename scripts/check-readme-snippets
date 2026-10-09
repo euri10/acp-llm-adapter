@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Check that README.md quotes every tested editor snippet exactly.
+
+A snippet is marked in README.md by an HTML comment naming its source, followed
+by a fenced block holding that file's exact contents:
+
+    <!-- snippet: examples/louiselm.lua -->
+    ```lua
+    ...
+    ```
+
+Every file in SNIPPETS must be quoted at least once, and every quote must match
+its file byte for byte. scripts/test-editor-snippets runs those files.
+"""
+
+import pathlib
+import re
+import sys
+
+SNIPPETS = (
+    "examples/louiselm.lua",
+    "examples/zed-settings.json",
+    "examples/codecompanion.lua",
+)
+MARKED_BLOCK = re.compile(
+    r"^<!-- snippet: (?P<path>\S+) -->\n```[^\n]*\n(?P<body>.*?)^```$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def main() -> int:
+    root = pathlib.Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    errors = []
+    quoted = set()
+    for block in MARKED_BLOCK.finditer(readme):
+        path = block["path"]
+        quoted.add(path)
+        if path not in SNIPPETS:
+            errors.append(f"{path}: marked in README.md but not a tested snippet")
+            continue
+        if block["body"] != (root / path).read_text(encoding="utf-8"):
+            errors.append(f"{path}: README.md quote differs from the file")
+    errors += [f"{path}: not quoted in README.md" for path in SNIPPETS if path not in quoted]
+    for error in errors:
+        print(error, file=sys.stderr)
+    if not errors:
+        print(f"README.md quotes {len(SNIPPETS)} tested snippets exactly")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
