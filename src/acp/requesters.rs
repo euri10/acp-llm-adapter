@@ -316,11 +316,12 @@ impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
 }
 
 use crate::SessionStore;
+use crate::acp::turn_events::edit_diff;
 use crate::session::{
     PERMISSION_ALLOW_ALWAYS_OPTION_ID, PERMISSION_ALLOW_ONCE_OPTION_ID,
     PERMISSION_REJECT_ALWAYS_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID, PermissionDecision,
 };
-use crate::tools::ToolContext;
+use crate::tools::{ToolContext, ToolEdit};
 use crate::turn::tool_raw_input;
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::ToolCall as ChatToolCall;
@@ -330,6 +331,9 @@ use agent_client_protocol::schema::v1::{
 use tokio_util::sync::CancellationToken;
 
 /// Ask the client (or fall back to posture) whether a tool call is allowed.
+///
+/// A file edit passes `preview`, the exact change it will apply, so the editor
+/// can show that diff before approval rather than guess it from raw arguments.
 ///
 /// # Errors
 ///
@@ -341,6 +345,7 @@ pub(crate) async fn request_tool_permission(
     call: &ChatToolCall,
     kind: crate::tools::ToolKind,
     requester: &dyn PermissionRequester,
+    preview: Option<&ToolEdit>,
     cancellation: &CancellationToken,
 ) -> Result<PermissionDecision, AdapterError> {
     if cancellation.is_cancelled() {
@@ -365,16 +370,15 @@ pub(crate) async fn request_tool_permission(
         return Ok(PermissionDecision::AllowByMode);
     }
 
+    let fields = ToolCallUpdateFields::new()
+        .kind(agent_client_protocol::schema::v1::ToolKind::from(kind))
+        .status(ToolCallStatus::Pending)
+        .title(crate::turn::tool_call_title(call))
+        .raw_input(tool_raw_input(call))
+        .content(preview.map(|edit| vec![edit_diff(edit)]));
     let request = RequestPermissionRequest::new(
         context.session_id.clone(),
-        ToolCallUpdate::new(
-            call.id().to_string(),
-            ToolCallUpdateFields::new()
-                .kind(agent_client_protocol::schema::v1::ToolKind::from(kind))
-                .status(ToolCallStatus::Pending)
-                .title(crate::turn::tool_call_title(call))
-                .raw_input(tool_raw_input(call)),
-        ),
+        ToolCallUpdate::new(call.id().to_string(), fields),
         permission_options(),
     );
 

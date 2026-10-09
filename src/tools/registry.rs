@@ -573,7 +573,9 @@ mod tests {
         assert!(edit_result.success);
         assert_eq!(edit_result.raw_output["read_source"], "client");
         assert_eq!(edit_result.raw_output["write_source"], "client");
-        assert_eq!(requester.read_calls(), 4);
+        // read_file reads once; write_file and edit_file each read before
+        // approval (the preview) and again after it (the unchanged check).
+        assert_eq!(requester.read_calls(), 5);
         assert_eq!(requester.write_calls(), 2);
         assert_eq!(requester.permission_calls(), 2);
         Ok(())

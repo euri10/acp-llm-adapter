@@ -688,6 +688,7 @@ async fn permission_request_prompts_and_caches_allow_always()
         &call,
         ToolKind::Edit,
         &requester,
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await?;
@@ -728,6 +729,7 @@ async fn permission_request_prompts_and_caches_allow_always()
         &call,
         ToolKind::Edit,
         &second_requester,
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await?;
@@ -781,6 +783,7 @@ async fn permission_request_rejects_without_caching() -> Result<(), agent_client
         &call,
         ToolKind::Execute,
         &requester,
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await?;
@@ -827,6 +830,7 @@ async fn session_behavior_ask_prompts_all_mutations() -> Result<(), agent_client
             &edit_call,
             ToolKind::Edit,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,
@@ -839,6 +843,7 @@ async fn session_behavior_ask_prompts_all_mutations() -> Result<(), agent_client
             &shell_call,
             ToolKind::Execute,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,
@@ -877,6 +882,7 @@ async fn session_behavior_accept_edits_skips_edit_prompts()
             &edit_call,
             ToolKind::Edit,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,
@@ -889,6 +895,7 @@ async fn session_behavior_accept_edits_skips_edit_prompts()
             &shell_call,
             ToolKind::Execute,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,
@@ -929,6 +936,7 @@ async fn session_behavior_yolo_auto_allows_all_mutations()
             &edit_call,
             ToolKind::Edit,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,
@@ -941,6 +949,7 @@ async fn session_behavior_yolo_auto_allows_all_mutations()
             &shell_call,
             ToolKind::Execute,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,
@@ -1105,6 +1114,7 @@ async fn request_permission_rejects_unknown_option() -> Result<(), agent_client_
         &call,
         ToolKind::Edit,
         &requester,
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await
@@ -1239,6 +1249,7 @@ async fn require_tool_permission_rejects() -> Result<(), agent_client_protocol::
         &call,
         ToolKind::Execute,
         Some(&requester),
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await
@@ -1274,6 +1285,7 @@ async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol
         &call,
         ToolKind::Execute,
         Some(&requester),
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await
@@ -1299,6 +1311,7 @@ async fn require_tool_permission_missing_requester() {
         &context,
         &call,
         ToolKind::Edit,
+        None,
         None,
         &tokio_util::sync::CancellationToken::new(),
     )
@@ -1333,6 +1346,7 @@ async fn request_permission_handles_unknown_session_and_cancelled()
         &missing_call,
         ToolKind::Edit,
         &missing_requester,
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await
@@ -1366,6 +1380,7 @@ async fn request_permission_handles_unknown_session_and_cancelled()
             &call,
             ToolKind::Execute,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,

@@ -1,7 +1,7 @@
 //! Encode domain turn events as ACP notifications at the transport edge.
 
 use crate::SessionStore;
-use crate::tools::ToolExecution;
+use crate::tools::{ToolEdit, ToolExecution};
 use crate::turn::tool_call_title;
 use crate::turn::{PromptResult, TurnEvent, UsageTotals};
 use crate::{session_notification, tool_raw_input};
@@ -154,11 +154,16 @@ pub(crate) fn report_tool_result(
 
 fn tool_call_update_content(result: &ToolExecution) -> Vec<ToolCallContent> {
     match &result.edit {
-        Some(edit) => vec![ToolCallContent::from(
-            Diff::new(edit.path.clone(), edit.new_text.clone()).old_text(edit.old_text.clone()),
-        )],
+        Some(edit) => vec![edit_diff(edit)],
         None => vec![ToolCallContent::from(result.content.clone())],
     }
+}
+
+/// The ACP diff for a file edit: whole-file old and new text, as editors render it.
+pub(crate) fn edit_diff(edit: &ToolEdit) -> ToolCallContent {
+    ToolCallContent::from(
+        Diff::new(edit.path.clone(), edit.new_text.clone()).old_text(edit.old_text.clone()),
+    )
 }
 
 impl From<crate::tools::ToolKind> for ToolKind {

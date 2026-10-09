@@ -331,6 +331,7 @@ async fn mcp_tools_use_explicit_execute_permission_kind() -> Result<(), agent_cl
         &call,
         super::mcp_tool_kind(),
         &requester,
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await?;

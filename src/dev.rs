@@ -416,6 +416,7 @@ pub(crate) async fn exercise_permission_gate_smoke() -> Result<(), agent_client_
         &call,
         crate::tools::ToolKind::Edit,
         &MockPermissionRequester,
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await?;

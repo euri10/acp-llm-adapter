@@ -412,12 +412,32 @@ pub(crate) async fn write_file_tool_execution(
         Err(error) => return ToolExecution::failed(error),
     };
 
+    let use_client_write = context
+        .client_capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.write_text_file);
+    let read_existing = || async {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err("write_file cancelled".to_owned()),
+            result = read_existing_text(context, &resolved_path, read_connection, use_client_write) => result,
+        }
+    };
+    let existing = match read_existing().await {
+        Ok(existing) => existing,
+        Err(error) => return ToolExecution::failed(error),
+    };
+    // The exact change the user approves is the change that is written; with
+    // unknown old contents there is no truthful preview, so none is sent.
+    let edit = existing.into_edit(&resolved_path.path, &parsed_arguments.content);
+
     if let Err(error) = require_tool_permission(
         store,
         context,
         call,
         ToolKind::Edit,
         permission_requester,
+        edit.as_ref(),
         cancellation,
     )
     .await
@@ -425,18 +445,18 @@ pub(crate) async fn write_file_tool_execution(
         return ToolExecution::failed(error);
     }
 
-    let use_client_write = context
-        .client_capabilities
-        .as_ref()
-        .is_some_and(|capabilities| capabilities.write_text_file);
-    let old_text = match tokio::select! {
-        biased;
-        () = cancellation.cancelled() => return ToolExecution::failed("write_file cancelled"),
-        result = read_existing_text(context, &resolved_path, read_connection, use_client_write) => result,
-    } {
-        Ok(text) => text,
+    // Approval can stay open while the user edits, creates or deletes this
+    // document. Overwriting it then would apply a change nobody approved.
+    match read_existing().await {
+        Ok(current) if current.unchanged_since(edit.as_ref()) => {}
+        Ok(_) => {
+            return ToolExecution::failed(format!(
+                "write_file: {} changed while awaiting approval; read it again before retrying",
+                resolved_path.path.display()
+            ));
+        }
         Err(error) => return ToolExecution::failed(error),
-    };
+    }
     if cancellation.is_cancelled() {
         return ToolExecution::failed("write_file cancelled");
     }
@@ -480,12 +500,7 @@ pub(crate) async fn write_file_tool_execution(
                     "source": if use_client_write { "client" } else { "local" },
                 }),
                 success: true,
-                edit: Some(ToolEdit {
-                    path: resolved_path.path,
-                    old_text,
-                    new_text: parsed_arguments.content,
-                    line: 1,
-                }),
+                edit,
             }
         }
         Err(error) => ToolExecution::failed(error),
@@ -544,12 +559,25 @@ pub(crate) async fn edit_file_tool_execution(
         ));
     }
 
+    // The exact change the user approves is the change that is written.
+    let line = match original.find(&parsed_arguments.old_text) {
+        Some(offset) => line_number_for_offset(&original, offset),
+        None => 1,
+    };
+    let edit = ToolEdit {
+        path: resolved_path.path.clone(),
+        new_text: original.replacen(&parsed_arguments.old_text, &parsed_arguments.new_text, 1),
+        old_text: Some(original),
+        line,
+    };
+
     if let Err(error) = require_tool_permission(
         store,
         context,
         call,
         ToolKind::Edit,
         permission_requester,
+        Some(&edit),
         cancellation,
     )
     .await
@@ -560,7 +588,7 @@ pub(crate) async fn edit_file_tool_execution(
     // Approval can stay open while the user edits or replaces this document.
     // Check the same confined source again before using its original snapshot.
     match read_edit_source(context, &resolved_path, read_connection, cancellation).await {
-        Ok(current) if current == original => {}
+        Ok(current) if edit.old_text.as_deref() == Some(current.as_str()) => {}
         Ok(_) => {
             return ToolExecution::failed(format!(
                 "edit_file: {} changed while awaiting approval; read it again before retrying",
@@ -570,11 +598,6 @@ pub(crate) async fn edit_file_tool_execution(
         Err(error) => return ToolExecution::failed(error),
     }
 
-    let edit_line = match original.find(&parsed_arguments.old_text) {
-        Some(offset) => line_number_for_offset(&original, offset),
-        None => 1,
-    };
-    let updated = original.replacen(&parsed_arguments.old_text, &parsed_arguments.new_text, 1);
     let use_client_write = context
         .client_capabilities
         .as_ref()
@@ -587,7 +610,7 @@ pub(crate) async fn edit_file_tool_execution(
                     store,
                     &context.session_id,
                     &resolved_path,
-                    &updated,
+                    &edit.new_text,
                     cancellation,
                 )
                 .await
@@ -599,7 +622,7 @@ pub(crate) async fn edit_file_tool_execution(
             store,
             &context.session_id,
             &resolved_path,
-            &updated,
+            &edit.new_text,
             cancellation,
         )
         .await
@@ -615,12 +638,7 @@ pub(crate) async fn edit_file_tool_execution(
                 "write_source": if use_client_write { "client" } else { "local" },
             }),
             success: true,
-            edit: Some(ToolEdit {
-                path: resolved_path.path,
-                old_text: Some(original),
-                new_text: updated,
-                line: edit_line,
-            }),
+            edit: Some(edit),
         },
         Err(error) => ToolExecution::failed(error),
     }
@@ -717,6 +735,7 @@ pub(crate) async fn run_command_tool_execution(
         call,
         ToolKind::Execute,
         permission_requester,
+        None,
         cancellation_token,
     )
     .await
@@ -1076,6 +1095,7 @@ pub(crate) async fn require_tool_permission(
     call: &ChatToolCall,
     kind: ToolKind,
     requester: Option<&dyn PermissionRequester>,
+    preview: Option<&ToolEdit>,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
     let requester = requester.ok_or_else(|| {
@@ -1085,7 +1105,9 @@ pub(crate) async fn require_tool_permission(
         )
     })?;
 
-    match request_tool_permission(store, context, call, kind, requester, cancellation).await {
+    match request_tool_permission(store, context, call, kind, requester, preview, cancellation)
+        .await
+    {
         Ok(
             PermissionDecision::AllowOnce
             | PermissionDecision::AllowAlways
@@ -1167,22 +1189,58 @@ async fn read_edit_source(
     }
 }
 
+/// What `write_file` knows about the document it would overwrite.
+#[derive(Debug)]
+enum ExistingText {
+    /// No document exists at the path.
+    Missing,
+    /// The document's current contents.
+    Text(String),
+    /// The editor writes files but the adapter cannot read them.
+    Unknown,
+}
+
+impl ExistingText {
+    /// The diff writing `new_text` would apply, or `None` when the old
+    /// contents are unknown and any diff would misstate the change.
+    fn into_edit(self, path: &Path, new_text: &str) -> Option<ToolEdit> {
+        let old_text = match self {
+            Self::Missing => None,
+            Self::Text(text) => Some(text),
+            Self::Unknown => return None,
+        };
+        Some(ToolEdit {
+            path: path.to_path_buf(),
+            old_text,
+            new_text: new_text.to_owned(),
+            line: 1,
+        })
+    }
+
+    /// Whether these contents are still the ones `approved` was built from.
+    fn unchanged_since(&self, approved: Option<&ToolEdit>) -> bool {
+        match (self, approved) {
+            (Self::Unknown, None) => true,
+            (Self::Missing, Some(edit)) => edit.old_text.is_none(),
+            (Self::Text(text), Some(edit)) => edit.old_text.as_deref() == Some(text.as_str()),
+            _ => false,
+        }
+    }
+}
+
 async fn read_existing_text(
     context: &ToolContext,
     path: &ConfinedPath,
     read_connection: Option<&dyn ReadTextFileRequester>,
     use_client_write: bool,
-) -> Result<Option<String>, String> {
+) -> Result<ExistingText, String> {
     if use_client_write {
         let can_client_read = context
             .client_capabilities
             .as_ref()
             .is_some_and(|capabilities| capabilities.read_text_file);
-        if !can_client_read {
-            return Ok(None);
-        }
-        let Some(connection) = read_connection else {
-            return Ok(None);
+        let (true, Some(connection)) = (can_client_read, read_connection) else {
+            return Ok(ExistingText::Unknown);
         };
         let path = client_file_path(path).await?;
         return match connection
@@ -1192,9 +1250,9 @@ async fn read_existing_text(
             ))
             .await
         {
-            Ok(response) => Ok(Some(response.content)),
+            Ok(response) => Ok(ExistingText::Text(response.content)),
             Err(error) if error.code == agent_client_protocol::ErrorCode::ResourceNotFound => {
-                Ok(None)
+                Ok(ExistingText::Missing)
             }
             Err(error) => Err(read_file_client_error(&path, &error.to_string())),
         };
@@ -1202,8 +1260,8 @@ async fn read_existing_text(
 
     let path = path.clone();
     blocking::unblock(move || match path.read_to_string() {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Ok(text) => Ok(ExistingText::Text(text)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(ExistingText::Missing),
         Err(error) => Err(read_file_local_error(&path.path, &error)),
     })
     .await
@@ -1714,3 +1772,6 @@ mod confinement_tests;
 
 #[cfg(test)]
 mod edit_approval_tests;
+
+#[cfg(test)]
+mod permission_preview_tests;

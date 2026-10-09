@@ -49,12 +49,17 @@ canonical absolute paths. Roots must be locally verifiable, even for editor I/O.
 The trusted editor must preserve confinement when accessing the path: ACP passes
 a path, not an atomic filesystem capability.
 
-`edit_file` rereads the document after approval and reports a conflict without
-writing if its contents changed while approval was pending. The user can reread
-and retry against the updated document. This does not guarantee atomicity against
-changes between that final read and the write. `write_file` creates new
-editor-managed files when the editor's preflight read returns `ResourceNotFound`;
-other read failures prevent the write.
+`edit_file` and `write_file` permission requests carry an ACP diff of the whole
+file, the exact change that approval will apply, so the editor can show it
+before approval. Both tools read the document before asking and again after
+approval, and report a conflict without writing if it changed, appeared or was
+deleted while approval was pending. The user can reread and retry against the
+updated document. This does not guarantee atomicity against changes between that
+final read and the write. `write_file` creates new editor-managed files when the
+editor's preflight read returns `ResourceNotFound`; other read failures prevent
+the write. When the editor writes files but does not offer reads, the old
+contents are unknown: the request carries no diff, the write proceeds without the
+conflict check, and its result reports text rather than a diff.
 
 `run_command` remains permission-gated host execution starting in `cwd`, **not a
 filesystem sandbox**. MCP tools have their own permission boundary; these file

@@ -164,6 +164,7 @@ async fn reject_always_is_remembered_before_mode_auto_approval()
             &call,
             ToolKind::Execute,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,
@@ -178,6 +179,7 @@ async fn reject_always_is_remembered_before_mode_auto_approval()
             &call,
             ToolKind::Execute,
             &requester,
+            None,
             &CancellationToken::new()
         )
         .await?,

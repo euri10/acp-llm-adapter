@@ -10,8 +10,8 @@ mod registry;
 mod search;
 
 pub(crate) use execution::require_tool_permission;
-pub(crate) use registry::{
-    AdapterToolRegistry, ToolContext, ToolExecution, ToolExecutor, ToolKind, ToolRegistry,
-};
 #[cfg(test)]
-pub(crate) use registry::{EmptyToolRegistry, ToolEdit};
+pub(crate) use registry::EmptyToolRegistry;
+pub(crate) use registry::{
+    AdapterToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolExecutor, ToolKind, ToolRegistry,
+};

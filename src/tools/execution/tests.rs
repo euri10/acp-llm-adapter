@@ -1955,6 +1955,7 @@ async fn require_tool_permission_propagates_request_error()
         &call,
         ToolKind::Edit,
         Some(&requester),
+        None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await;
