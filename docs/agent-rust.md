@@ -14,8 +14,7 @@ together with [testing](agent-testing.md).
   from an untested `rust-version` field.
 - Dependencies are pinned deliberately and updated by Dependabot, with daily
   Cargo and GitHub Actions checks in `.github/dependabot.yml`. Cargo uses the
-  default `auto` versioning strategy; it does not support `increase`. `renovate.json`
-  disables the previous updater. A major bump on
+  default `auto` versioning strategy; it does not support `increase`. A major bump on
   a protocol crate (`agent-client-protocol`, `rmcp`) is a deliberate change with
   a full regression pass, not a routine update.
 
