@@ -160,4 +160,4 @@ coverage, architecture, and the reusable `llm` library API.
 
 ## License
 
-MIT OR Apache-2.0.
+[MIT](LICENSE).

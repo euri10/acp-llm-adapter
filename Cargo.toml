@@ -4,7 +4,7 @@ version = "0.9.1"
 edition = "2024"
 rust-version = "1.95"
 description = "ACP adapter server that exposes LLM providers (DeepSeek, GLM, Groq) as agents to ACP-capable editors"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/euri10/acp-llm-adapter"
 readme = "README.md"
 # README screenshots load from GitHub by absolute URL; the crate never needs them.
