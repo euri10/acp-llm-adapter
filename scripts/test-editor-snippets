@@ -17,7 +17,7 @@ set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
 # Bump deliberately; the README "Tested with" lines name these versions.
-LOUISELM_REV=plugin-v0.2.0
+LOUISELM_REV=plugin-v0.3.0
 CODECOMPANION_REV=v19.27.0
 PLENARY_REV=74b06c6c75e4eeb3108ec01852001636d85a932b
 

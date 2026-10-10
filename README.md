@@ -12,7 +12,7 @@ OpenAI-compatible chat API.
 > and embedded file context, not images or audio, and elicitation is not
 > supported ([ACP coverage](docs/acp-coverage.md)).
 
-![LouiseLM chat with acp-llm-adapter: DeepSeek reads hello.py, edits it after approval in Ask mode, and the buffer shows the new docstring](https://raw.githubusercontent.com/euri10/acp-llm-adapter/main/docs/images/louiselm.png)
+![LouiseLM reviewing an acp-llm-adapter edit in Ask mode: the diff adds only a docstring to hello.py, above the Allow once / Allow always prompt](https://raw.githubusercontent.com/euri10/acp-llm-adapter/main/docs/images/louiselm.png)
 
 ## Install
 
@@ -62,7 +62,7 @@ assert(require("louiselm").setup({
 ```
 
 Then `:LouiselmChat`, as in the screenshot above. Tested with LouiseLM
-`plugin-v0.2.0` on Neovim 0.12.5, 2026-10-09.
+`plugin-v0.3.0` on Neovim 0.12.5, 2026-10-09.
 
 ### Zed
 
