@@ -168,6 +168,158 @@ async fn domain_turn_pairs_tool_history_and_cancels_remaining_calls() -> Result<
     Ok(())
 }
 
+fn domain_prompt(text: &str) -> PromptInput {
+    PromptInput {
+        session_id: "domain".into(),
+        text: text.into(),
+        title: None,
+    }
+}
+
+// Prompt admission: the size check passed, the session is claimed and the user
+// message is persisted, all before any provider work.
+#[test_log::test(tokio::test)]
+async fn admission_is_reported_once_before_provider_work() -> Result<(), AdapterError> {
+    let store = domain_store()?;
+    let reply = |text: &str| {
+        vec![
+            FakeStreamStep::Event(Ok(StreamEvent::Message(text.into()))),
+            FakeStreamStep::Event(Ok(StreamEvent::Finished(FinishReason::EndTurn))),
+        ]
+    };
+    let client = FakeLlmClient::with_streams(vec![reply("one"), reply("two")]);
+    let requests = client.requests();
+    // (prompt, user message index in history, provider requests made before it)
+    for (prompt, expected_index, earlier_requests) in [("first", 0, 0), ("second", 2, 1)] {
+        let mut events = Vec::new();
+        let mut provider_requests_at_admission = None;
+        super::handle_prompt_request(
+            &store,
+            &client,
+            &EmptyToolRegistry,
+            None,
+            domain_prompt(prompt),
+            DEFAULT_MAX_TURN_REQUESTS,
+            |event| {
+                if matches!(event, TurnEvent::Admitted { .. }) {
+                    provider_requests_at_admission = Some(
+                        requests
+                            .lock()
+                            .map_err(|e| AdapterError::Internal(e.to_string()))?
+                            .len(),
+                    );
+                }
+                events.push(event);
+                Ok(())
+            },
+        )
+        .await?;
+
+        let admitted: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::Admitted { history_index } => Some(*history_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(admitted, vec![expected_index], "{prompt}");
+        assert!(
+            matches!(events.first(), Some(TurnEvent::Admitted { .. })),
+            "{prompt}: admission must precede every other event"
+        );
+        assert_eq!(
+            provider_requests_at_admission,
+            Some(earlier_requests),
+            "{prompt}: admitted after provider work started"
+        );
+        store.with_session("domain", |record| {
+            let message = record.history.get(expected_index);
+            assert_eq!(message.map(ChatMessage::content), Some(prompt), "{prompt}");
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn admission_is_not_reported_for_refused_prompts() -> Result<(), Box<dyn std::error::Error>> {
+    let mut admitted = 0;
+    let mut count = |event: TurnEvent| {
+        if matches!(event, TurnEvent::Admitted { .. }) {
+            admitted += 1;
+        }
+        Ok(())
+    };
+    let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
+
+    // Oversized input fails the size check before the session is claimed.
+    let store = domain_store()?;
+    let oversized = "x".repeat(super::MAX_MESSAGE_BYTES + 1);
+    let refused = super::handle_prompt_request(
+        &store,
+        &client,
+        &EmptyToolRegistry,
+        None,
+        domain_prompt(&oversized),
+        DEFAULT_MAX_TURN_REQUESTS,
+        &mut count,
+    )
+    .await;
+    assert!(refused.is_err(), "oversized prompt was admitted");
+
+    // A session with an active turn cannot be claimed.
+    store.begin_turn(
+        "domain",
+        CancellationToken::new(),
+        ChatMessage::user("busy"),
+        None,
+    )?;
+    let refused = super::handle_prompt_request(
+        &store,
+        &client,
+        &EmptyToolRegistry,
+        None,
+        domain_prompt("while busy"),
+        DEFAULT_MAX_TURN_REQUESTS,
+        &mut count,
+    )
+    .await;
+    assert!(refused.is_err(), "busy session was admitted");
+
+    // An unpersisted prompt is not admitted.
+    let root = std::env::temp_dir().join(format!("acp-admission-disk-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&root, b"not a directory")?;
+    let store =
+        test_store().with_persistence(crate::session_store::FilesystemSessionStore::new(&root));
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    let refused = super::handle_prompt_request(
+        &store,
+        &client,
+        &EmptyToolRegistry,
+        None,
+        PromptInput {
+            session_id: session.session_id.0.to_string(),
+            text: "persist first".into(),
+            title: None,
+        },
+        DEFAULT_MAX_TURN_REQUESTS,
+        &mut count,
+    )
+    .await;
+    assert!(refused.is_err(), "unpersisted prompt was admitted");
+    std::fs::remove_file(root)?;
+
+    assert_eq!(admitted, 0);
+    assert!(
+        client
+            .requests()
+            .lock()
+            .map_err(|e| e.to_string())?
+            .is_empty()
+    );
+    Ok(())
+}
+
 async fn handle_prompt_request(
     store: &SessionStore,
     client: &dyn LlmClient,

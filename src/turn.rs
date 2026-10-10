@@ -56,6 +56,19 @@ pub(crate) struct PromptResult {
 /// Facts emitted by turn orchestration; adapters decide their wire encoding.
 #[derive(Debug)]
 pub(crate) enum TurnEvent {
+    /// The prompt is admitted: it passed the size check, claimed the session
+    /// and is persisted, before any provider work. Emitted once, first.
+    /// `history_index` locates the user message in the persisted history.
+    Admitted {
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "Read by the ACP v2 prompt acceptance (daa-acp-v2-37zc.3); v1 has no acceptance."
+            )
+        )]
+        history_index: usize,
+    },
     SessionInfo {
         title: Option<String>,
         updated_at: String,
@@ -441,6 +454,10 @@ pub(crate) async fn handle_prompt_request(
         store
             .persist_history(&session_id, &turn_setup.messages)
             .await?;
+        // The user message is the last entry of the persisted history.
+        notify(TurnEvent::Admitted {
+            history_index: turn_setup.messages.len().saturating_sub(1),
+        })?;
         notify(TurnEvent::SessionInfo {
             title: turn_setup.title_changed.then_some(turn_setup.title.clone()),
             updated_at: turn_setup.updated_at.clone(),

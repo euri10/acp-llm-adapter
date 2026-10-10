@@ -22,6 +22,8 @@ pub(crate) fn encode_event(
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<(), AdapterError> {
     let update = match event {
+        // v1 has no prompt acceptance; its session/prompt answers at turn end.
+        TurnEvent::Admitted { .. } => return Ok(()),
         TurnEvent::SessionInfo { title, updated_at } => {
             let mut info = SessionInfoUpdate::new().updated_at(updated_at);
             if let Some(title) = title {
