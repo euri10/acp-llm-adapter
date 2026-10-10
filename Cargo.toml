@@ -27,7 +27,7 @@ test-log = { version = "^0.2.21", default-features = false, features = [
 protocol-v2 = ["agent-client-protocol/unstable_protocol_v2"]
 
 [dependencies]
-agent-client-protocol = { version = "^3.1.0", features = ["process", "unstable"] }
+agent-client-protocol = { version = "^3.3.0", features = ["process", "unstable"] }
 blocking = "^1.7.0"
 # Directory-relative file I/O closes the path-validation/open symlink race.
 cap-std = "4.0.3"
