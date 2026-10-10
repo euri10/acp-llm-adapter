@@ -322,7 +322,15 @@ async fn serve_with_transport_impl(
 
     // The draft v2 probe gets its own implementation; v1 traffic is unchanged.
     #[cfg(feature = "protocol-v2")]
-    let agent = Agent.protocol_router().with_v1(v1).with_v2(v2::agent());
+    let agent = Agent
+        .protocol_router()
+        .with_v1(v1)
+        .with_v2(v2::agent(v2::Services {
+            store,
+            llm_client,
+            tool_registry,
+            max_turn_requests,
+        }));
     #[cfg(not(feature = "protocol-v2"))]
     let agent = v1;
     agent.connect_to(transport).await
@@ -665,19 +673,26 @@ fn replay_message_id(
     role: MessageRole,
     content: &str,
 ) -> MessageId {
+    derived_message_id(session_id.0.as_ref(), message_index, role, content).into()
+}
+
+/// The stable ID of a persisted history message, the same in every protocol
+/// version and on every replay: derived from the session, the message's
+/// position in the persisted history, its role and its content.
+pub(crate) fn derived_message_id(
+    session_id: &str,
+    message_index: usize,
+    role: MessageRole,
+    content: &str,
+) -> String {
     let role_name = match role {
         MessageRole::System => "system",
         MessageRole::User => "user",
         MessageRole::Assistant => "assistant",
         MessageRole::Tool => "tool",
     };
-    let name = format!(
-        "acp-llm-adapter:replay:{}:{message_index}:{role_name}:{content}",
-        session_id.0.as_ref(),
-    );
-    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes())
-        .to_string()
-        .into()
+    let name = format!("acp-llm-adapter:replay:{session_id}:{message_index}:{role_name}:{content}");
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
 }
 
 fn replayed_tool_call(tool_call: &ChatToolCall, history: &[ChatMessage]) -> AcpToolCall {

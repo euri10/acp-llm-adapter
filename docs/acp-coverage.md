@@ -12,8 +12,10 @@ may continue with v1 or disconnect.
 A draft ACP v2 probe exists behind the off-by-default `protocol-v2` cargo
 feature (daa-acp-v2-37zc). Built with it, `serve` routes each connection by
 its `initialize` request: v1 clients reach this unchanged implementation, and
-v2 clients a separate one that advertises the v2 session baseline. Released
-binaries do not include it.
+v2 clients a separate one implementing the v2 session baseline (new, list,
+resume with optional replay, close, prompt, cancel and updates) over the same
+session store and turn loop; tool execution and config options are not wired
+yet. Released binaries do not include it.
 
 Loading or resuming a session with an active turn is rejected at session
 publication, including when the turn began during restore setup. Cancellation

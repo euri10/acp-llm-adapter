@@ -61,10 +61,10 @@ pub(crate) enum TurnEvent {
     /// `history_index` locates the user message in the persisted history.
     Admitted {
         #[cfg_attr(
-            not(test),
+            not(any(test, feature = "protocol-v2")),
             expect(
                 dead_code,
-                reason = "Read by the ACP v2 prompt acceptance (daa-acp-v2-37zc.3); v1 has no acceptance."
+                reason = "Only ACP v2 prompt acceptance reads it; v1 has no acceptance."
             )
         )]
         history_index: usize,
