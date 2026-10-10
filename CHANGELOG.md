@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4](https://github.com/euri10/acp-llm-adapter/compare/v0.9.3...v0.9.4) - 2026-10-10
+
+### Added
+
+- implement the ACP v2 session baseline behind protocol-v2
+- route ACP v2 connections behind the protocol-v2 feature
+- report prompt admission from the turn loop
+
+### Other
+
+- *(deps)* upgrade agent-client-protocol to 3.3.0
+- plan ACP v2 probe and define prompt admission
+- show LouiseLM 0.3.0 edit review in README
+- show permission diff previews in Zed and CodeCompanion shots
+- record verified 0.9.3 release
+
 ## [0.9.3](https://github.com/euri10/acp-llm-adapter/compare/v0.9.2...v0.9.3) - 2026-10-09
 
 ### Added
