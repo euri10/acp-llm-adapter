@@ -38,6 +38,8 @@ pub(crate) mod requesters;
 pub(crate) use requesters::*;
 pub(crate) mod session_options;
 pub(crate) mod turn_events;
+#[cfg(feature = "protocol-v2")]
+pub(crate) mod v2;
 use session_options::{default_session_modes, session_modes};
 
 #[cfg(test)]
@@ -124,7 +126,7 @@ async fn serve_with_transport_impl(
     let close_session_store = store.clone();
     let delete_session_store = store.clone();
 
-    Agent
+    let v1 = Agent
         .builder()
         .name("acp-llm-adapter")
         .on_receive_request(
@@ -316,9 +318,14 @@ async fn serve_with_transport_impl(
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
-        )
-        .connect_to(transport)
-        .await
+        );
+
+    // The draft v2 probe gets its own implementation; v1 traffic is unchanged.
+    #[cfg(feature = "protocol-v2")]
+    let agent = Agent.protocol_router().with_v1(v1).with_v2(v2::agent());
+    #[cfg(not(feature = "protocol-v2"))]
+    let agent = v1;
+    agent.connect_to(transport).await
 }
 
 /// The initialize handshake has no session yet, so it is deliberately traced
@@ -863,7 +870,7 @@ pub(crate) async fn handle_prompt_request(
 }
 
 pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> InitializeResponse {
-    InitializeResponse::new(ProtocolVersion::LATEST)
+    InitializeResponse::new(ProtocolVersion::V1)
         .agent_capabilities(
             AgentCapabilities::new()
                 .load_session(true)

@@ -277,9 +277,9 @@ async fn prompt_uses_final_text_block_for_session_title() -> Result<(), agent_cl
 
 #[test_log::test]
 fn build_initialize_response_advertises_expected_caps() {
-    let response = build_initialize_response(ProtocolVersion::LATEST);
+    let response = build_initialize_response(ProtocolVersion::V1);
 
-    assert_eq!(response.protocol_version, ProtocolVersion::LATEST);
+    assert_eq!(response.protocol_version, ProtocolVersion::V1);
     assert_eq!(
         response.agent_info,
         Some(Implementation::new(
@@ -345,14 +345,14 @@ fn build_initialize_response_uses_latest_supported_protocol_version()
 
     let response = build_initialize_response(unsupported_protocol_version);
 
-    assert_eq!(response.protocol_version, ProtocolVersion::LATEST);
+    assert_eq!(response.protocol_version, ProtocolVersion::V1);
     Ok(())
 }
 
 #[test_log::test]
 fn initialize_handshake_records_client_capabilities() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
-    let request = InitializeRequest::new(ProtocolVersion::LATEST).client_capabilities(
+    let request = InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
         ClientCapabilities::new()
             .fs(FileSystemCapabilities::new()
                 .read_text_file(true)
@@ -362,7 +362,7 @@ fn initialize_handshake_records_client_capabilities() -> Result<(), agent_client
 
     let response = handle_initialize_request(&store, request)?;
 
-    assert_eq!(response.protocol_version, ProtocolVersion::LATEST);
+    assert_eq!(response.protocol_version, ProtocolVersion::V1);
     let guard = store
         .state
         .lock()
@@ -995,7 +995,7 @@ async fn serve_with_transport_handles_authenticate_and_mode_updates()
         .builder()
         .connect_with(client_transport, async move |cx| {
             let initialize_response = cx
-                .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
             assert!(initialize_response.agent_capabilities.load_session);
@@ -1597,7 +1597,7 @@ async fn serve_with_transport_exercises_list_close_and_logout()
     Agent
         .builder()
         .connect_with(client_transport, async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::LATEST))
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
 
@@ -1657,7 +1657,7 @@ async fn serve_with_transport_drives_new_session_config_prompt_and_cancel()
     Agent
         .builder()
         .connect_with(client_transport, async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::LATEST))
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
 

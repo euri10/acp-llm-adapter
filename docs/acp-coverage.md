@@ -9,6 +9,12 @@ A client that asks for version 2 is answered with 1, as
 [version negotiation](https://agentclientprotocol.com/protocol/v1/initialization#version-negotiation) prescribes, and
 may continue with v1 or disconnect.
 
+A draft ACP v2 probe exists behind the off-by-default `protocol-v2` cargo
+feature (daa-acp-v2-37zc). Built with it, `serve` routes each connection by
+its `initialize` request: v1 clients reach this unchanged implementation, and
+v2 clients a separate one that advertises the v2 session baseline. Released
+binaries do not include it.
+
 Loading or resuming a session with an active turn is rejected at session
 publication, including when the turn began during restore setup. Cancellation
 continues to target the original turn until its cleanup completes.

@@ -203,7 +203,7 @@ pub(crate) async fn run_smoke_flow(
         )
         .connect_with(transport, async move |cx| {
             let initialize_response = cx
-                .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
             let mut session = cx.build_session_cwd()?.block_task().start_session().await?;
@@ -510,7 +510,7 @@ mod tests {
 
         assert_eq!(
             result.initialize_response.protocol_version,
-            ProtocolVersion::LATEST
+            ProtocolVersion::V1
         );
         assert!(
             result
@@ -615,7 +615,7 @@ mod tests {
     #[test_log::test]
     fn print_dev_smoke_result_is_callable() {
         let result = DevSmokeResult {
-            initialize_response: build_initialize_response(ProtocolVersion::LATEST),
+            initialize_response: build_initialize_response(ProtocolVersion::V1),
             new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
                 "session-1",
             ),
@@ -878,7 +878,7 @@ mod tests {
     #[test_log::test]
     fn dev_smoke_result_clones() {
         let original = DevSmokeResult {
-            initialize_response: build_initialize_response(ProtocolVersion::LATEST),
+            initialize_response: build_initialize_response(ProtocolVersion::V1),
             new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
                 "session-clone",
             ),
@@ -889,7 +889,7 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(
             cloned.initialize_response.protocol_version,
-            ProtocolVersion::LATEST
+            ProtocolVersion::V1
         );
         assert_eq!(
             cloned.new_session_response.session_id.0.as_ref(),
@@ -903,7 +903,7 @@ mod tests {
     #[test_log::test]
     fn print_dev_smoke_result_handles_empty_updates() {
         let result = DevSmokeResult {
-            initialize_response: build_initialize_response(ProtocolVersion::LATEST),
+            initialize_response: build_initialize_response(ProtocolVersion::V1),
             new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
                 "session-empty",
             ),

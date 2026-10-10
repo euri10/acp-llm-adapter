@@ -36,6 +36,11 @@ cargo test --locked --all-features -q 2>&1 | grep -E "^test result|FAILED"
 cargo fmt --all && cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 
+# 3b. The released configuration. --all-features also enables the draft
+#     protocol-v2 probe, so check default features separately.
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --test serve_protocol_v2
+
 # 4. Public documentation.
 cargo doc --locked --no-deps --all-features   # RUSTDOCFLAGS="-D warnings" in CI
 ```
