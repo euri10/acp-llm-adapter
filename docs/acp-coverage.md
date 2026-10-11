@@ -14,8 +14,10 @@ feature (daa-acp-v2-37zc). Built with it, `serve` routes each connection by
 its `initialize` request: v1 clients reach this unchanged implementation, and
 v2 clients a separate one implementing the v2 session baseline (new, list,
 resume with optional replay, close, prompt, cancel and updates) over the same
-session store and turn loop; tool execution and config options are not wired
-yet. Released binaries do not include it.
+session store and turn loop, with config options for mode, model and effort,
+and tools that always run locally (v2 has no client file system or terminal)
+behind the same permission gating as v1. Edit permission requests carry no
+diff preview in v2 yet. Released binaries do not include it.
 
 Loading or resuming a session with an active turn is rejected at session
 publication, including when the turn began during restore setup. Cancellation

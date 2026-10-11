@@ -291,6 +291,13 @@ pub(crate) struct MockLlmClient;
 /// ```
 pub(crate) const MOCK_TOOL_DIRECTIVE: &str = "!tool run_command ";
 
+/// Prompt prefixes the mock answers with a tool call: the prefix, the tool it
+/// calls, and the argument that receives everything after the prefix.
+const MOCK_TOOL_DIRECTIVES: [(&str, &str, &str); 2] = [
+    (MOCK_TOOL_DIRECTIVE, "run_command", "command"),
+    ("!tool read_file ", "read_file", "path"),
+];
+
 /// Tool-call id the mock reports, fixed so tests can match on it.
 const MOCK_TOOL_CALL_ID: &str = "mock-tool-call-0";
 
@@ -320,21 +327,27 @@ impl LlmClient for MockLlmClient {
             |message| message.content().to_owned(),
         );
 
-        if let Some(command) = prompt
-            .split_once(MOCK_TOOL_DIRECTIVE)
-            .map(|(_, command)| command.trim())
-            .filter(|command| !command.is_empty())
+        if let Some((tool, argument, value)) =
+            MOCK_TOOL_DIRECTIVES
+                .iter()
+                .find_map(|(prefix, tool, argument)| {
+                    prompt
+                        .split_once(prefix)
+                        .map(|(_, value)| value.trim())
+                        .filter(|value| !value.is_empty())
+                        .map(|value| (*tool, *argument, value))
+                })
         {
             // Split across deltas the way a provider streams one: metadata
             // first, arguments after, then a ToolCalls finish reason. A caller
             // that only works against a single combined delta would pass here
             // and fail against the real thing.
-            let arguments = serde_json::json!({ "command": command }).to_string();
+            let arguments = serde_json::json!({ argument: value }).to_string();
             let events = vec![
                 Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
                     0,
                     Some(MOCK_TOOL_CALL_ID.to_owned()),
-                    Some("run_command".to_owned()),
+                    Some(tool.to_owned()),
                     None,
                 ))),
                 Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
@@ -720,6 +733,28 @@ mod tests {
         assert_eq!(metadata.arguments(), None);
         assert_eq!(arguments.index(), metadata.index());
         assert_eq!(arguments.arguments(), Some(r#"{"command":"echo hello"}"#));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mock_client_turns_the_read_directive_into_a_read_file_call()
+    -> Result<(), agent_client_protocol::Error> {
+        let events = drain(
+            &MockLlmClient,
+            ChatRequest::new(vec![ChatMessage::user("!tool read_file notes.txt")]),
+        )
+        .await?;
+        let [
+            StreamEvent::ToolCallDelta(metadata),
+            StreamEvent::ToolCallDelta(arguments),
+            StreamEvent::Finished(FinishReason::ToolCalls),
+        ] = events.as_slice()
+        else {
+            return Err(agent_client_protocol::Error::internal_error()
+                .data(format!("unexpected mock events: {events:?}")));
+        };
+        assert_eq!(metadata.name(), Some("read_file"));
+        assert_eq!(arguments.arguments(), Some(r#"{"path":"notes.txt"}"#));
         Ok(())
     }
 

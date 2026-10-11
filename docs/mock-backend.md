@@ -11,6 +11,13 @@ cancellation part-way through a command — prefix a prompt with
 !tool run_command sleep 300
 ```
 
+`!tool read_file ` works the same way for a `read_file` call; everything after
+the prefix is the path:
+
+```text
+!tool read_file notes.txt
+```
+
 The mock then answers with a `run_command` tool call, streamed as the metadata
 and argument deltas a real provider sends, and closes the turn once the tool
 result comes back. This is a documented affordance of the mock rather than a

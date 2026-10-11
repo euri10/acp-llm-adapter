@@ -7,9 +7,10 @@
 //! confinement are not duplicated.
 //!
 //! The probe implements the v2 session baseline (new, list, resume, close,
-//! prompt, cancel and updates). Tool execution and config options are added by
-//! daa-acp-v2-37zc.4; until then this module runs turns without a tool
-//! executor.
+//! prompt, cancel and updates), config options (mode, model, effort) and tool
+//! execution. v2 has no client file system or terminal, so tools always run
+//! locally; permission prompts go through the shared v1 gating logic and are
+//! translated to v2 `session/request_permission` at this edge.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -18,7 +19,12 @@ use acp_llm_adapter::llm::{LlmClient, MessageRole};
 use agent_client_protocol::schema::v1;
 use agent_client_protocol::schema::{ProtocolVersion, v2};
 use agent_client_protocol::{Agent, Client, ConnectTo, Responder, V2ConnectionTo};
+use futures_util::future::BoxFuture;
 
+use super::{
+    EditorTools, PermissionRequester, ReadTextFileRequester, TerminalRequester,
+    ToolProgressReporter, WriteTextFileRequester,
+};
 use crate::session_store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::turn::{PromptInput, PromptResult, TurnEvent};
@@ -46,7 +52,8 @@ impl std::fmt::Debug for Services {
 
 /// The v2 implementation handed to `Agent.protocol_router()`.
 pub(crate) fn agent(services: Services) -> impl ConnectTo<Client> {
-    let (new, list, resume, close, prompt, cancel) = (
+    let (new, list, resume, close, prompt, config, cancel) = (
+        services.clone(),
         services.clone(),
         services.clone(),
         services.clone(),
@@ -125,6 +132,14 @@ pub(crate) fn agent(services: Services) -> impl ConnectTo<Client> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            async move |request: v2::SetSessionConfigOptionRequest,
+                        responder: Responder<v2::SetSessionConfigOptionResponse>,
+                        _connection: V2ConnectionTo<Client>| {
+                responder.respond_with_result(set_config_option(&config.store, &request))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_notification(
             async move |notification: v2::CancelSessionNotification,
                         _connection: V2ConnectionTo<Client>| {
@@ -172,7 +187,9 @@ fn new_session(
     reject_unadvertised(&request.mcp_servers, &request.additional_directories)?;
     let created =
         super::handle_new_session_request(store, &v1::NewSessionRequest::new(&request.cwd.0))?;
-    Ok(v2::NewSessionResponse::new(created.session_id.to_string())
+    let session_id = created.session_id.to_string();
+    Ok(v2::NewSessionResponse::new(session_id.clone())
+        .config_options(config_options(store, &session_id)?)
         .available_commands(available_commands()))
 }
 
@@ -236,7 +253,9 @@ async fn resume_session(
                 .data("only replayFrom start is supported"));
         }
     }
-    Ok(v2::ResumeSessionResponse::new().available_commands(available_commands()))
+    Ok(v2::ResumeSessionResponse::new()
+        .config_options(config_options(store, &request.session_id.to_string())?)
+        .available_commands(available_commands()))
 }
 
 /// Translate v1's history replay into v2 whole-message snapshots.
@@ -314,17 +333,24 @@ async fn run_prompt(
     connection: &V2ConnectionTo<Client>,
 ) -> AcpResult<()> {
     let session_id = request.session_id.clone();
+    if is_clear_command(&request) {
+        return clear_history(services, &session_id, responder, connection).await;
+    }
     let input = match prompt_input(&request) {
         Ok(input) => input,
         Err(error) => return responder.respond_with_error(error),
     };
     let user_text = input.text.clone();
     let mut responder = Some(responder);
+    let tools = V2Tools {
+        connection: connection.clone(),
+    };
+    let executor = EditorTools(Some(&tools));
     let result = crate::turn::handle_prompt_request(
         &services.store,
         services.llm_client.as_ref(),
         services.tool_registry.as_ref(),
-        None,
+        Some(&executor),
         input,
         services.max_turn_requests,
         |event| {
@@ -347,7 +373,7 @@ async fn run_prompt(
                 )?;
                 return Ok(send(connection, &session_id, running())?);
             }
-            match turn_update(event) {
+            match turn_update(&services.store, &session_id.to_string(), event)? {
                 Some(update) => Ok(send(connection, &session_id, update)?),
                 None => Ok(()),
             }
@@ -376,10 +402,18 @@ async fn run_prompt(
 }
 
 /// Encode a turn event as a v2 update. Prompt admission is handled by the
-/// caller; mode changes arrive with config options (daa-acp-v2-37zc.4).
-fn turn_update(event: TurnEvent) -> Option<v2::SessionUpdate> {
-    Some(match event {
-        TurnEvent::Admitted { .. } | TurnEvent::ModeChanged(_) => return None,
+/// caller. A mode change reports the session's config options, as the `mode`
+/// option carries it in v2.
+fn turn_update(
+    store: &SessionStore,
+    session_id: &str,
+    event: TurnEvent,
+) -> AcpResult<Option<v2::SessionUpdate>> {
+    Ok(Some(match event {
+        TurnEvent::Admitted { .. } => return Ok(None),
+        TurnEvent::ModeChanged(_) => v2::SessionUpdate::ConfigOptionUpdate(
+            v2::ConfigOptionUpdate::new(config_options(store, session_id)?),
+        ),
         TurnEvent::SessionInfo { title, updated_at } => {
             let mut info = v2::SessionInfoUpdate::new().updated_at(updated_at);
             if let Some(title) = title {
@@ -414,6 +448,11 @@ fn turn_update(event: TurnEvent) -> Option<v2::SessionUpdate> {
                 } else {
                     v2::ToolCallStatus::Failed
                 })
+                // The tool's output; edits report text too, since the v2 diff
+                // format is outside the probe.
+                .content(vec![v2::ToolCallContent::Content(Box::new(
+                    v2::Content::new(result.content),
+                ))])
                 .raw_output(result.raw_output),
         ),
         TurnEvent::Usage {
@@ -431,7 +470,233 @@ fn turn_update(event: TurnEvent) -> Option<v2::SessionUpdate> {
             }
             v2::SessionUpdate::UsageUpdate(update)
         }
+    }))
+}
+
+/// `/clear` alone clears the conversation, as in v1: no provider request and
+/// no inserted message, so the acceptance carries a fresh message ID.
+fn is_clear_command(request: &v2::PromptRequest) -> bool {
+    matches!(request.prompt.as_slice(), [v2::ContentBlock::Text(text)] if text.text.trim() == "/clear")
+}
+
+async fn clear_history(
+    services: &Services,
+    session_id: &v2::SessionId,
+    responder: Responder<v2::PromptResponse>,
+    connection: &V2ConnectionTo<Client>,
+) -> AcpResult<()> {
+    if let Err(error) = services.store.clear_history(&session_id.to_string()).await {
+        return responder.respond_with_error(error.into());
+    }
+    responder.respond(v2::PromptResponse::new(uuid::Uuid::new_v4().to_string()))?;
+    send(connection, session_id, running())?;
+    send(
+        connection,
+        session_id,
+        v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+            "Conversation history cleared.".into(),
+            uuid::Uuid::new_v4().to_string(),
+        )),
+    )?;
+    send(connection, session_id, idle(Some(v2::StopReason::EndTurn)))
+}
+
+/// The session's config options in v2 shape. v1 and v2 share the option
+/// structure except that v2 names the identifier `configId`; deserializing
+/// checks every other field, so a divergence fails loudly here.
+fn config_options(
+    store: &SessionStore,
+    session_id: &str,
+) -> AcpResult<Vec<v2::SessionConfigOption>> {
+    store
+        .session_config_options(session_id)?
+        .into_iter()
+        .map(|option| {
+            let mut json = serde_json::to_value(option)
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            if let Some(object) = json.as_object_mut()
+                && let Some(id) = object.remove("id")
+            {
+                object.insert("configId".into(), id);
+            }
+            serde_json::from_value(json).map_err(agent_client_protocol::Error::into_internal_error)
+        })
+        .collect()
+}
+
+fn set_config_option(
+    store: &SessionStore,
+    request: &v2::SetSessionConfigOptionRequest,
+) -> AcpResult<v2::SetSessionConfigOptionResponse> {
+    let value = match &request.value {
+        v2::SessionConfigOptionValue::Id { value } => v1::SessionConfigOptionValue::ValueId {
+            value: value.to_string().into(),
+        },
+        v2::SessionConfigOptionValue::Boolean { value } => {
+            v1::SessionConfigOptionValue::Boolean { value: *value }
+        }
+        _ => {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("unsupported session config option value"));
+        }
+    };
+    let session_id = request.session_id.to_string();
+    // The response carries the complete option list, so the v1 handler's
+    // follow-up notifications have nothing to add.
+    super::handle_set_session_config_option_request_notifying(
+        store,
+        &v1::SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            request.config_id.to_string(),
+            value,
+        ),
+        |_| Ok(()),
+    )?;
+    Ok(v2::SetSessionConfigOptionResponse::new(config_options(
+        store,
+        &session_id,
+    )?))
+}
+
+/// The tool layer's view of a v2 connection. Permission prompts reach the
+/// client as v2 requests; v2 has no client file system or terminal, so those
+/// requests are refused (v2 sessions advertise no such capability, so the
+/// tool layer runs file and command tools locally and never calls them).
+struct V2Tools {
+    connection: V2ConnectionTo<Client>,
+}
+
+type RequestFuture<'a, T> = BoxFuture<'a, AcpResult<T>>;
+
+fn no_client_capability<'a, T: Send + 'a>(what: &'static str) -> RequestFuture<'a, T> {
+    Box::pin(async move {
+        Err(agent_client_protocol::Error::invalid_request()
+            .data(format!("ACP v2 has no client {what}")))
     })
+}
+
+impl ReadTextFileRequester for V2Tools {
+    fn read_text_file(
+        &self,
+        _: v1::ReadTextFileRequest,
+    ) -> RequestFuture<'_, v1::ReadTextFileResponse> {
+        no_client_capability("file system")
+    }
+}
+
+impl WriteTextFileRequester for V2Tools {
+    fn write_text_file(
+        &self,
+        _: v1::WriteTextFileRequest,
+    ) -> RequestFuture<'_, v1::WriteTextFileResponse> {
+        no_client_capability("file system")
+    }
+}
+
+impl TerminalRequester for V2Tools {
+    fn create_terminal(
+        &self,
+        _: v1::CreateTerminalRequest,
+    ) -> RequestFuture<'_, v1::CreateTerminalResponse> {
+        no_client_capability("terminal")
+    }
+    fn terminal_output(
+        &self,
+        _: v1::TerminalOutputRequest,
+    ) -> RequestFuture<'_, v1::TerminalOutputResponse> {
+        no_client_capability("terminal")
+    }
+    fn wait_for_terminal_exit(
+        &self,
+        _: v1::WaitForTerminalExitRequest,
+    ) -> RequestFuture<'_, v1::WaitForTerminalExitResponse> {
+        no_client_capability("terminal")
+    }
+    fn release_terminal(
+        &self,
+        _: v1::ReleaseTerminalRequest,
+    ) -> RequestFuture<'_, v1::ReleaseTerminalResponse> {
+        no_client_capability("terminal")
+    }
+    fn kill_terminal(
+        &self,
+        _: v1::KillTerminalRequest,
+    ) -> RequestFuture<'_, v1::KillTerminalResponse> {
+        no_client_capability("terminal")
+    }
+}
+
+impl PermissionRequester for V2Tools {
+    fn request_permission(
+        &self,
+        request: v1::RequestPermissionRequest,
+    ) -> RequestFuture<'_, v1::RequestPermissionResponse> {
+        let request = permission_request(request);
+        Box::pin(async move {
+            let response = self.connection.send_request(request).block_task().await?;
+            Ok(v1::RequestPermissionResponse::new(match response.outcome {
+                v2::RequestPermissionOutcome::Selected(selected) => {
+                    v1::RequestPermissionOutcome::Selected(v1::SelectedPermissionOutcome::new(
+                        selected.option_id.to_string(),
+                    ))
+                }
+                // Cancelled, or an outcome this probe does not know: deny.
+                _ => v1::RequestPermissionOutcome::Cancelled,
+            }))
+        })
+    }
+}
+
+impl ToolProgressReporter for V2Tools {
+    fn report_in_progress(&self, session_id: &v1::SessionId, tool_call_id: &str) {
+        // Best effort, as in v1: a lost progress hint must not fail the tool.
+        let _ = send(
+            &self.connection,
+            &session_id.to_string().into(),
+            v2::SessionUpdate::ToolCallUpdate(
+                v2::ToolCallUpdate::new(tool_call_id.to_string())
+                    .status(v2::ToolCallStatus::InProgress),
+            ),
+        );
+    }
+}
+
+/// Translate the shared gating logic's v1 request into v2's: the tool call is
+/// the subject, and the options keep their identifiers.
+fn permission_request(request: v1::RequestPermissionRequest) -> v2::RequestPermissionRequest {
+    let call = request.tool_call;
+    let title = call
+        .fields
+        .title
+        .clone()
+        .unwrap_or_else(|| "Run tool".to_owned());
+    let mut tool_call = v2::ToolCallUpdate::new(call.tool_call_id.to_string())
+        .title(title.clone())
+        .status(v2::ToolCallStatus::Pending);
+    if let Some(kind) = call.fields.kind {
+        tool_call = tool_call.kind(v2_tool_kind(kind.into()));
+    }
+    if let Some(raw_input) = call.fields.raw_input {
+        tool_call = tool_call.raw_input(raw_input);
+    }
+    let options = request
+        .options
+        .into_iter()
+        .map(|option| {
+            let kind = match option.kind {
+                v1::PermissionOptionKind::AllowOnce => v2::PermissionOptionKind::AllowOnce,
+                v1::PermissionOptionKind::AllowAlways => v2::PermissionOptionKind::AllowAlways,
+                v1::PermissionOptionKind::RejectOnce => v2::PermissionOptionKind::RejectOnce,
+                _ => v2::PermissionOptionKind::RejectAlways,
+            };
+            v2::PermissionOption::new(option.option_id.to_string(), option.name, kind)
+        })
+        .collect();
+    v2::RequestPermissionRequest::new(request.session_id.to_string(), title, options).subject(
+        v2::RequestPermissionSubject::ToolCall(Box::new(v2::ToolCallPermissionSubject::new(
+            tool_call,
+        ))),
+    )
 }
 
 fn stop_reason(result: &PromptResult) -> v2::StopReason {
@@ -530,26 +795,29 @@ mod tests {
     }
 
     #[test]
-    fn turn_events_encode_as_v2_updates() -> Result<(), String> {
+    fn turn_events_encode_as_v2_updates() -> Result<(), Box<dyn std::error::Error>> {
+        let store = crate::test_store();
+        let encode = |event| turn_update(&store, "unused", event);
         let message = |thought| TurnEvent::Message {
             text: "hi".into(),
             message_id: "m-1".into(),
             thought,
         };
         assert!(matches!(
-            turn_update(message(false)),
+            encode(message(false))?,
             Some(v2::SessionUpdate::AgentMessageChunk(chunk)) if chunk.message_id.to_string() == "m-1"
         ));
         assert!(matches!(
-            turn_update(message(true)),
+            encode(message(true))?,
             Some(v2::SessionUpdate::AgentThoughtChunk(_))
         ));
-        assert!(turn_update(TurnEvent::Admitted { history_index: 0 }).is_none());
-        let Some(v2::SessionUpdate::UsageUpdate(usage)) = turn_update(TurnEvent::Usage {
+        assert!(encode(TurnEvent::Admitted { history_index: 0 })?.is_none());
+        let Some(v2::SessionUpdate::UsageUpdate(usage)) = encode(TurnEvent::Usage {
             used: 10,
             size: 100,
             cost_micros: Some(1_500_000),
-        }) else {
+        })?
+        else {
             return Err("usage was not encoded".into());
         };
         assert_eq!((usage.used, usage.size), (10, 100));

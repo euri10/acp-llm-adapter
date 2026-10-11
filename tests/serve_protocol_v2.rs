@@ -125,6 +125,8 @@ struct V2Connection {
     stdin: tokio::process::ChildStdin,
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     notifications: Vec<Value>,
+    /// Requests the agent sent us (e.g. permission prompts), unanswered.
+    incoming: Vec<Value>,
     next_id: u64,
     state_dir: std::path::PathBuf,
 }
@@ -155,6 +157,7 @@ impl V2Connection {
             stdin,
             lines,
             notifications: Vec::new(),
+            incoming: Vec::new(),
             next_id: 1,
             state_dir,
         };
@@ -189,6 +192,8 @@ impl V2Connection {
         let message: Value = serde_json::from_str(&line)?;
         if message.get("method").and_then(Value::as_str) == Some("session/update") {
             self.notifications.push(message.clone());
+        } else if message.get("method").is_some() && message.get("id").is_some() {
+            self.incoming.push(message.clone());
         }
         Ok(message)
     }
@@ -206,6 +211,54 @@ impl V2Connection {
             .iter()
             .filter_map(|message| message.pointer("/params/update").cloned())
             .collect())
+    }
+
+    /// Wait for the agent to send a request with `method`, and take it.
+    async fn wait_request(&mut self, method: &str) -> Result<Value, Box<dyn Error>> {
+        loop {
+            if let Some(index) = self
+                .incoming
+                .iter()
+                .position(|request| request["method"] == method)
+            {
+                return Ok(self.incoming.remove(index));
+            }
+            self.next_message().await?;
+        }
+    }
+
+    async fn respond(&mut self, request: &Value, result: Value) -> Result<(), Box<dyn Error>> {
+        let response = json!({"jsonrpc":"2.0", "id": request["id"], "result": result});
+        self.stdin
+            .write_all(format!("{response}\n").as_bytes())
+            .await?;
+        Ok(())
+    }
+
+    /// Send a request without waiting for its response; returns its id.
+    async fn send(&mut self, method: &str, params: Value) -> Result<u64, Box<dyn Error>> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
+        self.stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await?;
+        Ok(id)
+    }
+
+    async fn new_session(
+        &mut self,
+        cwd: &std::path::Path,
+    ) -> Result<(String, Value), Box<dyn Error>> {
+        let created = self.request("session/new", json!({"cwd": cwd})).await?;
+        let session_id = created
+            .pointer("/result/sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("session/new failed: {created}"))?
+            .to_owned();
+        let mark = self.notifications.len();
+        self.until_idle(mark).await?;
+        Ok((session_id, created))
     }
 
     async fn stop(mut self) -> Result<(), Box<dyn Error>> {
@@ -458,6 +511,242 @@ async fn v2_reports_failures_after_admission_as_an_error_stop_reason() -> Result
             .iter()
             .all(|message| !message.to_string().contains(SENTINEL)),
         "provider detail reached the client"
+    );
+    connection.stop().await
+}
+
+#[cfg(feature = "protocol-v2")]
+fn tool_updates(updates: &[Value]) -> Vec<&Value> {
+    updates
+        .iter()
+        .filter(|update| update["sessionUpdate"] == "tool_call_update")
+        .collect()
+}
+
+#[cfg(feature = "protocol-v2")]
+#[tokio::test]
+async fn v2_config_options_expose_modes_and_plan_refuses_commands() -> Result<(), Box<dyn Error>> {
+    let mut connection = V2Connection::start().await?;
+    let (session_id, created) = connection.new_session(&std::env::temp_dir()).await?;
+    let mode = |options: &Value| {
+        options
+            .as_array()
+            .and_then(|options| options.iter().find(|option| option["configId"] == "mode"))
+            .map(|option| option["currentValue"].clone())
+    };
+    assert_eq!(
+        mode(&created["result"]["configOptions"]),
+        Some(json!("ask")),
+        "{created}"
+    );
+
+    let set = connection
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session_id, "configId": "mode", "type": "id", "value": "plan"}),
+        )
+        .await?;
+    assert_eq!(
+        mode(&set["result"]["configOptions"]),
+        Some(json!("plan")),
+        "{set}"
+    );
+
+    // Plan refuses execution before any permission prompt.
+    let mark = connection.notifications.len();
+    connection
+        .request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type":"text","text":"!tool run_command echo planned"}]}),
+        )
+        .await?;
+    let turn = connection.until_idle(mark).await?;
+    assert!(
+        connection.incoming.is_empty(),
+        "plan mode asked for permission"
+    );
+    assert!(
+        tool_updates(&turn)
+            .iter()
+            .any(|update| update["status"] == "failed"),
+        "{turn:?}"
+    );
+    connection.stop().await
+}
+
+#[cfg(feature = "protocol-v2")]
+#[tokio::test]
+async fn v2_runs_gated_commands_and_confined_reads_locally() -> Result<(), Box<dyn Error>> {
+    let cwd = std::env::temp_dir().join(format!("acp-v2-tools-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&cwd)?;
+    std::fs::write(cwd.join("notes.txt"), "local notes\n")?;
+    let mut connection = V2Connection::start().await?;
+    let (session_id, _) = connection.new_session(&cwd).await?;
+
+    // read_file runs locally, confined to the session directory, unprompted.
+    let mark = connection.notifications.len();
+    connection
+        .request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type":"text","text":"!tool read_file notes.txt"}]}),
+        )
+        .await?;
+    let turn = connection.until_idle(mark).await?;
+    assert!(
+        connection.incoming.is_empty(),
+        "read_file asked for permission"
+    );
+    assert!(
+        tool_updates(&turn)
+            .iter()
+            .any(|update| update["status"] == "completed"
+                && update.to_string().contains("local notes")),
+        "{turn:?}"
+    );
+
+    // run_command waits for a v2 permission request about the tool call.
+    let mark = connection.notifications.len();
+    connection
+        .send(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type":"text","text":"!tool run_command echo v2-ran"}]}),
+        )
+        .await?;
+    let permission = connection
+        .wait_request("session/request_permission")
+        .await?;
+    assert_eq!(permission["params"]["sessionId"], json!(session_id));
+    assert_eq!(
+        permission["params"]["subject"]["type"], "tool_call",
+        "{permission}"
+    );
+    assert_eq!(
+        permission["params"]["subject"]["toolCall"]["toolCallId"],
+        "mock-tool-call-0"
+    );
+    let allow = permission["params"]["options"]
+        .as_array()
+        .and_then(|options| options.iter().find(|option| option["kind"] == "allow_once"))
+        .ok_or("no allow_once option")?["optionId"]
+        .clone();
+    connection
+        .respond(
+            &permission,
+            json!({"outcome": {"outcome": "selected", "optionId": allow}}),
+        )
+        .await?;
+    let turn = connection.until_idle(mark).await?;
+    assert!(
+        tool_updates(&turn)
+            .iter()
+            .any(|update| update["status"] == "in_progress"),
+        "{turn:?}"
+    );
+    assert!(
+        tool_updates(&turn)
+            .iter()
+            .any(|update| update["status"] == "completed" && update.to_string().contains("v2-ran")),
+        "{turn:?}"
+    );
+    connection.stop().await?;
+    std::fs::remove_dir_all(cwd)?;
+    Ok(())
+}
+
+#[cfg(feature = "protocol-v2")]
+#[tokio::test]
+async fn v2_switching_to_plan_revokes_a_pending_approval() -> Result<(), Box<dyn Error>> {
+    let cwd = std::env::temp_dir().join(format!("acp-v2-revoke-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&cwd)?;
+    let marker = cwd.join("must-not-exist");
+    let mut connection = V2Connection::start().await?;
+    let (session_id, _) = connection.new_session(&cwd).await?;
+    let mark = connection.notifications.len();
+    connection
+        .send(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [
+                {"type":"text","text": format!("!tool run_command touch {}", marker.display())}
+            ]}),
+        )
+        .await?;
+    let permission = connection
+        .wait_request("session/request_permission")
+        .await?;
+    let set = connection
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session_id, "configId": "mode", "type": "id", "value": "plan"}),
+        )
+        .await?;
+    assert!(set.get("result").is_some(), "{set}");
+    let allow = permission["params"]["options"]
+        .as_array()
+        .and_then(|options| options.iter().find(|option| option["kind"] == "allow_once"))
+        .ok_or("no allow_once option")?["optionId"]
+        .clone();
+    connection
+        .respond(
+            &permission,
+            json!({"outcome": {"outcome": "selected", "optionId": allow}}),
+        )
+        .await?;
+    let turn = connection.until_idle(mark).await?;
+    assert!(
+        !marker.exists(),
+        "an approval granted before Plan ran the command"
+    );
+    assert!(
+        tool_updates(&turn)
+            .iter()
+            .any(|update| update["status"] == "failed"),
+        "{turn:?}"
+    );
+    connection.stop().await?;
+    std::fs::remove_dir_all(cwd)?;
+    Ok(())
+}
+
+#[cfg(feature = "protocol-v2")]
+#[tokio::test]
+async fn v2_clear_command_empties_the_history() -> Result<(), Box<dyn Error>> {
+    let mut connection = V2Connection::start().await?;
+    let cwd = std::env::temp_dir();
+    let (session_id, _) = connection.new_session(&cwd).await?;
+    let prompt =
+        |text: &str| json!({"sessionId": session_id, "prompt": [{"type":"text","text":text}]});
+    let mark = connection.notifications.len();
+    connection
+        .request("session/prompt", prompt("hello"))
+        .await?;
+    connection.until_idle(mark).await?;
+
+    let mark = connection.notifications.len();
+    let cleared = connection
+        .request("session/prompt", prompt("/clear"))
+        .await?;
+    assert!(cleared.pointer("/result/messageId").is_some(), "{cleared}");
+    let turn = connection.until_idle(mark).await?;
+    assert!(
+        turn.iter()
+            .any(|update| update["content"]["text"] == "Conversation history cleared."),
+        "{turn:?}"
+    );
+    assert_eq!(
+        turn.last().map(|update| update["stopReason"].clone()),
+        Some(json!("end_turn"))
+    );
+
+    let mark = connection.notifications.len();
+    connection
+        .request(
+            "session/resume",
+            json!({"sessionId": session_id, "cwd": cwd, "replayFrom": {"type": "start"}}),
+        )
+        .await?;
+    assert!(
+        connection.notifications[mark..].is_empty(),
+        "cleared history was replayed"
     );
     connection.stop().await
 }
