@@ -17,7 +17,8 @@ resume with optional replay, close, prompt, cancel and updates) over the same
 session store and turn loop, with config options for mode, model and effort,
 and tools that always run locally (v2 has no client file system or terminal)
 behind the same permission gating as v1. Edit permission requests carry no
-diff preview in v2 yet. Released binaries do not include it.
+diff preview in v2 yet. Released binaries do not include it. See
+[ACP v2 probe](protocol-v2.md) for what it covers and what it found.
 
 Loading or resuming a session with an active turn is rejected at session
 publication, including when the turn began during restore setup. Cancellation

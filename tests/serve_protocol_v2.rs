@@ -750,3 +750,156 @@ async fn v2_clear_command_empties_the_history() -> Result<(), Box<dyn Error>> {
     );
     connection.stop().await
 }
+
+#[cfg(feature = "protocol-v2")]
+/// Updates for one prompt: everything after `running` up to its `idle`.
+async fn sdk_until_idle(
+    updates: &mut tokio::sync::mpsc::UnboundedReceiver<
+        agent_client_protocol::schema::v2::UpdateSessionNotification,
+    >,
+    session_id: &agent_client_protocol::schema::v2::SessionId,
+) -> Result<
+    (
+        Vec<agent_client_protocol::schema::v2::SessionUpdate>,
+        Option<agent_client_protocol::schema::v2::StopReason>,
+    ),
+    agent_client_protocol::Error,
+> {
+    use agent_client_protocol::schema::v2;
+    let mut running = false;
+    let mut seen = Vec::new();
+    loop {
+        let notification = tokio::time::timeout(Duration::from_secs(10), updates.recv())
+            .await
+            .map_err(agent_client_protocol::Error::into_internal_error)?
+            .ok_or_else(agent_client_protocol::Error::internal_error)?;
+        if &notification.session_id != session_id {
+            continue;
+        }
+        match notification.update {
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => running = true,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) if running => {
+                return Ok((seen, idle.stop_reason));
+            }
+            update if running => seen.push(update),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "protocol-v2")]
+/// The test client's permission policy: approve once.
+fn allow_once(
+    request: &agent_client_protocol::schema::v2::RequestPermissionRequest,
+) -> Result<
+    agent_client_protocol::schema::v2::RequestPermissionResponse,
+    agent_client_protocol::Error,
+> {
+    use agent_client_protocol::schema::v2;
+    let allow = request
+        .options
+        .iter()
+        .find(|option| option.kind == v2::PermissionOptionKind::AllowOnce)
+        .map(|option| option.option_id.clone())
+        .ok_or_else(agent_client_protocol::Error::internal_error)?;
+    Ok(v2::RequestPermissionResponse::new(
+        v2::RequestPermissionOutcome::Selected(v2::SelectedPermissionOutcome::new(allow)),
+    ))
+}
+
+/// Drive the shipped `serve` with the official SDK v2 client: the strongest
+/// interoperability evidence available while no editor speaks v2.
+#[cfg(feature = "protocol-v2")]
+#[tokio::test]
+async fn the_sdk_v2_client_drives_a_session_end_to_end() -> Result<(), Box<dyn Error>> {
+    use agent_client_protocol::schema::v2;
+    use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, V2ConnectionTo};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    let state_dir = std::env::temp_dir().join(format!("acp-v2-sdk-{}", uuid::Uuid::new_v4()));
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(env!("CARGO_BIN_EXE_acp-llm-adapter"))
+            .args(["serve", "--backend", "mock"])
+            .env("XDG_STATE_HOME", state_dir.display().to_string()),
+    );
+    let (update_tx, mut updates) = unbounded_channel();
+    Client
+        .v2()
+        .name("serve-protocol-v2-sdk-test")
+        .on_receive_notification(
+            async move |notification: v2::UpdateSessionNotification,
+                        _connection: V2ConnectionTo<Agent>| {
+                update_tx
+                    .send(notification)
+                    .map_err(agent_client_protocol::Error::into_internal_error)
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |request: v2::RequestPermissionRequest,
+                        responder: agent_client_protocol::Responder<
+                v2::RequestPermissionResponse,
+            >,
+                        _connection: V2ConnectionTo<Agent>| {
+                responder.respond(allow_once(&request)?)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(agent, async move |connection| {
+            let initialized = connection
+                .send_request(v2::InitializeRequest::new(
+                    agent_client_protocol::schema::ProtocolVersion::V2,
+                    v2::Implementation::new("serve-protocol-v2-sdk-test", "0.0.0"),
+                ))
+                .block_task()
+                .await?;
+            assert_eq!(
+                initialized.protocol_version,
+                agent_client_protocol::schema::ProtocolVersion::V2
+            );
+            assert!(initialized.capabilities.session.is_some());
+
+            let session = connection
+                .build_session(std::env::temp_dir())
+                .start_session()
+                .block_task()
+                .await?
+                .into_session();
+
+            // A permission-gated command, approved by the client's handler.
+            session
+                .send_prompt("!tool run_command echo sdk-client-ran")
+                .block_task()
+                .await?;
+            let (turn, stop) = sdk_until_idle(&mut updates, session.session_id()).await?;
+            assert_eq!(stop, Some(v2::StopReason::EndTurn));
+            assert!(
+                turn.iter().any(|update| matches!(
+                    update,
+                    v2::SessionUpdate::ToolCallUpdate(call)
+                        if serde_json::to_string(call).is_ok_and(|json|
+                            json.contains("\"completed\"") && json.contains("sdk-client-ran"))
+                )),
+                "{turn:?}"
+            );
+
+            // A plain prompt streams the model's answer.
+            session.send_prompt("hello").block_task().await?;
+            let (turn, stop) = sdk_until_idle(&mut updates, session.session_id()).await?;
+            assert_eq!(stop, Some(v2::StopReason::EndTurn));
+            assert!(turn.iter().any(|update| matches!(
+                update,
+                v2::SessionUpdate::AgentMessageChunk(chunk)
+                    if matches!(&chunk.content, v2::ContentBlock::Text(text)
+                        if text.text == "mock response to: hello")
+            )));
+
+            session.close().block_task().await?;
+            Ok(())
+        })
+        .await?;
+    if state_dir.exists() {
+        std::fs::remove_dir_all(state_dir)?;
+    }
+    Ok(())
+}

@@ -9,6 +9,7 @@
 - [Logging and debugging](logging.md) — structured logs, `acp-proxy`, retention, redaction, tracing.
 - [Usage and cost](usage-and-cost.md) — `usage_update` cost, `LLM_PRICING`, usage validation, context-window reporting.
 - [ACP protocol coverage](acp-coverage.md) — supported ACP methods and load/resume/close semantics.
+- [ACP v2 probe](protocol-v2.md) — the draft v2 implementation behind the `protocol-v2` feature, and its findings.
 - [Mock backend](mock-backend.md) — offline `--backend mock`, including the `!tool` affordance.
 - [Architecture](architecture.md) — channel diagram, module map, transport limits, design principles.
 - [Library API](library.md) — the reusable `llm` module and a streaming example.
