@@ -7,6 +7,23 @@ while the draft is still open to feedback
 It is parked behind an off-by-default cargo feature; released binaries speak
 ACP v1 only. Tracked as `daa-acp-v2-37zc`.
 
+## Status: parked
+
+The probe stays behind the `protocol-v2` feature until one of these triggers
+fires, checked at every `agent-client-protocol` upgrade
+([Rust policy](agent-rust.md)):
+
+- ACP announces v2 as stable.
+- The SDK stabilises v2: `unstable_protocol_v2` is removed, or V2 is available
+  without it.
+- A target editor (Zed, CodeCompanion, LouiseLM) requests `protocolVersion: 2`.
+
+Last checked 2026-10-10, on the upgrade to SDK 3.3.0: none had fired. v2 was
+still behind `unstable_protocol_v2`, ACP listed it as Draft, and CodeCompanion
+and LouiseLM requested version 1. Promotion means a new design: the follow-ups
+in `daa-acp-v2-followups-5m7j`, MCP, edits with the v2 diff format, and whether
+released binaries ship v2.
+
 ## What it covers
 
 Built with the `protocol-v2` feature, `serve` reads each connection's
@@ -56,39 +73,42 @@ permission gating and turn loop. No other loop change was needed.
 
 ## Findings
 
-Candidates for upstream feedback are marked; each is drafted, checked for
-duplicates and posted only after maintainer approval (`daa-acp-v2-37zc.6`).
+Each candidate for upstream feedback was checked against existing issues,
+discussions, RFDs and documentation before drafting (`daa-acp-v2-37zc.6`).
+None survived, so nothing was filed.
 
-1. **Upstream candidate (spec question): the session baseline is
-   all-or-nothing.** Advertising `session: {}` obliges `session/resume`,
-   `session/close` and resource-link prompts
-   ([initialization](https://agentclientprotocol.com/protocol/v2/initialization)).
-   An agent without persistence cannot expose sessions at all. Cheap for this
-   adapter, which already persists sessions, but worth asking whether a
-   narrower baseline was considered.
-2. **Upstream candidate (spec clarity): ready `idle` versus turn completion.**
-   An agent may send `idle` after `session/new` (the SDK's own example does).
-   A client that waits for `idle` after sending its first prompt can take that
-   ready update for the end of the turn; our wire tests hit exactly this race.
-   The prompt lifecycle could state that completion is the `idle` following the
-   `running` transition after acceptance, which the SDK example only says in a
-   code comment.
-3. **Upstream candidate (SDK docs): the agent-side router is undocumented.**
-   `Agent.protocol_router().with_v1(...).with_v2(...)` exists in the Rust SDK,
-   but its README documents only `Proxy.protocol_router()`, so agent authors may
-   not find the supported side-by-side entry point.
-4. **Upstream candidate (API ergonomics): flattened config values.**
-   `SetSessionConfigOptionRequest` flattens its value (`type` and `value` at the
-   top level of the request) while option lists nest values. Our own test sent
-   the nested shape first.
-5. **Internal: no diff previews for edits.** v2 permission requests carry the
+1. **Answered by an RFD: the session baseline is all-or-nothing.** Advertising
+   `session: {}` obliges `session/resume`, `session/close` and resource-link
+   prompts. This is deliberate: the
+   [Required Session Methods RFD](https://agentclientprotocol.com/rfds/v2/required-session-methods)
+   notes that almost all agents already support these methods, users expect
+   them, and agents without sessions omit `session` entirely.
+2. **Answered by the spec: ready `idle` versus turn completion.** An agent may
+   report `idle` after `session/new`. The
+   [prompt lifecycle](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle)
+   requires a stop reason whenever the `idle` transition ends foreground work,
+   so a client tells the two apart by the stop reason. Our wire tests briefly
+   raced on this; the fix was in the test.
+3. **Documented: the agent-side router.** `Agent.protocol_router()` is
+   documented, with an example, in the Rust SDK's
+   [Protocol V2 guide](https://agentclientprotocol.github.io/rust-sdk/protocol-v2.html),
+   which the crate README links; only the README's summary names just the proxy
+   router.
+4. **Documented: flattened config values.** `session/set_config_option` puts
+   `type` and `value` at the top level of the request, as the
+   [config options page](https://agentclientprotocol.com/protocol/v2/session-config-options)
+   shows. Our test sent a nested value first.
+5. **Internal: no `requires_action` during permission waits.** The prompt
+   lifecycle says the agent *should* report `requires_action` while blocked on
+   a permission response and `running` when work resumes. The probe sends
+   neither.
+6. **Internal: no diff previews for edits.** v2 permission requests carry the
    subject's `ToolCallUpdate`, so a preview needs the new v2 diff format. The
    probe sends none, a step back from v1's previews (0.9.3) until it does.
-6. **Internal: `run_command` could use the `command` subject.** v2's
+7. **Internal: `run_command` could use the `command` subject.** v2's
    `CommandPermissionSubject` (command, cwd, tool call ID) fits better than a
    generic tool-call subject.
-7. **Not upstream: SDK lag, resolved.** The `error` stop reason (spec #2281)
-   was missing from SDK 3.1 / schema 1.10.2; the adapter moved to 3.3.0 / 1.11.0.
+8. **Resolved: SDK lag.** The `error` stop reason (spec #2281) was missing from
+   SDK 3.1 / schema 1.10.2; the adapter moved to 3.3.0 / 1.11.0.
 
-Status of each candidate (filed link or reason for not filing) is recorded here
-once `daa-acp-v2-37zc.6` completes.
+Findings 5 to 7 are recorded as follow-up work for promotion to full support.

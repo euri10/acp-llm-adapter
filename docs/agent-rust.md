@@ -17,6 +17,15 @@ together with [testing](agent-testing.md).
   default `auto` versioning strategy; it does not support `increase`. A major bump on
   a protocol crate (`agent-client-protocol`, `rmcp`) is a deliberate change with
   a full regression pass, not a routine update.
+- Every `agent-client-protocol` upgrade, of any size, is also the checkpoint for
+  the parked ACP v2 probe ([protocol-v2](protocol-v2.md)). Run the regression
+  pass with default features and with `--all-features`, then check the three
+  promotion triggers and record the result on the upgrade's issue: ACP announces
+  v2 as stable; the SDK stabilises v2 (`unstable_protocol_v2` removed, or V2
+  available without it); a target editor (Zed, CodeCompanion, LouiseLM) requests
+  `protocolVersion: 2`. If one fired, file a feature for full v2 support
+  (`daa-acp-v2-followups-5m7j`, MCP, edits with the v2 diff, and shipping v2 in
+  released binaries).
 
 ## Lints
 
