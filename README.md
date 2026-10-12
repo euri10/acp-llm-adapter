@@ -40,8 +40,10 @@ defaults.
 ## Editor setup
 
 Each snippet is the exact content of a file in [`examples/`](examples/), which
-CI runs against a local fake provider (`scripts/test-editor-snippets`). They use
-DeepSeek; for another backend change `--backend` and the key.
+CI runs against a local fake provider (`scripts/test-editor-snippets`): for
+LouiseLM and CodeCompanion it checks a reply, an approved and a rejected
+command, and that the edit preview shown before approval is the exact change.
+They use DeepSeek; for another backend change `--backend` and the key.
 
 ### LouiseLM
 

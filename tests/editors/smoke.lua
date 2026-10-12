@@ -31,8 +31,58 @@ function M.mapping(buffer, mode, lhs)
   error(("chat %s-mode %s mapping is absent"):format(mode, lhs))
 end
 
-function M.wait(what, predicate)
-  assert(vim.wait(M.timeout_ms, predicate, 50), what)
+-- Wait for `predicate`; on timeout fail with `what` and, when given, what
+-- `context()` reports (e.g. the end of the chat buffer).
+function M.wait(what, predicate, context)
+  if not vim.wait(M.timeout_ms, predicate, 50) then
+    error(what .. (context and ("\n--- context ---\n" .. context()) or ""), 2)
+  end
+end
+
+function M.tail(buffer, count)
+  local lines = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+  return table.concat(vim.list_slice(lines, math.max(1, #lines - count + 1)), "\n")
+end
+
+-- The fake provider answers "!tool <name> <json-args>" with that tool call,
+-- then quotes the tool result after this prefix.
+M.tool_reply = "tool said: "
+
+function M.tool_prompt(name, args)
+  return "!tool " .. name .. " " .. vim.json.encode(args)
+end
+
+M.hello = 'def greet(name):\n    return "Hello, " + name + "!"\n\n\nif __name__ == "__main__":\n    print(greet("world"))\n'
+M.docstring_edit = {
+  path = "hello.py",
+  old_text = "def greet(name):\n",
+  new_text = 'def greet(name):\n    """Greet someone."""\n',
+}
+
+-- A throwaway project with hello.py; Neovim's cwd moves there so sessions
+-- and edits never touch the repository. Returns the directory.
+function M.project()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local file = assert(io.open(dir .. "/hello.py", "w"))
+  file:write(M.hello)
+  file:close()
+  vim.cmd.cd(dir)
+  return dir
+end
+
+function M.read(path)
+  local file = assert(io.open(path, "r"))
+  local text = file:read("*a")
+  file:close()
+  return text
+end
+
+-- What an approved docstring edit must and must not show before approval:
+-- the added line, and none of the untouched lines removed.
+function M.assert_docstring_preview(text, where)
+  assert(text and text:find('+    """Greet someone."""', 1, true), where .. ": preview lacks the added docstring:\n" .. tostring(text))
+  assert(not text:find('-if __name__', 1, true), where .. ": preview deletes lines the edit keeps:\n" .. text)
 end
 
 -- Run `check`, then `cleanup`, and exit nonzero with the first error.
@@ -40,7 +90,7 @@ function M.run(name, check, cleanup)
   local ok, err = xpcall(check, debug.traceback)
   local cleanup_ok, cleanup_err = pcall(cleanup)
   if ok and cleanup_ok then
-    io.stdout:write(name .. ": reply visible in chat buffer\n")
+    io.stdout:write(name .. ": reply, approved and rejected commands, edit preview verified\n")
     vim.cmd("qall!")
   end
   io.stderr:write(name .. ": " .. tostring(ok and cleanup_err or err) .. "\n")
