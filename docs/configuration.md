@@ -1,6 +1,6 @@
 # Configuration
 
-- Rust stable
+- Rust 1.95 or newer (stable)
 - `LLM_API_KEY` (required for the DeepSeek, GLM and Groq backends)
 - Optional: `LLM_BASE_URL` (overrides the provider's default base URL)
 - Optional: `LLM_MODEL` (overrides the provider's default model)
@@ -15,6 +15,12 @@ provider contracts ([Groq](https://console.groq.com/docs/api-reference),
 models, including GLM-4.6, offer only Provider default until their effort contract
 is supported. Invalid updates are rejected before changing state; switching or
 restoring a model resets an unsupported stored effort to Provider default.
+
+The **Max Output Tokens** selector caps how many tokens the model may generate
+in one response. It starts at **Default**, which omits `max_tokens` so the
+provider's own default applies; presets are 4096, 8192, 16384, 32768, 65536 and
+131072. Like mode, model and reasoning effort, the choice is stored with the
+session and kept on load and resume ([sessions](sessions.md)).
 
 Every live backend is the same OpenAI-compatible client; the backend only chooses the defaults that `LLM_BASE_URL` and `LLM_MODEL` override:
 

@@ -142,7 +142,8 @@ Then `:CodeCompanionChat`. Tested with CodeCompanion `v19.27.0` on Neovim
   ([ACP coverage](docs/acp-coverage.md)).
 - Usage, context-window and cost reporting, with cost for models whose prices
   are published ([usage and cost](docs/usage-and-cost.md)).
-- Model and reasoning-effort pickers ([configuration](docs/configuration.md)).
+- Model, reasoning-effort and max-output-token pickers
+  ([configuration](docs/configuration.md)).
 
 ## Configuration
 

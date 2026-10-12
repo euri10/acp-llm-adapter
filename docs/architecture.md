@@ -39,6 +39,7 @@ The adapter bridges two independent channels:
 | Module                                     | Responsibility                                                                                       |
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
 | [`acp/`](../src/acp/)                         | ACP transport registration, request handler dispatch, response builders, permission requesters       |
+| [`acp/v2.rs`](../src/acp/v2.rs)               | Draft ACP v2 probe behind the off-by-default `protocol-v2` feature ([protocol-v2](protocol-v2.md)) |
 | [`session.rs`](../src/session.rs)             | Adapter-owned session data, mode/permission policy, tool-call accumulation                          |
 | [`turn.rs`](../src/turn.rs)                   | Prompt-turn orchestration: LLM streaming, tool-call accumulation, loop control, cancellation         |
 | [`tools/`](../src/tools/)                     | Built-in tool registration, execution and filesystem boundaries                                      |
