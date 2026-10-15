@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5](https://github.com/euri10/acp-llm-adapter/compare/v0.9.4...v0.9.5) - 2026-10-15
+
+### Fixed
+
+- *(deps)* update vulnerable TLS dependencies
+
+### Other
+
+- Merge pull request #76 from euri10/dependabot/cargo/uuid-1.28.0
+- Merge pull request #79 from euri10/dependabot/cargo/serde_json-1.0.154
+- *(deps)* bump uuid from 1.27.0 to 1.28.0
+- *(deps)* bump tokio-util from 0.7.19 to 0.7.20
+- *(deps)* bump serde_json from 1.0.151 to 1.0.154
+- close verified dependency audit bug
+- document max output tokens and the v2 probe module
+- drive permission and edit-preview turns in editor snippet checks
+- file reality-check gaps for editor tool turns and docs
+- record verified 0.9.4 release
+
 ## [0.9.4](https://github.com/euri10/acp-llm-adapter/compare/v0.9.3...v0.9.4) - 2026-10-11
 
 ### Added
