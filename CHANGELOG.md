@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6](https://github.com/euri10/acp-llm-adapter/compare/v0.9.5...v0.9.6) - 2026-10-28
+
+### Fixed
+
+- *(deps)* update vulnerable TLS and Tokio
+
+### Other
+
+- *(beads)* close verified Tokio fixture fix
+- consume model fixture requests before close
+- Merge branch 'main' into dependabot/cargo/tokio-1.54.1
+- *(beads)* close verified dependency upgrades
+- record ACP v2 editor adoption checkpoint
+- Merge pull request #83 from euri10/dependabot/cargo/agent-client-protocol-3.5.0
+- Merge branch 'main' into dependabot/cargo/agent-client-protocol-3.5.0
+- Merge branch 'main' into dependabot/cargo/uuid-1.29.0
+- *(beads)* track dependency upgrade follow-ups
+- *(deps)* bump rmcp from 3.5.1 to 3.7.0
+- *(deps)* bump tokio from 1.53.3 to 1.54.1
+- *(deps)* bump uuid from 1.28.0 to 1.29.0
+- *(deps)* bump agent-client-protocol from 3.3.0 to 3.5.0
+
 ### Fixed
 
 - Update TLS and Tokio dependencies to address RUSTSEC-2026-0382,
