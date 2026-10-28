@@ -18,11 +18,14 @@ fires, checked at every `agent-client-protocol` upgrade
   without it.
 - A target editor (Zed, CodeCompanion, LouiseLM) requests `protocolVersion: 2`.
 
-Last checked 2026-10-10, on the upgrade to SDK 3.3.0: none had fired. v2 was
-still behind `unstable_protocol_v2`, ACP listed it as Draft, and CodeCompanion
-and LouiseLM requested version 1. Promotion means a new design: the follow-ups
-in `daa-acp-v2-followups-5m7j`, MCP, edits with the v2 diff format, and whether
-released binaries ship v2.
+Last checked 2026-10-28, on the upgrade to SDK 3.5.0: the editor trigger has
+fired. [Zed's ACP beta path](https://github.com/zed-industries/zed/blob/e5bdd01cd819d6348ae764e69218adfee3d7edab/crates/agent_servers/src/acp.rs#L132)
+[requests version 2](https://github.com/zed-industries/zed/blob/e5bdd01cd819d6348ae764e69218adfee3d7edab/crates/agent_servers/src/acp/v2.rs#L427).
+The SDK still gates v2 behind `unstable_protocol_v2`, ACP still lists it as
+Draft, and the inspected CodeCompanion and LouiseLM clients request version 1.
+Promotion is tracked as `daa-jn8o` and requires a design: the follow-ups in
+`daa-acp-v2-followups-5m7j`, MCP, edits with the v2 diff format, and whether
+released binaries ship v2. The probe remains off by default pending that work.
 
 ## What it covers
 
