@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use futures_util::StreamExt;
 use serde_json::json;
 use sse_reqwest_client::{RequestBuilderExt as _, SseErrorEvent, SseEvent};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -17,11 +17,11 @@ use super::{
 };
 
 /// Spawn a simple HTTP server on a random local port that returns a single
-/// JSON response to any request, then shuts down.
+/// JSON response to a GET request, then shuts down.
 async fn spawn_http_json_server(
     status_line: String,
     json_body: String,
-) -> Result<String, ChatError> {
+) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), ChatError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
@@ -30,8 +30,26 @@ async fn spawn_http_json_server(
         .map_err(|error| ChatError::InvalidResponse(error.to_string()))?;
     let url = format!("http://{address}");
 
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let mut socket = BufReader::new(socket);
+        // Closing with unread request bytes can reset the connection before the
+        // client receives the response. Consume the complete, bodyless GET.
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if socket
+                .read_line(&mut line)
+                .await
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                return Err("connection closed before request headers completed".to_string());
+            }
+            if line == "\r\n" {
+                break;
+            }
+        }
 
         let response = format!(
             "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -41,13 +59,19 @@ async fn spawn_http_json_server(
         );
 
         socket
+            .get_mut()
             .write_all(response.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        socket
+            .get_mut()
+            .shutdown()
             .await
             .map_err(|e| e.to_string())?;
         Ok::<_, String>(())
     });
 
-    Ok(url)
+    Ok((url, server))
 }
 
 async fn spawn_sse_server(
@@ -1302,10 +1326,15 @@ async fn fetch_available_models_parses_openai_model_list() -> Result<(), ChatErr
     })
     .to_string();
 
-    let base_url = spawn_http_json_server("HTTP/1.1 200 OK".to_string(), json_body).await?;
+    let (base_url, server) =
+        spawn_http_json_server("HTTP/1.1 200 OK".to_string(), json_body).await?;
     let client = ChatClient::new(ChatConfig::new("test-key", base_url, "glm-4.6"));
 
     let catalog = client.fetch_available_models("glm-4.6").await;
+    server
+        .await
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
 
     assert_eq!(
         catalog.ids,
@@ -1339,10 +1368,15 @@ async fn fetch_available_models_captures_reported_context_windows() -> Result<()
     })
     .to_string();
 
-    let base_url = spawn_http_json_server("HTTP/1.1 200 OK".to_string(), json_body).await?;
+    let (base_url, server) =
+        spawn_http_json_server("HTTP/1.1 200 OK".to_string(), json_body).await?;
     let client = ChatClient::new(ChatConfig::new("test-key", base_url, "openai/gpt-oss-120b"));
 
     let catalog = client.fetch_available_models("openai/gpt-oss-120b").await;
+    server
+        .await
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
 
     assert_eq!(
         catalog.context_window("openai/gpt-oss-120b"),
@@ -1365,7 +1399,7 @@ async fn fetch_available_models_captures_reported_context_windows() -> Result<()
 #[test_log::test(tokio::test)]
 async fn fetch_available_models_falls_back_on_http_error() -> Result<(), ChatError> {
     let json_body = r#"{"error": "internal server error"}"#;
-    let base_url = spawn_http_json_server(
+    let (base_url, server) = spawn_http_json_server(
         "HTTP/1.1 500 Internal Server Error".to_string(),
         json_body.to_string(),
     )
@@ -1373,6 +1407,10 @@ async fn fetch_available_models_falls_back_on_http_error() -> Result<(), ChatErr
     let client = ChatClient::new(ChatConfig::new("test-key", base_url, "my-model"));
 
     let catalog = client.fetch_available_models("my-model").await;
+    server
+        .await
+        .map_err(|error| ChatError::InvalidResponse(error.to_string()))?
+        .map_err(ChatError::InvalidResponse)?;
 
     assert_eq!(catalog.ids, vec!["my-model"]);
     assert_eq!(
