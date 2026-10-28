@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Update TLS and Tokio dependencies to address RUSTSEC-2026-0382,
   RUSTSEC-2026-0383, and RUSTSEC-2026-0386.
+- Make model-discovery test fixtures consume requests before closing connections,
+  allowing the Tokio 1.54.1 upgrade to pass reliably.
 
 ## [0.9.5](https://github.com/euri10/acp-llm-adapter/compare/v0.9.4...v0.9.5) - 2026-10-15
 
