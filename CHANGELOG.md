@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.7](https://github.com/euri10/acp-llm-adapter/compare/v0.9.6...v0.9.7) - 2026-10-29
+
+### Added
+
+- *(acp)* enable v2 negotiation by default
+- *(acp)* complete v2 tools and session setup
+
 ### Added
 - Enable ACP v1 and experimental v2 negotiation by default; retain `--no-default-features` for v1-only builds. Existing editor configurations stay unchanged.
 - ACP v2 permission-wait states, structured command subjects, and renderable file-edit previews/results.
