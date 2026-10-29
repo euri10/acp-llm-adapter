@@ -381,6 +381,8 @@ impl PermissionRequester for MockPermissionRequester {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
+        _tool_name: &str,
+        _cwd: &std::path::Path,
     ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
         let outcome = request
             .options
@@ -847,7 +849,9 @@ mod tests {
             ],
         );
 
-        let response = requester.request_permission(request).await?;
+        let response = requester
+            .request_permission(request, "test", std::path::Path::new("/"))
+            .await?;
         let RequestPermissionOutcome::Selected(selected) = response.outcome else {
             return Err(
                 agent_client_protocol::Error::internal_error().data("expected Selected outcome")
@@ -878,7 +882,9 @@ mod tests {
             )],
         );
 
-        let response = requester.request_permission(request).await?;
+        let response = requester
+            .request_permission(request, "test", std::path::Path::new("/"))
+            .await?;
         assert!(matches!(
             response.outcome,
             RequestPermissionOutcome::Cancelled
@@ -902,7 +908,9 @@ mod tests {
             vec![],
         );
 
-        let response = requester.request_permission(request).await?;
+        let response = requester
+            .request_permission(request, "test", std::path::Path::new("/"))
+            .await?;
         assert!(matches!(
             response.outcome,
             RequestPermissionOutcome::Cancelled

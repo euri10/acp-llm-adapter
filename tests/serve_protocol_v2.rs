@@ -16,6 +16,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+#[cfg(feature = "protocol-v2")]
+#[path = "serve_protocol_v2/promotion.rs"]
+mod promotion;
+
 /// Spawn `serve` on the mock backend and return its reply to one `initialize`.
 async fn initialize(params: Value) -> Result<Value, Box<dyn Error>> {
     let state_dir = std::env::temp_dir().join(format!("acp-v2-test-{}", uuid::Uuid::new_v4()));
@@ -102,11 +106,10 @@ async fn with_the_feature_v2_requests_get_the_v2_baseline() -> Result<(), Box<dy
     assert_eq!(at("/protocolVersion"), Some(json!(2)), "{response}");
     assert_eq!(at("/info/name"), Some(json!("acp-llm-adapter")));
     assert_eq!(at("/info/version"), Some(json!(env!("CARGO_PKG_VERSION"))));
-    // The whole baseline session surface; no MCP, prompt extensions or
-    // selected-content extension in the probe.
+    // Advertise only the implemented transports and session extensions.
     assert_eq!(
         at("/capabilities"),
-        Some(json!({"session": {}})),
+        Some(json!({"session": {"mcp": {"stdio": {}, "http": {}}, "additionalDirectories": {}}})),
         "{response}"
     );
     assert!(
@@ -375,7 +378,10 @@ async fn v2_session_baseline_over_the_wire() -> Result<(), Box<dyn Error>> {
         .iter()
         .filter_map(|message| message.pointer("/params/update").cloned())
         .collect();
-    assert_eq!(kinds(&replayed), ["user_message", "agent_message"]);
+    assert_eq!(
+        kinds(&replayed),
+        ["user_message", "agent_message", "state_update:idle"]
+    );
     assert_eq!(replayed[0]["messageId"], json!(message_id));
 
     // session/close answers {}, and the closed session takes no prompt.
@@ -401,7 +407,7 @@ async fn v2_refuses_unadvertised_input_before_admission() -> Result<(), Box<dyn 
     let with_mcp = connection
         .request(
             "session/new",
-            json!({"cwd": cwd, "mcpServers": [{"name":"x","command":"/bin/true","args":[],"env":[]}]}),
+            json!({"cwd": cwd, "mcpServers": [{"type":"sse","name":"x","url":"http://127.0.0.1:1"}]}),
         )
         .await?;
     assert!(with_mcp.get("error").is_some(), "{with_mcp}");
@@ -617,12 +623,21 @@ async fn v2_runs_gated_commands_and_confined_reads_locally() -> Result<(), Box<d
         .await?;
     assert_eq!(permission["params"]["sessionId"], json!(session_id));
     assert_eq!(
-        permission["params"]["subject"]["type"], "tool_call",
+        permission["params"]["subject"]["type"], "command",
         "{permission}"
     );
     assert_eq!(
-        permission["params"]["subject"]["toolCall"]["toolCallId"],
+        permission["params"]["subject"]["toolCallId"],
         "mock-tool-call-0"
+    );
+    assert_eq!(permission["params"]["subject"]["command"], "echo v2-ran");
+    assert_eq!(permission["params"]["subject"]["cwd"], json!(cwd));
+    assert_eq!(
+        connection
+            .notifications
+            .last()
+            .and_then(|n| n.pointer("/params/update/state")),
+        Some(&json!("requires_action"))
     );
     let allow = permission["params"]["options"]
         .as_array()
@@ -636,6 +651,20 @@ async fn v2_runs_gated_commands_and_confined_reads_locally() -> Result<(), Box<d
         )
         .await?;
     let turn = connection.until_idle(mark).await?;
+    let states: Vec<_> = turn
+        .iter()
+        .filter_map(|n| n.get("state"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            json!("running"),
+            json!("requires_action"),
+            json!("running"),
+            json!("idle")
+        ]
+    );
     assert!(
         tool_updates(&turn)
             .iter()
@@ -745,7 +774,12 @@ async fn v2_clear_command_empties_the_history() -> Result<(), Box<dyn Error>> {
         )
         .await?;
     assert!(
-        connection.notifications[mark..].is_empty(),
+        connection.notifications[mark..]
+            .iter()
+            .all(
+                |notification| notification.pointer("/params/update/sessionUpdate")
+                    == Some(&json!("state_update"))
+            ),
         "cleared history was replayed"
     );
     connection.stop().await

@@ -1,4 +1,4 @@
-//! Draft ACP v2 agent for the `protocol-v2` probe (daa-acp-v2-37zc).
+//! Draft ACP v2 agent, negotiated alongside v1 (`protocol-v2` feature).
 //!
 //! `serve` routes each connection by its `initialize` request: v1 clients reach
 //! the stable implementation in the parent module, v2 clients reach this one.
@@ -6,29 +6,29 @@
 //! store, v1 session handlers and turn loop, so validation, persistence and
 //! confinement are not duplicated.
 //!
-//! The probe implements the v2 session baseline (new, list, resume, close,
-//! prompt, cancel and updates), config options (mode, model, effort) and tool
-//! execution. v2 has no client file system or terminal, so tools always run
+//! Implements the v2 session baseline (new, list, resume, close, prompt, cancel
+//! and updates), config options, MCP and additional roots. v2 has no client
+//! file system or terminal delegation, so built-in tools always run
 //! locally; permission prompts go through the shared v1 gating logic and are
 //! translated to v2 `session/request_permission` at this edge.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use acp_llm_adapter::llm::{LlmClient, MessageRole};
-use agent_client_protocol::schema::v1;
-use agent_client_protocol::schema::{ProtocolVersion, v2};
-use agent_client_protocol::{Agent, Client, ConnectTo, Responder, V2ConnectionTo};
-use futures_util::future::BoxFuture;
-
-use super::{
-    EditorTools, PermissionRequester, ReadTextFileRequester, TerminalRequester,
-    ToolProgressReporter, WriteTextFileRequester,
-};
+use self::tools::V2Tools;
+use super::EditorTools;
 use crate::session_store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::turn::{PromptInput, PromptResult, TurnEvent};
 use crate::{ADAPTER_NAME, ADAPTER_VERSION, adapter_available_commands};
+use acp_llm_adapter::error::AdapterError;
+use acp_llm_adapter::llm::{LlmClient, MessageRole};
+use agent_client_protocol::schema::v1;
+use agent_client_protocol::schema::{ProtocolVersion, v2};
+use agent_client_protocol::{Agent, Client, ConnectTo, Responder, V2ConnectionTo};
+
+mod diff;
+mod tools;
 
 type AcpResult<T> = Result<T, agent_client_protocol::Error>;
 
@@ -76,15 +76,17 @@ pub(crate) fn agent(services: Services) -> impl ConnectTo<Client> {
             async move |request: v2::NewSessionRequest,
                         responder: Responder<v2::NewSessionResponse>,
                         connection: V2ConnectionTo<Client>| {
-                match new_session(&new.store, &request) {
-                    Ok(response) => {
-                        let session_id = response.session_id.clone();
-                        responder.respond(response)?;
-                        // A new session is ready for its first prompt.
-                        send(&connection, &session_id, idle(None))
+                let services = new.clone();
+                connection.clone().spawn(async move {
+                    match new_session(&services.store, &request).await {
+                        Ok(response) => {
+                            let session_id = response.session_id.clone();
+                            responder.respond(response)?;
+                            send(&connection, &session_id, idle(None))
+                        }
+                        Err(error) => responder.respond_with_error(error),
                     }
-                    Err(error) => responder.respond_with_error(error),
-                }
+                })
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -112,12 +114,7 @@ pub(crate) fn agent(services: Services) -> impl ConnectTo<Client> {
             async move |request: v2::CloseSessionRequest,
                         responder: Responder<v2::CloseSessionResponse>,
                         _connection: V2ConnectionTo<Client>| {
-                let closed = super::handle_close_session_request(
-                    &close.store,
-                    &v1::CloseSessionRequest::new(request.session_id.to_string()),
-                )
-                .map(|_| v2::CloseSessionResponse::new());
-                responder.respond_with_result(closed)
+                responder.respond_with_result(close_session(&close.store, &request))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -143,50 +140,121 @@ pub(crate) fn agent(services: Services) -> impl ConnectTo<Client> {
         .on_receive_notification(
             async move |notification: v2::CancelSessionNotification,
                         _connection: V2ConnectionTo<Client>| {
-                cancel
+                match cancel
                     .store
-                    .cancel_active_turn(&notification.session_id.to_string())?;
-                Ok(())
+                    .cancel_active_turn(&notification.session_id.to_string())
+                {
+                    Ok(()) | Err(AdapterError::InvalidParams(_)) => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
             },
             agent_client_protocol::on_receive_notification!(),
         )
 }
 
+/// The store lookup's only `InvalidParams` case is an absent session; v2 uses
+/// resource-not-found for that case, without changing v1's error contract.
+fn require_active_session(store: &SessionStore, id: &v2::SessionId) -> AcpResult<()> {
+    store
+        .lookup_session(&id.to_string())
+        .map_err(|error| match error {
+            AdapterError::InvalidParams(_) => {
+                agent_client_protocol::Error::resource_not_found(None)
+            }
+            other => other.into(),
+        })
+}
+
+fn close_session(
+    store: &SessionStore,
+    request: &v2::CloseSessionRequest,
+) -> AcpResult<v2::CloseSessionResponse> {
+    require_active_session(store, &request.session_id)?;
+    super::handle_close_session_request(
+        store,
+        &v1::CloseSessionRequest::new(request.session_id.to_string()),
+    )?;
+    Ok(v2::CloseSessionResponse::new())
+}
+
 /// The v2 handshake. The router only selects this implementation for clients
-/// that accept v2, so the answer is always v2. `session: {}` advertises the
-/// whole baseline session surface and nothing optional: no MCP, no prompt
-/// extensions and no selected-content extension.
+/// that accept v2, so the answer is always v2. Advertise the session baseline,
+/// stdio/HTTP MCP and additional roots, but no prompt or selected-content extensions.
 pub(crate) fn initialize_response() -> v2::InitializeResponse {
     v2::InitializeResponse::new(
         ProtocolVersion::V2,
         v2::Implementation::new(ADAPTER_NAME, ADAPTER_VERSION),
     )
-    .capabilities(v2::AgentCapabilities::new().session(v2::SessionCapabilities::new()))
+    .capabilities(
+        v2::AgentCapabilities::new().session(
+            v2::SessionCapabilities::new()
+                .mcp(
+                    v2::McpCapabilities::new()
+                        .stdio(v2::McpStdioCapabilities::new())
+                        .http(v2::McpHttpCapabilities::new()),
+                )
+                .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new()),
+        ),
+    )
 }
 
-/// Refuse lifecycle fields for capabilities the probe does not advertise.
-fn reject_unadvertised(
-    mcp_servers: &[v2::McpServer],
-    additional_directories: &[v2::AbsolutePath],
-) -> AcpResult<()> {
-    if !mcp_servers.is_empty() {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data("MCP servers are not supported by this ACP v2 agent"));
-    }
-    if !additional_directories.is_empty() {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data("additionalDirectories is not advertised by this ACP v2 agent"));
-    }
-    Ok(())
+/// Validate the complete setup before starting any MCP process or connection.
+fn session_setup(
+    cwd: &v2::AbsolutePath,
+    directories: &[v2::AbsolutePath],
+    servers: &[v2::McpServer],
+) -> AcpResult<v1::NewSessionRequest> {
+    let servers = servers
+        .iter()
+        .map(|server| {
+            Ok(match server {
+                v2::McpServer::Stdio(server) => v1::McpServer::Stdio(
+                    v1::McpServerStdio::new(&server.name, &server.command.0)
+                        .args(server.args.clone())
+                        .env(
+                            server
+                                .env
+                                .iter()
+                                .map(|env| v1::EnvVariable::new(&env.name, &env.value))
+                                .collect(),
+                        ),
+                ),
+                v2::McpServer::Http(server) => v1::McpServer::Http(
+                    v1::McpServerHttp::new(&server.name, &server.url).headers(
+                        server
+                            .headers
+                            .iter()
+                            .map(|header| v1::HttpHeader::new(&header.name, &header.value))
+                            .collect(),
+                    ),
+                ),
+                _ => {
+                    return Err(agent_client_protocol::Error::invalid_params()
+                        .data("unsupported MCP transport"));
+                }
+            })
+        })
+        .collect::<AcpResult<Vec<_>>>()?;
+    let setup = v1::NewSessionRequest::new(&cwd.0)
+        .additional_directories(directories.iter().map(|path| path.0.clone()).collect())
+        .mcp_servers(servers);
+    super::validate_session_paths(&setup)?;
+    Ok(setup)
 }
 
-fn new_session(
+async fn new_session(
     store: &SessionStore,
     request: &v2::NewSessionRequest,
 ) -> AcpResult<v2::NewSessionResponse> {
-    reject_unadvertised(&request.mcp_servers, &request.additional_directories)?;
-    let created =
-        super::handle_new_session_request(store, &v1::NewSessionRequest::new(&request.cwd.0))?;
+    let mut setup = session_setup(
+        &request.cwd,
+        &request.additional_directories,
+        &request.mcp_servers,
+    )?;
+    let sessions = crate::connect_mcp_sessions(&setup.mcp_servers).await?;
+    // MCP credentials are connection inputs, not durable session metadata.
+    setup.mcp_servers.clear();
+    let created = super::insert_session_record(store, &setup, sessions)?;
     let session_id = created.session_id.to_string();
     Ok(v2::NewSessionResponse::new(session_id.clone())
         .config_options(config_options(store, &session_id)?)
@@ -227,32 +295,31 @@ async fn resume_session(
     request: &v2::ResumeSessionRequest,
     connection: &V2ConnectionTo<Client>,
 ) -> AcpResult<v2::ResumeSessionResponse> {
-    reject_unadvertised(&request.mcp_servers, &request.additional_directories)?;
-    let session_id = request.session_id.to_string();
-    match &request.replay_from {
-        None => {
-            super::handle_resume_session_request(
-                store,
-                &v1::ResumeSessionRequest::new(session_id, &request.cwd.0),
-            )
-            .await?;
-        }
-        Some(v2::ReplayFrom::Start(_)) => {
-            super::handle_load_session_request(
-                store,
-                &v1::LoadSessionRequest::new(session_id, &request.cwd.0),
-                |notification| match replayed_update(notification.update) {
-                    Some(update) => send(connection, &request.session_id, update),
-                    None => Ok(()),
-                },
-            )
-            .await?;
-        }
-        Some(_) => {
-            return Err(agent_client_protocol::Error::invalid_params()
-                .data("only replayFrom start is supported"));
-        }
+    let setup = session_setup(
+        &request.cwd,
+        &request.additional_directories,
+        &request.mcp_servers,
+    )?;
+    if !matches!(&request.replay_from, None | Some(v2::ReplayFrom::Start(_))) {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("only replayFrom start is supported"));
     }
+    let (session_id, history) = super::restore_persisted_session(
+        store,
+        &request.session_id.to_string().into(),
+        &setup.cwd,
+        Some(&setup),
+    )
+    .await?;
+    if request.replay_from.is_some() {
+        super::replay_session_history(&session_id, &history, &mut |notification| {
+            match replayed_update(notification.update) {
+                Some(update) => send(connection, &request.session_id, update),
+                None => Ok(()),
+            }
+        })?;
+    }
+    send(connection, &request.session_id, idle(None))?;
     Ok(v2::ResumeSessionResponse::new()
         .config_options(config_options(store, &request.session_id.to_string())?)
         .available_commands(available_commands()))
@@ -333,6 +400,9 @@ async fn run_prompt(
     connection: &V2ConnectionTo<Client>,
 ) -> AcpResult<()> {
     let session_id = request.session_id.clone();
+    if let Err(error) = require_active_session(&services.store, &session_id) {
+        return responder.respond_with_error(error);
+    }
     if is_clear_command(&request) {
         return clear_history(services, &session_id, responder, connection).await;
     }
@@ -448,11 +518,14 @@ fn turn_update(
                 } else {
                     v2::ToolCallStatus::Failed
                 })
-                // The tool's output; edits report text too, since the v2 diff
-                // format is outside the probe.
-                .content(vec![v2::ToolCallContent::Content(Box::new(
-                    v2::Content::new(result.content),
-                ))])
+                .content(vec![match &result.edit {
+                    Some(edit) => {
+                        diff::content(&edit.path, edit.old_text.as_deref(), &edit.new_text)
+                    }
+                    None => {
+                        v2::ToolCallContent::Content(Box::new(v2::Content::new(result.content)))
+                    }
+                }])
                 .raw_output(result.raw_output),
         ),
         TurnEvent::Usage {
@@ -528,6 +601,7 @@ fn set_config_option(
     store: &SessionStore,
     request: &v2::SetSessionConfigOptionRequest,
 ) -> AcpResult<v2::SetSessionConfigOptionResponse> {
+    require_active_session(store, &request.session_id)?;
     let value = match &request.value {
         v2::SessionConfigOptionValue::Id { value } => v1::SessionConfigOptionValue::ValueId {
             value: value.to_string().into(),
@@ -556,147 +630,6 @@ fn set_config_option(
         store,
         &session_id,
     )?))
-}
-
-/// The tool layer's view of a v2 connection. Permission prompts reach the
-/// client as v2 requests; v2 has no client file system or terminal, so those
-/// requests are refused (v2 sessions advertise no such capability, so the
-/// tool layer runs file and command tools locally and never calls them).
-struct V2Tools {
-    connection: V2ConnectionTo<Client>,
-}
-
-type RequestFuture<'a, T> = BoxFuture<'a, AcpResult<T>>;
-
-fn no_client_capability<'a, T: Send + 'a>(what: &'static str) -> RequestFuture<'a, T> {
-    Box::pin(async move {
-        Err(agent_client_protocol::Error::invalid_request()
-            .data(format!("ACP v2 has no client {what}")))
-    })
-}
-
-impl ReadTextFileRequester for V2Tools {
-    fn read_text_file(
-        &self,
-        _: v1::ReadTextFileRequest,
-    ) -> RequestFuture<'_, v1::ReadTextFileResponse> {
-        no_client_capability("file system")
-    }
-}
-
-impl WriteTextFileRequester for V2Tools {
-    fn write_text_file(
-        &self,
-        _: v1::WriteTextFileRequest,
-    ) -> RequestFuture<'_, v1::WriteTextFileResponse> {
-        no_client_capability("file system")
-    }
-}
-
-impl TerminalRequester for V2Tools {
-    fn create_terminal(
-        &self,
-        _: v1::CreateTerminalRequest,
-    ) -> RequestFuture<'_, v1::CreateTerminalResponse> {
-        no_client_capability("terminal")
-    }
-    fn terminal_output(
-        &self,
-        _: v1::TerminalOutputRequest,
-    ) -> RequestFuture<'_, v1::TerminalOutputResponse> {
-        no_client_capability("terminal")
-    }
-    fn wait_for_terminal_exit(
-        &self,
-        _: v1::WaitForTerminalExitRequest,
-    ) -> RequestFuture<'_, v1::WaitForTerminalExitResponse> {
-        no_client_capability("terminal")
-    }
-    fn release_terminal(
-        &self,
-        _: v1::ReleaseTerminalRequest,
-    ) -> RequestFuture<'_, v1::ReleaseTerminalResponse> {
-        no_client_capability("terminal")
-    }
-    fn kill_terminal(
-        &self,
-        _: v1::KillTerminalRequest,
-    ) -> RequestFuture<'_, v1::KillTerminalResponse> {
-        no_client_capability("terminal")
-    }
-}
-
-impl PermissionRequester for V2Tools {
-    fn request_permission(
-        &self,
-        request: v1::RequestPermissionRequest,
-    ) -> RequestFuture<'_, v1::RequestPermissionResponse> {
-        let request = permission_request(request);
-        Box::pin(async move {
-            let response = self.connection.send_request(request).block_task().await?;
-            Ok(v1::RequestPermissionResponse::new(match response.outcome {
-                v2::RequestPermissionOutcome::Selected(selected) => {
-                    v1::RequestPermissionOutcome::Selected(v1::SelectedPermissionOutcome::new(
-                        selected.option_id.to_string(),
-                    ))
-                }
-                // Cancelled, or an outcome this probe does not know: deny.
-                _ => v1::RequestPermissionOutcome::Cancelled,
-            }))
-        })
-    }
-}
-
-impl ToolProgressReporter for V2Tools {
-    fn report_in_progress(&self, session_id: &v1::SessionId, tool_call_id: &str) {
-        // Best effort, as in v1: a lost progress hint must not fail the tool.
-        let _ = send(
-            &self.connection,
-            &session_id.to_string().into(),
-            v2::SessionUpdate::ToolCallUpdate(
-                v2::ToolCallUpdate::new(tool_call_id.to_string())
-                    .status(v2::ToolCallStatus::InProgress),
-            ),
-        );
-    }
-}
-
-/// Translate the shared gating logic's v1 request into v2's: the tool call is
-/// the subject, and the options keep their identifiers.
-fn permission_request(request: v1::RequestPermissionRequest) -> v2::RequestPermissionRequest {
-    let call = request.tool_call;
-    let title = call
-        .fields
-        .title
-        .clone()
-        .unwrap_or_else(|| "Run tool".to_owned());
-    let mut tool_call = v2::ToolCallUpdate::new(call.tool_call_id.to_string())
-        .title(title.clone())
-        .status(v2::ToolCallStatus::Pending);
-    if let Some(kind) = call.fields.kind {
-        tool_call = tool_call.kind(v2_tool_kind(kind.into()));
-    }
-    if let Some(raw_input) = call.fields.raw_input {
-        tool_call = tool_call.raw_input(raw_input);
-    }
-    let options = request
-        .options
-        .into_iter()
-        .map(|option| {
-            let kind = match option.kind {
-                v1::PermissionOptionKind::AllowOnce => v2::PermissionOptionKind::AllowOnce,
-                v1::PermissionOptionKind::AllowAlways => v2::PermissionOptionKind::AllowAlways,
-                v1::PermissionOptionKind::RejectOnce => v2::PermissionOptionKind::RejectOnce,
-                _ => v2::PermissionOptionKind::RejectAlways,
-            };
-            v2::PermissionOption::new(option.option_id.to_string(), option.name, kind)
-        })
-        .collect();
-    v2::RequestPermissionRequest::new(request.session_id.to_string(), title, options).subject(
-        v2::RequestPermissionSubject::ToolCall(Box::new(v2::ToolCallPermissionSubject::new(
-            tool_call,
-        ))),
-    )
 }
 
 fn stop_reason(result: &PromptResult) -> v2::StopReason {

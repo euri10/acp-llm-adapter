@@ -1,31 +1,39 @@
-# ACP v2 probe
+# ACP v2 support
 
-A bounded implementation of the [ACP v2 draft](https://agentclientprotocol.com/protocol/v2/overview),
-built to find out what v2 costs this adapter and to report what does not work
-while the draft is still open to feedback
-([announcement](https://agentclientprotocol.com/announcements/acp-v2-draft)).
-It is parked behind an off-by-default cargo feature; released binaries speak
-ACP v1 only. Tracked as `daa-acp-v2-37zc`.
+An implementation of the [ACP v2 draft](https://agentclientprotocol.com/protocol/v2/overview)
+alongside ACP v1, extending the original `daa-acp-v2-37zc` probe. Promotion is
+tracked as `daa-jn8o`. The protocol and the SDK's `unstable_protocol_v2` surface
+are still drafts; editor adoption does not imply protocol stability.
 
-## Status: parked
+## Status: implementation ready, default promotion awaiting editor validation
 
-The probe stays behind the `protocol-v2` feature until one of these triggers
-fires, checked at every `agent-client-protocol` upgrade
-([Rust policy](agent-rust.md)):
+The original promotion triggers, checked at every SDK upgrade, were:
 
 - ACP announces v2 as stable.
 - The SDK stabilises v2: `unstable_protocol_v2` is removed, or V2 is available
   without it.
 - A target editor (Zed, CodeCompanion, LouiseLM) requests `protocolVersion: 2`.
 
-Last checked 2026-10-28, on the upgrade to SDK 3.5.0: the editor trigger has
+Checked 2026-10-29 with SDK 3.5.0: the editor trigger has
 fired. [Zed's ACP beta path](https://github.com/zed-industries/zed/blob/e5bdd01cd819d6348ae764e69218adfee3d7edab/crates/agent_servers/src/acp.rs#L132)
 [requests version 2](https://github.com/zed-industries/zed/blob/e5bdd01cd819d6348ae764e69218adfee3d7edab/crates/agent_servers/src/acp/v2.rs#L427).
 The SDK still gates v2 behind `unstable_protocol_v2`, ACP still lists it as
 Draft, and the inspected CodeCompanion and LouiseLM clients request version 1.
-Promotion is tracked as `daa-jn8o` and requires a design: the follow-ups in
-`daa-acp-v2-followups-5m7j`, MCP, edits with the v2 diff format, and whether
-released binaries ship v2. The probe remains off by default pending that work.
+The maintainer approved shipping both protocols by default after validation.
+The tool/session gaps below are implemented and covered by wire and SDK tests.
+LouiseLM and CodeCompanion's unchanged configurations are tested against the
+dual-protocol binary and continue negotiating v1.
+
+The remaining editor gate is a real v2 session. Zed 1.27.0-pre includes the v2
+client, but its [release build only honors feature-flag overrides for staff](https://github.com/zed-industries/zed/blob/1a91814bd79e80e8f21ed7bea8e228852cd13def/crates/feature_flags/src/store.rs#L99).
+An isolated check with `acp-beta: on` still negotiated v1. That is a v1 pass,
+not a v2 pass. Until this gate is resolved, `protocol-v2` remains opt-in and
+default/released builds continue speaking v1 only.
+
+Once promoted, LouiseLM needs no configuration change: update the adapter
+binary, keeping the same command, arguments, backend and environment. The
+editor chooses the protocol in `initialize`; enabling v2 in the binary does
+not force v1 clients onto v2.
 
 ## What it covers
 
@@ -49,13 +57,30 @@ v1 clients reach the unchanged v1 implementation, v2 clients reach
 - Config options for mode, model and effort, including
   `session/set_config_option` and `config_option_update`; Plan still revokes a
   pending approval.
-- Tools, always run locally because v2 has no client file system or terminal,
+- Built-in tools, always run locally because v2 has no client file system or terminal delegation,
   behind the same permission gating as v1; permission prompts become v2
-  `session/request_permission` requests with the tool call as subject.
+  `session/request_permission` requests. The sequential turn reports
+  `requires_action` while waiting, then `running` when it resumes. Cancellation
+  ends with `idle(cancelled)`; late approvals cannot resume cancelled work.
+- `run_command` uses the command subject with its actual command, cwd and tool
+  call ID. MCP calls keep tool-call subjects, even if their arguments contain
+  a field named `command`.
+- File creation and editing previews/results use v2 changes-list diffs with
+  absolute paths and renderable Git patches. Whole-file hunks preserve newline
+  endings and quote unusual filenames; unchanged content needs no patch.
+- Stdio and streamable-HTTP MCP, using the shared executor and approval policy.
+  Unsupported transports (including v1's legacy SSE) are rejected. MCP
+  configuration credentials are not stored in v2 session metadata; clients
+  supply the desired servers again on resume.
+- `additionalDirectories`, with the shared directory-relative confinement.
+  Resume applies the newly supplied roots and servers, including empty lists;
+  it does not silently reinstate removed access from persistence. It reports an
+  idle snapshot after optional history replay.
 - `/clear`, as in v1.
 
-Not covered: MCP servers, `additionalDirectories`, edits shown with the v2 diff
-format, terminals, selected-content Sessions. Unadvertised inputs are refused.
+Not advertised: image/audio/embedded prompt content, terminal streaming,
+elicitation, subagents, selected-content Sessions or MCP-over-ACP. Unadvertised
+prompt content and MCP transports are refused.
 
 ## Trying it
 
@@ -65,7 +90,13 @@ cargo test --locked --features protocol-v2 --test serve_protocol_v2
 ```
 
 The tests drive the real binary over raw JSON-RPC and with the official SDK
-v2 client, against the mock backend and a localhost fake provider.
+v2 client, against the mock backend and a localhost fake provider. Both MCP
+transports, approval/denial, cancellation with a late approval, edit previews,
+and root/server revocation on resume are covered. The editor smoke script
+explicitly builds the dual-protocol router for the existing v1 clients.
+Unknown/inactive sessions return v2's `-32002`; cancellation of an inactive
+session is ignored. Corrupt storage remains an internal error, not a missing
+session. The v1 error mapping is preserved.
 
 ## Result: the architecture held
 
@@ -101,17 +132,18 @@ None survived, so nothing was filed.
    `type` and `value` at the top level of the request, as the
    [config options page](https://agentclientprotocol.com/protocol/v2/session-config-options)
    shows. Our test sent a nested value first.
-5. **Internal: no `requires_action` during permission waits.** The prompt
+5. **Resolved during promotion: `requires_action` during permission waits.** The prompt
    lifecycle says the agent *should* report `requires_action` while blocked on
    a permission response and `running` when work resumes. The probe sends
-   neither.
-6. **Internal: no diff previews for edits.** v2 permission requests carry the
+   neither; the implementation now reports both, with a cancellation regression.
+6. **Resolved during promotion: diff previews for edits.** v2 permission requests carry the
    subject's `ToolCallUpdate`, so a preview needs the new v2 diff format. The
-   probe sends none, a step back from v1's previews (0.9.3) until it does.
-7. **Internal: `run_command` could use the `command` subject.** v2's
+   probe sent none; previews and completed edits now share the same v2 encoder.
+7. **Resolved during promotion: `run_command` uses the `command` subject.** v2's
    `CommandPermissionSubject` (command, cwd, tool call ID) fits better than a
    generic tool-call subject.
 8. **Resolved: SDK lag.** The `error` stop reason (spec #2281) was missing from
    SDK 3.1 / schema 1.10.2; the adapter moved to 3.3.0 / 1.11.0.
 
-Findings 5 to 7 are recorded as follow-up work for promotion to full support.
+Findings 5 to 7 are tracked in `daa-acp-v2-followups-5m7j`; `daa-jn8o` retains
+the final default-build/editor-validation gate.

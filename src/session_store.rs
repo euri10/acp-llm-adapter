@@ -829,7 +829,7 @@ impl SessionStore {
 
         persistence
             .load_record(session_id)
-            .map_err(|e| AdapterError::Internal(e.to_string()))
+            .map_err(AdapterError::from)
     }
 
     /// Return the absolute path to the session's `history.jsonl` file, if

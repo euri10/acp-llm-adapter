@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- ACP v2 permission-wait states, structured command subjects, and renderable file-edit previews/results.
+- ACP v2 stdio/HTTP MCP and additional directories, with fresh configuration on resume and no persisted MCP credentials in v2 session metadata.
+
+### Testing
+- Verify unchanged LouiseLM and CodeCompanion configurations against the dual-protocol router. Default-v2 promotion awaits real-editor v2 validation; the draft feature remains opt-in meanwhile.
+
+### Fixed
+- Return v2's unknown-session error without changing v1 responses; ignore inactive-session cancellation.
+
 ## [0.9.6](https://github.com/euri10/acp-llm-adapter/compare/v0.9.5...v0.9.6) - 2026-10-28
 
 ### Fixed

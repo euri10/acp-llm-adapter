@@ -249,6 +249,8 @@ pub(crate) trait PermissionRequester: Send + Sync {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
+        tool_name: &str,
+        cwd: &std::path::Path,
     ) -> AcpRequestFuture<'_, RequestPermissionResponse>;
 }
 
@@ -310,6 +312,8 @@ impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
+        _tool_name: &str,
+        _cwd: &std::path::Path,
     ) -> AcpRequestFuture<'_, RequestPermissionResponse> {
         Box::pin(self.send_request(request).block_task())
     }
@@ -385,7 +389,7 @@ pub(crate) async fn request_tool_permission(
     let response = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Ok(PermissionDecision::Cancelled),
-        response = requester.request_permission(request) => response,
+        response = requester.request_permission(request, call.name(), &context.cwd) => response,
     }
     .map_err(|e| AdapterError::Internal(e.to_string()))?;
     // Approval and cancellation can become ready together. A stale reply must

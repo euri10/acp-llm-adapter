@@ -171,6 +171,8 @@ impl PermissionRequester for SwapOnApproval {
     fn request_permission(
         &self,
         _request: agent_client_protocol::schema::v1::RequestPermissionRequest,
+        _tool_name: &str,
+        _cwd: &std::path::Path,
     ) -> futures_util::future::BoxFuture<
         '_,
         Result<

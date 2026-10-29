@@ -2478,22 +2478,26 @@ async fn connection_to_client_permission_requester_delegation()
     let response = Agent
         .builder()
         .connect_with(client_transport, async move |cx| {
-            cx.request_permission(RequestPermissionRequest::new(
-                agent_client_protocol::schema::v1::SessionId::new("session-permission"),
-                agent_client_protocol::schema::v1::ToolCallUpdate::new(
-                    "call-permission",
-                    agent_client_protocol::schema::v1::ToolCallUpdateFields::new()
-                        .kind(agent_client_protocol::schema::v1::ToolKind::Execute)
-                        .status(agent_client_protocol::schema::v1::ToolCallStatus::Pending)
-                        .title("run_command")
-                        .raw_input(serde_json::json!({ "command": "echo hi" })),
+            cx.request_permission(
+                RequestPermissionRequest::new(
+                    agent_client_protocol::schema::v1::SessionId::new("session-permission"),
+                    agent_client_protocol::schema::v1::ToolCallUpdate::new(
+                        "call-permission",
+                        agent_client_protocol::schema::v1::ToolCallUpdateFields::new()
+                            .kind(agent_client_protocol::schema::v1::ToolKind::Execute)
+                            .status(agent_client_protocol::schema::v1::ToolCallStatus::Pending)
+                            .title("run_command")
+                            .raw_input(serde_json::json!({ "command": "echo hi" })),
+                    ),
+                    vec![agent_client_protocol::schema::v1::PermissionOption::new(
+                        "allow-once",
+                        "Allow once",
+                        agent_client_protocol::schema::v1::PermissionOptionKind::AllowOnce,
+                    )],
                 ),
-                vec![agent_client_protocol::schema::v1::PermissionOption::new(
-                    "allow-once",
-                    "Allow once",
-                    agent_client_protocol::schema::v1::PermissionOptionKind::AllowOnce,
-                )],
-            ))
+                "run_command",
+                std::path::Path::new("/"),
+            )
             .await
         })
         .await?;
@@ -3043,7 +3047,7 @@ async fn restore_persisted_session_rejects_mismatched_id()
     std::fs::write(meta_dir.join("meta.json"), meta_json.as_bytes())
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-    let Err(error) = restore_persisted_session(&store, &session_id, &workspace).await else {
+    let Err(error) = restore_persisted_session(&store, &session_id, &workspace, None).await else {
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected mismatched persisted session id to fail"));
     };

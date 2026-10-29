@@ -712,8 +712,10 @@ impl PermissionRequester for TransitionRequester {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
+        tool_name: &str,
+        cwd: &std::path::Path,
     ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
-        self.permission.request_permission(request)
+        self.permission.request_permission(request, tool_name, cwd)
     }
 }
 

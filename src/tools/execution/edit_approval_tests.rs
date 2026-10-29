@@ -46,6 +46,8 @@ impl PermissionRequester for ChangeOnApproval {
     fn request_permission(
         &self,
         _request: RequestPermissionRequest,
+        _tool_name: &str,
+        _cwd: &std::path::Path,
     ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
         Box::pin(async move {
             if let Some(path) = &self.local_path {

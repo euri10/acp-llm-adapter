@@ -204,6 +204,8 @@ mod tests {
         fn request_permission(
             &self,
             _request: RequestPermissionRequest,
+            _tool_name: &str,
+            _cwd: &std::path::Path,
         ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>>
         {
             self.permission.fetch_add(1, Ordering::SeqCst);

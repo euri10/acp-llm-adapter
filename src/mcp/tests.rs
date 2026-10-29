@@ -193,6 +193,8 @@ impl PermissionRequester for FakePermissionRequester {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
+        _tool_name: &str,
+        _cwd: &std::path::Path,
     ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
         self.requests
             .lock()
