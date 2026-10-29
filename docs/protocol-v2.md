@@ -5,7 +5,7 @@ alongside ACP v1, extending the original `daa-acp-v2-37zc` probe. Promotion is
 tracked as `daa-jn8o`. The protocol and the SDK's `unstable_protocol_v2` surface
 are still drafts; editor adoption does not imply protocol stability.
 
-## Status: implementation ready, default promotion awaiting editor validation
+## Status: experimental, enabled by default alongside v1
 
 The original promotion triggers, checked at every SDK upgrade, were:
 
@@ -19,25 +19,27 @@ fired. [Zed's ACP beta path](https://github.com/zed-industries/zed/blob/e5bdd01c
 [requests version 2](https://github.com/zed-industries/zed/blob/e5bdd01cd819d6348ae764e69218adfee3d7edab/crates/agent_servers/src/acp/v2.rs#L427).
 The SDK still gates v2 behind `unstable_protocol_v2`, ACP still lists it as
 Draft, and the inspected CodeCompanion and LouiseLM clients request version 1.
-The maintainer approved shipping both protocols by default after validation.
+The maintainer approved shipping both protocols by default using SDK/wire tests
+and existing v1 editor regression checks as the release gate.
 The tool/session gaps below are implemented and covered by wire and SDK tests.
 LouiseLM and CodeCompanion's unchanged configurations are tested against the
 dual-protocol binary and continue negotiating v1.
 
-The remaining editor gate is a real v2 session. Zed 1.27.0-pre includes the v2
-client, but its [release build only honors feature-flag overrides for staff](https://github.com/zed-industries/zed/blob/1a91814bd79e80e8f21ed7bea8e228852cd13def/crates/feature_flags/src/store.rs#L99).
+The remaining non-blocking QA task (`daa-ltct`) is a real v2 session. Zed
+1.27.0-pre includes the v2 client, but its
+[release build only honors feature-flag overrides for staff](https://github.com/zed-industries/zed/blob/1a91814bd79e80e8f21ed7bea8e228852cd13def/crates/feature_flags/src/store.rs#L99).
 An isolated check with `acp-beta: on` still negotiated v1. That is a v1 pass,
-not a v2 pass. Until this gate is resolved, `protocol-v2` remains opt-in and
-default/released builds continue speaking v1 only.
+not a v2 pass. Real-editor v2 interoperability is not yet verified; this limit
+does not block default builds under the maintainer's accepted release policy.
 
-Once promoted, LouiseLM needs no configuration change: update the adapter
+LouiseLM needs no configuration change: update the adapter
 binary, keeping the same command, arguments, backend and environment. The
 editor chooses the protocol in `initialize`; enabling v2 in the binary does
 not force v1 clients onto v2.
 
 ## What it covers
 
-Built with the `protocol-v2` feature, `serve` reads each connection's
+Built with the default `protocol-v2` feature, `serve` reads each connection's
 `initialize` request and routes it with the SDK's `Agent.protocol_router()`:
 v1 clients reach the unchanged v1 implementation, v2 clients reach
 [`src/acp/v2.rs`](../src/acp/v2.rs).
@@ -85,15 +87,22 @@ prompt content and MCP transports are refused.
 ## Trying it
 
 ```sh
-cargo install --path . --features protocol-v2
-cargo test --locked --features protocol-v2 --test serve_protocol_v2
+cargo install --locked --path .
+cargo test --locked --test serve_protocol_v2
+```
+
+For an explicit v1-only binary and its negotiation checks:
+
+```sh
+cargo install --locked --path . --no-default-features
+cargo test --locked --no-default-features --test serve_protocol_v2
 ```
 
 The tests drive the real binary over raw JSON-RPC and with the official SDK
 v2 client, against the mock backend and a localhost fake provider. Both MCP
 transports, approval/denial, cancellation with a late approval, edit previews,
 and root/server revocation on resume are covered. The editor smoke script
-explicitly builds the dual-protocol router for the existing v1 clients.
+builds the shipped default dual-protocol router for the existing v1 clients.
 Unknown/inactive sessions return v2's `-32002`; cancellation of an inactive
 session is ignored. Corrupt storage remains an internal error, not a missing
 session. The v1 error mapping is preserved.
@@ -145,5 +154,5 @@ None survived, so nothing was filed.
 8. **Resolved: SDK lag.** The `error` stop reason (spec #2281) was missing from
    SDK 3.1 / schema 1.10.2; the adapter moved to 3.3.0 / 1.11.0.
 
-Findings 5 to 7 are tracked in `daa-acp-v2-followups-5m7j`; `daa-jn8o` retains
-the final default-build/editor-validation gate.
+Findings 5 to 7 were resolved in `daa-acp-v2-followups-5m7j`; `daa-jn8o` covers
+default-build promotion. Real-editor v2 QA remains separate in `daa-ltct`.

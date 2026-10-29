@@ -8,8 +8,10 @@ keeps sessions, and reports usage and cost. The provider only needs an
 OpenAI-compatible chat API.
 
 > [!WARNING]
-> Alpha software: expect breaking changes. It speaks ACP v1; prompts take text
-> and embedded file context, not images or audio, and elicitation is not
+> Alpha software: expect breaking changes. Default builds negotiate ACP v1 or
+> experimental [ACP v2](docs/protocol-v2.md), which remains a draft; real-editor
+> v2 validation is still pending. Existing LouiseLM/CodeCompanion configurations
+> stay unchanged and negotiate v1. Images, audio and elicitation are not
 > supported ([ACP coverage](docs/acp-coverage.md)).
 
 ![LouiseLM reviewing an acp-llm-adapter edit in Ask mode: the diff adds only a docstring to hello.py, above the Allow once / Allow always prompt](https://raw.githubusercontent.com/euri10/acp-llm-adapter/main/docs/images/louiselm.png)

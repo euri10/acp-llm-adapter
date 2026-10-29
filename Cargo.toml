@@ -22,8 +22,9 @@ test-log = { version = "^0.2.21", default-features = false, features = [
 ] }
 
 [features]
-# Draft ACP v2 probe (daa-acp-v2-37zc): routes v2 connections to a separate
-# implementation. Off by default; released binaries speak ACP v1 only.
+# Negotiate v1 or experimental v2 per connection. Disable default features
+# for a v1-only binary; the v2 protocol and SDK surface are still drafts.
+default = ["protocol-v2"]
 protocol-v2 = ["agent-client-protocol/unstable_protocol_v2"]
 
 [dependencies]

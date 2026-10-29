@@ -62,10 +62,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      # Released binaries use default features; --all-features also enables
-      # the draft protocol-v2 probe, so lint the shipped configuration too.
+      # Check the shipped configuration and the explicit v1-only fallback.
       - name: cargo clippy (default features, as released)
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo clippy (v1-only fallback)
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
       # ------------------------------------------------------------------
       # 3. Testing    (AGENTS.md -> docs/agent-testing.md)
@@ -86,9 +88,15 @@ jobs:
       - name: cargo test (doc-tests)
         run: cargo test --locked --doc --all-features
 
-      # The shipped binary must keep answering v2 requests with v1.
+      # Default builds negotiate both protocols; v1-only builds answer v2
+      # requests with v1. Keep both contracts covered explicitly.
       - name: cargo test (default features, protocol negotiation)
         run: cargo test --locked --test serve_protocol_v2
+        env:
+          LLM_API_KEY: "skip-ci-no-key"
+
+      - name: cargo test (v1-only fallback, protocol negotiation)
+        run: cargo test --locked --no-default-features --test serve_protocol_v2
         env:
           LLM_API_KEY: "skip-ci-no-key"
 

@@ -1,24 +1,19 @@
 # ACP protocol coverage
 
-acp-llm-adapter implements **ACP v1** (`protocolVersion: 1`), the stable
-protocol, and every link below points to the [v1 specification](https://agentclientprotocol.com/protocol/v1/overview).
-ACP v2 is still labelled draft and drops v1 surfaces this adapter uses (client
-file system, terminals and session modes; see the
-[v2 migration guide](https://agentclientprotocol.com/protocol/v2/migration)).
-A client that asks for version 2 is answered with 1, as
-[version negotiation](https://agentclientprotocol.com/protocol/v1/initialization#version-negotiation) prescribes, and
-may continue with v1 or disconnect.
+Default builds negotiate stable **ACP v1** (`protocolVersion: 1`) or
+experimental **ACP v2** (`protocolVersion: 2`) per connection. Existing v1
+editors keep their configuration and behavior. The coverage table below is
+for the [v1 specification](https://agentclientprotocol.com/protocol/v1/overview).
 
-A draft ACP v2 probe exists behind the off-by-default `protocol-v2` cargo
-feature (daa-acp-v2-37zc). Built with it, `serve` routes each connection by
-its `initialize` request: v1 clients reach this unchanged implementation, and
-v2 clients a separate one implementing the v2 session baseline (new, list,
-resume with optional replay, close, prompt, cancel and updates) over the same
-session store and turn loop, with config options for mode, model and effort,
-and tools that always run locally (v2 has no client file system or terminal)
-behind the same permission gating as v1. Edit permission requests carry no
-diff preview in v2 yet. Released binaries do not include it. See
-[ACP v2 probe](protocol-v2.md) for what it covers and what it found.
+See [ACP v2 support](protocol-v2.md) for v2 sessions, MCP, local tools and edit
+previews, plus the outstanding real-editor validation. V2 remains a draft;
+SDK/wire checks are not a real-editor v2 pass. Both implementations share the
+session store, turn loop, permission gating and path confinement.
+
+An explicit `--no-default-features` build speaks only v1. A v2 request then
+receives version 1 under
+[version negotiation](https://agentclientprotocol.com/protocol/v1/initialization#version-negotiation);
+the client may continue with v1 or disconnect.
 
 Loading or resuming a session with an active turn is rejected at session
 publication, including when the turn began during restore setup. Cancellation

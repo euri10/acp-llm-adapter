@@ -42,9 +42,9 @@ fetch() { # name url rev -> prints checkout path
   printf '%s' "$dir"
 }
 
-# Exercise v1 editors through the dual-protocol router even before v2 ships
-# in default builds. Their snippets and protocol selection stay unchanged.
-cargo build --locked -q --features protocol-v2 --bin acp-llm-adapter --example fake_provider
+# Exercise v1 editors through the shipped default dual-protocol router.
+# Their snippets and protocol selection stay unchanged.
+cargo build --locked -q --bin acp-llm-adapter --example fake_provider
 # The snippets call `acp-llm-adapter`; resolve it to this checkout's build.
 export PATH="$PWD/target/debug:$PATH"
 

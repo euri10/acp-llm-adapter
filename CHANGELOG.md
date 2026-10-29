@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Enable ACP v1 and experimental v2 negotiation by default; retain `--no-default-features` for v1-only builds. Existing editor configurations stay unchanged.
 - ACP v2 permission-wait states, structured command subjects, and renderable file-edit previews/results.
 - ACP v2 stdio/HTTP MCP and additional directories, with fresh configuration on resume and no persisted MCP credentials in v2 session metadata.
 
 ### Testing
-- Verify unchanged LouiseLM and CodeCompanion configurations against the dual-protocol router. Default-v2 promotion awaits real-editor v2 validation; the draft feature remains opt-in meanwhile.
+- Verify unchanged LouiseLM and CodeCompanion configurations against the default dual-protocol router, with explicit v1-only fallback checks. Real-editor v2 validation remains a non-blocking follow-up (`daa-ltct`), not a claimed pass.
 
 ### Fixed
 - Return v2's unknown-session error without changing v1 responses; ignore inactive-session cancellation.
