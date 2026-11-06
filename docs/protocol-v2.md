@@ -25,6 +25,13 @@ The tool/session gaps below are implemented and covered by wire and SDK tests.
 LouiseLM and CodeCompanion's unchanged configurations are tested against the
 dual-protocol binary and continue negotiating v1.
 
+Rechecked 2026-11-06 with [SDK 3.6.0](https://github.com/agentclientprotocol/rust-sdk/releases/tag/v3.6.0)
+and schema 1.13.0: the protocol remains Draft and the SDK still requires
+`unstable_protocol_v2`. Zed's beta path still requests v2; the pinned LouiseLM
+and CodeCompanion clients still use v1. Schema 1.13 represents slash commands
+as a tagged union, so session creation and resume now advertise each command
+with `type: "command"`. This upgrade does not establish real-editor v2 QA.
+
 The remaining non-blocking QA task (`daa-ltct`) is a real v2 session. Zed
 1.27.0-pre includes the v2 client, but its
 [release build only honors feature-flag overrides for staff](https://github.com/zed-industries/zed/blob/1a91814bd79e80e8f21ed7bea8e228852cd13def/crates/feature_flags/src/store.rs#L99).

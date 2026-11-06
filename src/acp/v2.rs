@@ -660,13 +660,13 @@ fn available_commands() -> Vec<v2::AvailableCommand> {
     adapter_available_commands()
         .into_iter()
         .map(|command| {
-            let mut available = v2::AvailableCommand::new(command.name, command.description);
+            let mut available = v2::Command::new(command.name, command.description);
             if let Some(v1::AvailableCommandInput::Unstructured(input)) = command.input {
                 available = available.input(v2::AvailableCommandInput::Text(
                     v2::TextCommandInput::new(input.hint),
                 ));
             }
-            available
+            v2::AvailableCommand::Command(available)
         })
         .collect()
 }

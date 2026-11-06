@@ -303,12 +303,12 @@ async fn v2_session_baseline_over_the_wire() -> Result<(), Box<dyn Error>> {
         .and_then(Value::as_str)
         .ok_or_else(|| format!("session/new failed: {created}"))?
         .to_owned();
-    assert!(
-        created
-            .pointer("/result/availableCommands")
-            .and_then(Value::as_array)
-            .is_some_and(|commands| !commands.is_empty())
-    );
+    let commands = &created["result"]["availableCommands"];
+    let clear = commands
+        .as_array()
+        .and_then(|commands| commands.iter().find(|command| command["name"] == "clear"))
+        .ok_or("session/new did not advertise /clear")?;
+    assert_eq!(clear["type"], "command");
     let ready = connection.until_idle(0).await?;
     assert_eq!(kinds(&ready), ["state_update:idle"]);
 
@@ -374,6 +374,7 @@ async fn v2_session_baseline_over_the_wire() -> Result<(), Box<dyn Error>> {
         )
         .await?;
     assert!(resumed.get("result").is_some(), "{resumed}");
+    assert_eq!(&resumed["result"]["availableCommands"], commands);
     let replayed: Vec<Value> = connection.notifications[mark..]
         .iter()
         .filter_map(|message| message.pointer("/params/update").cloned())
