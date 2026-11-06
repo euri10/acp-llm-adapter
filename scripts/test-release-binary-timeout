@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Regression: a hung --version probe must not leave its Docker container alive."""
+
+import hashlib
+import io
+from pathlib import Path
+import runpy
+import subprocess
+import tarfile
+import tempfile
+import uuid
+from unittest.mock import patch
+
+
+checker = runpy.run_path(str(Path(__file__).with_name("check-release-binary")))
+run = subprocess.run
+container = "acp-release-timeout-" + uuid.uuid4().hex
+
+
+def short_probe(command, **kwargs):
+    if command[:2] == ["docker", "run"]:
+        command = list(command)
+        if "--name" in command:
+            command[command.index("--name") + 1] = container
+        else:
+            command[2:2] = ["--name", container]
+        kwargs["timeout"] = 3
+    elif command[:3] == ["docker", "rm", "--force"]:
+        command = [*command[:-1], container]
+    return run(command, **kwargs)
+
+
+# Pull before shortening the timeout, so a slow image download is not the test.
+run(["docker", "pull", "ubuntu:22.04"], check=True, stdout=subprocess.DEVNULL)
+try:
+    with tempfile.TemporaryDirectory(prefix="acp-release-timeout-") as directory:
+        archive = Path(directory) / "hung.tar.gz"
+        with tarfile.open(archive, "w:gz") as package:
+            for name, content in {
+                "acp-llm-adapter": b"#!/bin/sh\nexec sleep 300\n",
+                "LICENSE": b"test fixture\n",
+                "SOURCE.txt": b"intentional hung-version fixture\n",
+            }.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(content)
+                package.addfile(member, io.BytesIO(content))
+        checksum = archive.with_suffix(".sha256")
+        checksum.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+        with patch("subprocess.run", short_probe):
+            try:
+                checker["check"](archive, checksum, "0.0.0", "ubuntu:22.04")
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise AssertionError("hung version probe did not time out")
+        remaining = run(["docker", "ps", "--all", "--quiet", "--filter", f"name=^/{container}$"],
+                        check=True, capture_output=True, text=True).stdout.strip()
+        assert not remaining, f"version probe leaked container {container}: {remaining}"
+        print("PASS: timed-out version container removed and client reaped")
+finally:
+    # Clean up the deliberately broken baseline too; never touch other containers.
+    run(["docker", "rm", "--force", container], check=False, capture_output=True)

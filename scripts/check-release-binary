@@ -45,12 +45,18 @@ def check(archive, checksum, version, image):
             "--env", "HOME=/pilot/home", "--env", "XDG_STATE_HOME=/pilot/state",
             "--env", "PATH=/pilot/home/.local/bin:/usr/bin:/bin",
         ]
-        launch = subprocess.run(base + [image, "sh", "-ec", """
-            for tool in rustc cargo python python3 node npm; do
-                if command -v "$tool"; then exit 1; fi
-            done
-            exec acp-llm-adapter --version
-        """], capture_output=True, text=True, timeout=120)
+        try:
+            launch = subprocess.run(base + ["--name", container, image, "sh", "-ec", """
+                for tool in rustc cargo python python3 node npm; do
+                    if command -v "$tool"; then exit 1; fi
+                done
+                exec acp-llm-adapter --version
+            """], capture_output=True, text=True, timeout=120)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            # Killing the Docker client does not stop its container.
+            subprocess.run(["docker", "rm", "--force", container],
+                           check=True, stdout=subprocess.DEVNULL, timeout=15)
+            raise
         assert launch.returncode == 0, launch.stderr
         assert launch.stdout.strip() == f"acp-llm-adapter {version}", launch.stdout
         print(f"Installed --version passed in {image}; no Rust/Python/Node runtime", flush=True)

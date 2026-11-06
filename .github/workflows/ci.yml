@@ -54,6 +54,9 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      - name: Release checker timeout cleanup
+        run: python3 scripts/test-release-binary-timeout
+
       # ------------------------------------------------------------------
       # 2. Linting    (AGENTS.md -> docs/agent-rust.md)
       # ------------------------------------------------------------------
