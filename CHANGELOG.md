@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/euri10/acp-llm-adapter/compare/v0.10.0...v0.10.1) - 2026-11-06
+
+### Fixed
+
+- *(tests)* reap editor-check children
+- *(release)* own container creation and cleanup
+- *(release)* reap timed-out version probes
+
+### Other
+
+- *(beads)* checkpoint marketing rollout
+- verify CodeCompanion release setup
+- link the tested ACP pilot recipes
+- *(beads)* record marketing pilot evidence
+- add verified binary installation path
+- publish verified Linux release binaries
+- record live agentic.nvim pilot
+- reap agentic smoke adapter on exit
+- add tested agentic.nvim pilot recipe
+- add tested cc-connect pilot recipe
+- *(beads)* sync acceptance and marketing plan
+
 ## [0.10.0](https://github.com/euri10/acp-llm-adapter/compare/v0.9.6...v0.10.0) - 2026-11-06
 
 ### Added
