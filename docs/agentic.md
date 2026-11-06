@@ -13,7 +13,7 @@ Checked on 2026-11-06, Linux x86_64, adapter **v0.10.0** (runtime source
 Neovim **0.12.5** and **0.13.0-dev-1511+g5209695703**. The installation route
 was a locked Cargo build and the pinned plugin source archive.
 
-These checks run the **actual client, adapter, permission UI buffers, and file
+The offline checks run the **actual client, adapter, permission UI buffers, and file
 tools**, using a localhost synthetic OpenAI-compatible provider and a dummy
 key. They do not establish live DeepSeek quality, human visual review, or
 outside-user adoption. GLM/Groq were not run in this client.
@@ -40,6 +40,35 @@ unreaped adapter process under a Linux subreaper. The checker closes the
 adapter's stdin and waits for its exit before releasing the transport; this
 does not fix upstream's normal forced-stop path. No command remains running
 in the observed cases. Tracked locally as `daa-agentic-stop-reap-6bjc`.
+
+## Separate live pilot
+
+On the same date, an agent-operated interactive Neovim 0.12.5 run used the
+**real DeepSeek API**, model `deepseek-v4-pro`, Low reasoning effort and a
+4096-token output cap. The operator issued each action after inspecting the
+client state, displayed buffers and disk. This was separate from the automated
+tests and was not an independent human-user trial.
+
+In a disposable `hello.py` project, the model read the file, searched for
+`greet`, and proposed adding `"""Return a friendly greeting."""`. The displayed
+split preserved every other line; disk stayed unchanged until **Allow once**,
+then contained exactly that edit. A separate `write_file` request was rejected
+with **Reject once**; `denied.txt` remained absent. An approved command created
+`live-started`, then slept for 20 seconds before a proposed second write.
+Cancellation during the sleep prevented `live-cancelled-too-late`; it was still
+absent more than 20 seconds later.
+
+The same session answered a follow-up after hiding/showing the panel. After
+destroying its idle widget, selecting it from the real restore picker preserved
+its id/model/mode. A new live answer correctly recalled the exact docstring,
+rejected filename and cancelled command. Graceful stdin EOF reaped the adapter
+before Neovim exited. This proves this small live flow, not model quality on
+other tasks, another backend, or return use by an outside user.
+
+Observed friction: the restore picker title starts with injected environment
+metadata rather than the task. Select by session id if needed. This is tracked
+as `daa-agentic-session-title-4hj7`; the title policy needs a separate design
+decision because other clients put context before the user's request.
 
 ## Run a small pilot
 
