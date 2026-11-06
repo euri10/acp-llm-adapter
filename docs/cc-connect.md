@@ -49,8 +49,9 @@ not tested; do not infer it from the short scenario.
 
 ## English: first Feishu task
 
-1. Install the pinned cc-connect release above. In this adapter checkout, build
-   with Rust 1.95+ using the command below. No native cc-connect backend is needed:
+1. Install the pinned cc-connect release above and the
+   [verified Linux x86_64 adapter binary](installation.md) (Cargo alternative
+   also documented). Put `$HOME/.local/bin` on `PATH`. No native cc-connect backend is needed:
    the maintained example uses `type = "acp"`.
 2. Configure an enterprise Feishu bot using cc-connect's
    [Feishu guide](https://github.com/chenhg5/cc-connect/blob/10442325984a4e228222dec3532cab8c31f7caaa/docs/feishu.md).
@@ -65,8 +66,8 @@ not tested; do not infer it from the short scenario.
 3. Run this from the adapter checkout in a shell with those variables exported:
 
 ```sh
-cargo build --locked --bin acp-llm-adapter
-export ACP_ADAPTER_BIN="$PWD/target/debug/acp-llm-adapter"
+acp-llm-adapter --version
+export ACP_ADAPTER_BIN="$(command -v acp-llm-adapter)"
 export CC_PILOT_WORKSPACE="$(mktemp -d)"
 export CC_PILOT_STATE="$(mktemp -d)"
 export XDG_STATE_HOME="$CC_PILOT_STATE/adapter"
@@ -112,8 +113,9 @@ private conversations or project contents.
 
 ## 中文：第一个飞书任务
 
-1. 安装上面固定版本的 cc-connect。在适配器源码目录中，用 Rust 1.95+ 执行上面的
-   命令块。配置通过通用 `type = "acp"` 启动，无需新增原生后端。
+1. 安装上面固定版本的 cc-connect 和[已验证的 Linux x86_64 适配器二进制](installation.md)，
+   将 `$HOME/.local/bin` 加入 `PATH`；不需要 Rust、Python 或 Node 运行时，仍可选择 Cargo 安装。
+   在适配器源码目录中执行上面的命令块以使用配置示例。配置通过通用 `type = "acp"` 启动，无需新增原生后端。
 2. 按[飞书指南](https://github.com/chenhg5/cc-connect/blob/10442325984a4e228222dec3532cab8c31f7caaa/docs/feishu.md)
    创建并发布机器人，配置消息权限、事件订阅及长连接，把试用用户加入可用范围。
    只需参考账号及平台设置部分；以本配方的 ACP 配置替换其中的 Claude Code 配置，

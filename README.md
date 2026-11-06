@@ -18,12 +18,17 @@ OpenAI-compatible chat API.
 
 ## Install
 
+**Linux x86_64:** [download, verify and install the release binary](docs/installation.md)
+(Ubuntu 22.04 / glibc 2.35 or newer). No Rust, Python or Node runtime is needed.
+
+Or build with Cargo (Rust 1.95 or newer):
+
 ```sh
-cargo install acp-llm-adapter
+cargo install --locked acp-llm-adapter
 acp-llm-adapter --version
 ```
 
-Requires Rust 1.95 or newer.
+Other OS/architecture combinations have no verified downloadable binary yet.
 
 ## Choose a backend
 

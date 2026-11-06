@@ -2,6 +2,7 @@
 
 ## User documentation
 
+- [Installation](installation.md) — verified Linux x86_64 binary, checksums, updates and Cargo alternative.
 - [Configuration](configuration.md) — environment variables, `--backend`, reasoning effort, backend defaults.
 - [Sessions and modes](sessions.md) — system instruction, reasoning replay, history budget, modes, settings persistence, `/clear`.
 - [Tools and permissions](tools-and-permissions.md) — built-in tools, file-root confinement, cancellation, `run_command`, MCP tools.

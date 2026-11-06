@@ -72,11 +72,12 @@ decision because other clients put context before the user's request.
 
 ## Run a small pilot
 
-From this adapter checkout, with Rust 1.95+, Neovim, curl, and tar installed:
+First [install the Linux x86_64 release binary](installation.md) and put
+`$HOME/.local/bin` on your `PATH`. The same page retains the Cargo alternative.
+From this adapter checkout (for the Lua recipe), with Neovim, curl and tar:
 
 ```sh
-cargo build --locked --bin acp-llm-adapter
-export PATH="$PWD/target/debug:$PATH"
+acp-llm-adapter --version
 export AGENTIC_RECIPE="$PWD/examples/agentic.lua"
 export AGENTIC_PILOT="$(mktemp -d)"
 curl -fsSL https://codeload.github.com/carlos-algms/agentic.nvim/tar.gz/f0bef086b3ed6121d9a18a5a820d071c69f2f0f5 |
