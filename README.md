@@ -52,6 +52,11 @@ LouiseLM and CodeCompanion it checks a reply, an approved and a rejected
 command, and that the edit preview shown before approval is the exact change.
 They use DeepSeek; for another backend change `--backend` and the key.
 
+Additional recipes: [agentic.nvim](docs/agentic.md), with real-client checks
+and a separate live DeepSeek pilot; and [cc-connect / cc-connect 试用](docs/cc-connect.md),
+with local synthetic transport/provider checks and real chat-account validation
+still pending.
+
 ### LouiseLM
 
 In your [LouiseLM](https://github.com/euri10/louiselm) setup:
