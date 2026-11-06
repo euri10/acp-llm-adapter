@@ -5,6 +5,7 @@ Usage: check-release-binary ARCHIVE CHECKSUM VERSION [IMAGE]
 Python and Docker run on the verifier host, not in the installed agent's runtime.
 """
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -17,6 +18,55 @@ import tarfile
 import tempfile
 import time
 import uuid
+
+
+@contextmanager
+def container_process(base, command, **options):
+    """Own creation, attached client and removal as one lifecycle.
+
+    Creation and the version probe have separate 120s budgets. ACP keeps its
+    per-request (30s) and EOF (10s) deadlines below. On failure,
+    allow creation another 120s to settle before removal (15s). Killing a
+    create client cannot cancel a daemon allocation, and an early force-rm
+    succeeds even for a not-yet-visible name. Never use --rm: this owner removes
+    the container, including after successful exits and failed assertions.
+    """
+    container = "acp-release-check-" + uuid.uuid4().hex
+    # Terminal SIGINT belongs to this owner, not an in-flight create client.
+    creation = subprocess.Popen(base + ["--name", container, "-i"] + command,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+    process = None
+    try:
+        output, errors = creation.communicate(timeout=120)
+        if creation.returncode:
+            raise subprocess.CalledProcessError(creation.returncode, creation.args, output, errors)
+        process = subprocess.Popen(["docker", "start", "--attach", "--interactive", container],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   start_new_session=True, **options)
+        yield process
+    finally:
+        try:
+            # Retain the creating client until allocation is acknowledged. If
+            # the daemon never settles, report cleanup failure, not success.
+            try:
+                creation.communicate(timeout=120)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    f"Creation did not settle; cleanup unconfirmed for {container}"
+                ) from error
+            subprocess.run(["docker", "rm", "--force", container],
+                           check=True, stdout=subprocess.DEVNULL, timeout=15)
+        finally:
+            # Removal can itself fail; that must never skip local child reaping.
+            for child in (process, creation):
+                if child is not None:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=15)
+                    for stream in (child.stdin, child.stdout, child.stderr):
+                        if stream is not None:
+                            stream.close()
 
 
 def check(archive, checksum, version, image):
@@ -36,36 +86,27 @@ def check(archive, checksum, version, image):
                 shutil.copyfileobj(source, target)
             print(package.extractfile("SOURCE.txt").read().decode(), end="", flush=True)
         binary.chmod(0o755)
-        container = "acp-release-check-" + uuid.uuid4().hex
         base = [
-            "docker", "run", "--rm", "--network=none", "--read-only",
+            "docker", "create", "--network=none", "--read-only",
             "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--user", f"{os.getuid()}:{os.getgid()}",
             "--volume", f"{root}:/pilot", "--workdir", "/pilot/project",
             "--env", "HOME=/pilot/home", "--env", "XDG_STATE_HOME=/pilot/state",
             "--env", "PATH=/pilot/home/.local/bin:/usr/bin:/bin",
         ]
-        try:
-            launch = subprocess.run(base + ["--name", container, image, "sh", "-ec", """
+        with container_process(base, [image, "sh", "-ec", """
                 for tool in rustc cargo python python3 node npm; do
                     if command -v "$tool"; then exit 1; fi
                 done
                 exec acp-llm-adapter --version
-            """], capture_output=True, text=True, timeout=120)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            # Killing the Docker client does not stop its container.
-            subprocess.run(["docker", "rm", "--force", container],
-                           check=True, stdout=subprocess.DEVNULL, timeout=15)
-            raise
-        assert launch.returncode == 0, launch.stderr
-        assert launch.stdout.strip() == f"acp-llm-adapter {version}", launch.stdout
+            """], stderr=subprocess.PIPE, text=True) as launch:
+            output, errors = launch.communicate(timeout=120)
+            assert launch.returncode == 0, errors
+            assert output.strip() == f"acp-llm-adapter {version}", output
         print(f"Installed --version passed in {image}; no Rust/Python/Node runtime", flush=True)
-        with (root / "stderr.log").open("wb") as stderr:
-            process = subprocess.Popen(
-                base + ["--name", container, "-i", image,
-                        "acp-llm-adapter", "serve", "--backend", "mock"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
-            )
+        with (root / "stderr.log").open("wb") as stderr, container_process(
+            base, [image, "acp-llm-adapter", "serve", "--backend", "mock"], stderr=stderr,
+        ) as process:
             buffered = b""
             request_id = 0
 
@@ -127,16 +168,10 @@ def check(archive, checksum, version, image):
                 process.stdin.close()
                 assert process.wait(timeout=10) == 0, "unclean adapter shutdown"
                 assert not buffered.strip() and not process.stdout.read().strip(), "trailing stdout"
-            finally:
-                # Own container only; reap the Docker client even after a failed assertion.
-                if process.poll() is None:
-                    subprocess.run(["docker", "rm", "--force", container],
-                                   check=False, stdout=subprocess.DEVNULL, timeout=15)
-                    process.wait(timeout=10)
-                process.stdout.close()
+            except BaseException:
                 stderr.flush()
-                if process.returncode:
-                    print((root / "stderr.log").read_text(), file=sys.stderr)
+                print((root / "stderr.log").read_text(), file=sys.stderr)
+                raise
         print("PASS: checksum, install, launch, ACP v1, ask/deny/allow effects, continuation, EOF/reap")
 
 

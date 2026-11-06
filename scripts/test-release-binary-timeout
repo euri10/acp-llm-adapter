@@ -1,62 +1,272 @@
 #!/usr/bin/env python3
-"""Regression: a hung --version probe must not leave its Docker container alive."""
+"""Exercise creation, probe and cleanup failures against Docker; no providers.
+
+The delayed-create case gates the real daemon request on cleanup/settlement,
+so it reproduces late allocation without depending on machine speed or sleeps.
+"""
 
 import hashlib
+import http.client
+import http.server
 import io
+import os
 from pathlib import Path
 import runpy
+import select
+import socket
+import socketserver
 import subprocess
 import tarfile
 import tempfile
-import uuid
+import threading
+import unittest
 from unittest.mock import patch
 
 
 checker = runpy.run_path(str(Path(__file__).with_name("check-release-binary")))
 run = subprocess.run
-container = "acp-release-timeout-" + uuid.uuid4().hex
+Popen = subprocess.Popen
+select_ready = select.select
 
 
-def short_probe(command, **kwargs):
-    if command[:2] == ["docker", "run"]:
-        command = list(command)
-        if "--name" in command:
-            command[command.index("--name") + 1] = container
-        else:
-            command[2:2] = ["--name", container]
-        kwargs["timeout"] = 3
-    elif command[:3] == ["docker", "rm", "--force"]:
-        command = [*command[:-1], container]
-    return run(command, **kwargs)
+class DockerProxy(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """Hold a create request while retaining its connection to the real daemon."""
+
+    def __init__(self, path, endpoint):
+        self.endpoint = endpoint
+        self.pending = threading.Event()
+        self.release = threading.Event()
+        self.created = threading.Event()
+        self.errors = []
+        super().__init__(str(path), CreateHandler)
 
 
-# Pull before shortening the timeout, so a slow image download is not the test.
-run(["docker", "pull", "ubuntu:22.04"], check=True, stdout=subprocess.DEVNULL)
-try:
-    with tempfile.TemporaryDirectory(prefix="acp-release-timeout-") as directory:
-        archive = Path(directory) / "hung.tar.gz"
-        with tarfile.open(archive, "w:gz") as package:
-            for name, content in {
-                "acp-llm-adapter": b"#!/bin/sh\nexec sleep 300\n",
-                "LICENSE": b"test fixture\n",
-                "SOURCE.txt": b"intentional hung-version fixture\n",
-            }.items():
-                member = tarfile.TarInfo(name)
-                member.size = len(content)
-                package.addfile(member, io.BytesIO(content))
-        checksum = archive.with_suffix(".sha256")
-        checksum.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
-        with patch("subprocess.run", short_probe):
+class CreateHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def forward(self):
+        connection = http.client.HTTPConnection("localhost", timeout=20)
+        creating = "/containers/create" in self.path
+        try:
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if creating:
+                self.server.pending.set()
+                if not self.server.release.wait(20):
+                    raise AssertionError("creation was neither settled nor cleaned up")
+            connection.sock = socket.socket(socket.AF_UNIX)
+            connection.sock.connect(self.server.endpoint)
+            connection.request(self.command, self.path, body, dict(self.headers))
+            response = connection.getresponse()
+            data = response.read()
+            if creating:
+                assert response.status == 201, data
+                self.server.created.set()
+            self.send_response(response.status)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Type", response.getheader("Content-Type", "application/json"))
+            if response.getheader("Api-Version"):
+                self.send_header("Api-Version", response.getheader("Api-Version"))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+        except BrokenPipeError:
+            # The broken checker kills the client before its create response.
+            if not creating:
+                self.server.errors.append("unexpected disconnected client")
+        except Exception as error:
+            self.server.errors.append(repr(error))
+        finally:
+            connection.close()
+
+    do_HEAD = do_GET = do_POST = forward
+
+
+class CleanupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        run(["docker", "pull", "ubuntu:22.04"], check=True, stdout=subprocess.DEVNULL,
+            timeout=120)
+
+    def probe(self, phase, cleanup_failure=False):
+        clients = []
+        containers = []
+        operation_timeout = None
+        cleanup_timeout = subprocess.TimeoutExpired(["docker", "rm", "--force"], 15)
+        proxy = None
+        proxy_thread = None
+        with tempfile.TemporaryDirectory(prefix="acp-release-timeout-") as directory:
+            root = Path(directory)
+            if phase in ("create", "create_interrupt"):
+                endpoint = run(["docker", "context", "inspect", "--format",
+                                "{{.Endpoints.docker.Host}}"], check=True,
+                               capture_output=True, text=True, timeout=15).stdout.strip()
+                endpoint = os.environ.get("DOCKER_HOST", endpoint)
+                assert endpoint.startswith("unix://"), "delayed-create test needs a local Docker socket"
+                proxy = DockerProxy(root / "docker.sock", endpoint.removeprefix("unix://"))
+                proxy_thread = threading.Thread(target=proxy.serve_forever)
+                proxy_thread.start()
+
+            class ProbeClient(Popen):
+                def __init__(self, command, **kwargs):
+                    self.owned = command[:2] in (["docker", "run"], ["docker", "create"],
+                                                ["docker", "start"])
+                    self.first_communication = True
+                    if self.owned:
+                        if "--name" in command:
+                            containers.append(command[command.index("--name") + 1])
+                        if proxy:
+                            kwargs["env"] = {**os.environ,
+                                             "DOCKER_HOST": "unix://" + proxy.server_address}
+                    super().__init__(command, **kwargs)
+                    if self.owned:
+                        clients.append(self)
+
+                def communicate(self, *args, **kwargs):
+                    nonlocal operation_timeout
+                    if self.owned and self.first_communication and phase in (
+                        "version", "create", "interrupt", "create_interrupt"
+                    ):
+                        self.first_communication = False
+                        if proxy:
+                            assert proxy.pending.wait(15), "create request did not arrive"
+                            if phase == "create_interrupt":
+                                operation_timeout = KeyboardInterrupt()
+                                raise operation_timeout
+                        elif self.args[:2] == ["docker", "create"]:
+                            return super().communicate(*args, **kwargs)
+                        else:
+                            # The fixture proves the binary is running before shortening
+                            # its operation budget; pulling/creation is not a hung probe.
+                            assert select.select([self.stdout], [], [], 15)[0], "probe not ready"
+                            assert self.stdout.readline().strip() in (b"READY", "READY")
+                            if phase == "interrupt":
+                                operation_timeout = KeyboardInterrupt()
+                                raise operation_timeout
+                        kwargs["timeout"] = 0.1
+                        try:
+                            return super().communicate(*args, **kwargs)
+                        except subprocess.TimeoutExpired as error:
+                            operation_timeout = error
+                            raise
+                    if self.owned and proxy and operation_timeout:
+                        # Cleanup must let the outstanding create finish before removing.
+                        proxy.release.set()
+                    return super().communicate(*args, **kwargs)
+
+            def controlled_run(command, **kwargs):
+                if command[:3] == ["docker", "rm", "--force"]:
+                    if cleanup_failure and any("serve" in client.args for client in clients):
+                        raise cleanup_timeout
+                    result = run(command, **kwargs)
+                    if proxy and not proxy.release.is_set():
+                        # Old checker removes an absent name, then late creation survives.
+                        proxy.release.set()
+                        assert proxy.created.wait(15), "delayed creation failed"
+                    return result
+                return run(command, **kwargs)
+
+            request_started = False
+
+            def request_timeout(readers, writers, errors, timeout):
+                nonlocal request_started
+                if phase == "acp_timeout":
+                    if not request_started:
+                        # First notification proves serve is running before testing
+                        # a missing initialize response, regardless of startup speed.
+                        ready = select_ready(readers, writers, errors, 15)
+                        assert ready[0], "ACP fixture did not start"
+                        request_started = True
+                        return ready
+                    timeout = 0.1
+                return select_ready(readers, writers, errors, timeout)
+
+            binary = b"#!/bin/sh\nprintf 'READY\\n'\nexec sleep 300\n"
+            if phase in ("acp", "acp_timeout"):
+                line = (b'{"jsonrpc":"2.0","method":"session/update","params":{}}'
+                        if phase == "acp_timeout" else b"malformed ACP fixture")
+                binary = (b"#!/bin/sh\nif [ \"$1\" = --version ]; then\n"
+                          b"  echo 'acp-llm-adapter 0.0.0'; exit 0\nfi\n"
+                          b"echo '" + line + b"'\nexec sleep 300\n")
+            archive = root / "hung.tar.gz"
+            with tarfile.open(archive, "w:gz") as package:
+                for name, content in {"acp-llm-adapter": binary, "LICENSE": b"fixture\n",
+                                      "SOURCE.txt": f"intentional {phase} failure\n".encode()}.items():
+                    member = tarfile.TarInfo(name)
+                    member.size = len(content)
+                    package.addfile(member, io.BytesIO(content))
+            checksum = archive.with_suffix(".sha256")
+            checksum.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
             try:
-                checker["check"](archive, checksum, "0.0.0", "ubuntu:22.04")
-            except subprocess.TimeoutExpired:
-                pass
-            else:
-                raise AssertionError("hung version probe did not time out")
-        remaining = run(["docker", "ps", "--all", "--quiet", "--filter", f"name=^/{container}$"],
-                        check=True, capture_output=True, text=True).stdout.strip()
-        assert not remaining, f"version probe leaked container {container}: {remaining}"
-        print("PASS: timed-out version container removed and client reaped")
-finally:
-    # Clean up the deliberately broken baseline too; never touch other containers.
-    run(["docker", "rm", "--force", container], check=False, capture_output=True)
+                with patch("subprocess.Popen", ProbeClient), patch("subprocess.run", controlled_run), \
+                        patch("select.select", request_timeout):
+                    with self.assertRaises(BaseException) as caught:
+                        checker["check"](archive, checksum, "0.0.0", "ubuntu:22.04")
+                if cleanup_failure:
+                    self.assertIs(caught.exception, cleanup_timeout)
+                    self.assertIsNotNone(caught.exception.__context__, "lost original ACP failure")
+                elif phase in ("create", "version", "interrupt", "create_interrupt"):
+                    self.assertIsNotNone(operation_timeout, "wrong phase failed")
+                    self.assertIs(caught.exception, operation_timeout, "cleanup masked probe failure")
+                elif phase == "acp_timeout":
+                    self.assertTrue(request_started)
+                    self.assertIsInstance(caught.exception, AssertionError)
+                    self.assertEqual(str(caught.exception), "initialize")
+                else:
+                    self.assertIsInstance(caught.exception, ValueError)
+                self.assertTrue(clients)
+                for client in clients:
+                    self.assertIsNotNone(client.returncode, f"unreaped client: {client.args}")
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(client.pid, os.WNOHANG)
+                if not cleanup_failure:
+                    for container in containers:
+                        remaining = run(["docker", "ps", "--all", "--quiet", "--filter",
+                                         f"name=^/{container}$"], check=True, capture_output=True,
+                                        text=True, timeout=15).stdout.strip()
+                        self.assertFalse(remaining, f"leaked container {container}: {remaining}")
+                if proxy:
+                    self.assertTrue(proxy.created.is_set(), "late creation was not exercised")
+                    self.assertFalse(proxy.errors)
+            finally:
+                if proxy:
+                    proxy.release.set()
+                    proxy.shutdown()
+                    proxy_thread.join()
+                    proxy.server_close()
+                # Red tests and deliberately failed cleanup retain their exact ownership.
+                for container in containers:
+                    run(["docker", "rm", "--force", container], check=True,
+                        capture_output=True, timeout=15)
+                for client in clients:
+                    if client.poll() is None:
+                        client.kill()
+                    client.wait(timeout=15)
+                    for stream in (client.stdin, client.stdout, client.stderr):
+                        if stream is not None:
+                            stream.close()
+
+    def test_hung_version(self):
+        self.probe("version")
+
+    def test_delayed_creation(self):
+        self.probe("create")
+
+    def test_acp_failure(self):
+        self.probe("acp")
+
+    def test_acp_timeout(self):
+        self.probe("acp_timeout")
+
+    def test_interrupted_probe(self):
+        self.probe("interrupt")
+
+    def test_interrupted_creation(self):
+        self.probe("create_interrupt")
+
+    def test_cleanup_timeout_still_reaps_client(self):
+        self.probe("acp", cleanup_failure=True)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
