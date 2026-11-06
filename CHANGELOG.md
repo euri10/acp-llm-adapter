@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/euri10/acp-llm-adapter/compare/v0.9.6...v0.10.0) - 2026-11-06
+
+### Added
+
+- *(acp)* enable v2 negotiation by default
+- *(acp)* complete v2 tools and session setup
+
+### Fixed
+
+- *(acp)* [**breaking**] preserve replayed tool outcomes
+- *(acp)* adapt commands to schema 1.13
+
+### Other
+
+- *(acp)* record real-editor v2 QA
+- *(beads)* close dependency update work
+- Merge remote-tracking branch 'origin/main' into deps/acp-3.6-compat
+- Merge pull request #92 from euri10/dependabot/cargo/rmcp-3.8.0
+- Merge pull request #91 from euri10/dependabot/cargo/globset-0.4.21
+- Merge pull request #90 from euri10/dependabot/cargo/ignore-0.4.34
+- *(deps)* bump agent-client-protocol from 3.5.0 to 3.6.0
+- *(deps)* bump rmcp from 3.7.0 to 3.8.0
+- *(deps)* bump globset from 0.4.20 to 0.4.21
+- *(deps)* bump ignore from 0.4.33 to 0.4.34
+- *(deps)* bump rustix from 1.1.5 to 1.1.6
+
 ### Added
 - Enable ACP v1 and experimental v2 negotiation by default; retain `--no-default-features` for v1-only builds. Existing editor configurations stay unchanged.
 - ACP v2 permission-wait states, structured command subjects, and renderable file-edit previews/results.
