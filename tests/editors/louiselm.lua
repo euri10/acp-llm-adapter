@@ -90,6 +90,14 @@ smoke.run("louiselm", function()
   assert(vim.fn.filereadable(marker) == 0, "a rejected command ran")
 end, function()
   if Session then
-    assert(Session.dispose_all())
+    local sessions = Session.exit_verdict()
+    local ok, err = Session.dispose_all()
+    for _, entry in ipairs(sessions) do
+      local client = entry.session.client
+      if client and client.transport then
+        smoke.reap(client.transport.handle)
+      end
+    end
+    assert(ok, err)
   end
 end)

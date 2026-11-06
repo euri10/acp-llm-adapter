@@ -85,6 +85,12 @@ function M.assert_docstring_preview(text, where)
   assert(not text:find('-if __name__', 1, true), where .. ": preview deletes lines the edit keeps:\n" .. text)
 end
 
+-- vim.system children must be reaped before the headless editor exits.
+function M.reap(handle)
+  local result = handle:wait(5000)
+  assert(result.code == 0, "adapter cleanup failed or timed out: " .. vim.inspect(result))
+end
+
 -- Run `check`, then `cleanup`, and exit nonzero with the first error.
 function M.run(name, check, cleanup)
   local ok, err = xpcall(check, debug.traceback)

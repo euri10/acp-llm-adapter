@@ -84,6 +84,10 @@ smoke.run("codecompanion", function()
 end, function()
   local chat = require("codecompanion").last_chat()
   if chat then
+    local handle = chat.acp_connection and chat.acp_connection._state.handle
     chat:close()
+    if handle then
+      smoke.reap(handle)
+    end
   end
 end)

@@ -49,7 +49,21 @@ cargo build --locked -q --bin acp-llm-adapter --example fake_provider
 export PATH="$PWD/target/debug:$PATH"
 
 run_dir=$(mktemp -d "$work/run.XXXXXX")
-trap 'printf "editor state kept in %s\n" "$run_dir" >&2' ERR
+cleanup() {
+  local result=$?
+  if [ -n "${provider_pid:-}" ]; then
+    kill "$provider_pid" 2>/dev/null || true
+    wait "$provider_pid" 2>/dev/null || true
+  fi
+  if [ "$result" -eq 0 ]; then
+    rm -rf "$run_dir"
+  else
+    printf "editor state kept in %s\n" "$run_dir" >&2
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 export XDG_CONFIG_HOME="$run_dir/config" XDG_DATA_HOME="$run_dir/data"
 export XDG_STATE_HOME="$run_dir/state" XDG_CACHE_HOME="$run_dir/cache"
 
@@ -61,8 +75,9 @@ unset VIM VIMRUNTIME
 export FAKE_PROVIDER_KEY=your-deepseek-api-key
 export FAKE_PROVIDER_REPLY="Hello from acp-llm-adapter."
 
-# Closing our end of its stdin when this script exits stops the provider.
+# Retain the PID: Bash unsets PROVIDER_PID when the coprocess exits.
 coproc PROVIDER { exec target/debug/examples/fake_provider 2>"$run_dir/provider.log"; }
+provider_pid=$PROVIDER_PID
 read -r base_url <&"${PROVIDER[0]}"
 export LLM_BASE_URL="$base_url"
 
@@ -106,4 +121,3 @@ for client in "$@"; do
       exit 2 ;;
   esac
 done
-rm -rf "$run_dir"
