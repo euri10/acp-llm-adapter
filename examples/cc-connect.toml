@@ -1,0 +1,31 @@
+# Shared English/中文 recipe: docs/cc-connect.md
+language = "en"
+data_dir = "${CC_PILOT_STATE}"
+
+[log]
+level = "error"
+
+[display]
+thinking_messages = false
+tool_messages = true
+
+[[projects]]
+name = "acp-pilot"
+
+[projects.agent]
+type = "acp"
+
+[projects.agent.options]
+cmd = "${ACP_ADAPTER_BIN}"
+args = ["serve", "--backend", "deepseek"]
+work_dir = "${CC_PILOT_WORKSPACE}"
+mode = "ask"
+env = { LLM_API_KEY = "${DEEPSEEK_API_KEY}" }
+
+[[projects.platforms]]
+type = "feishu"
+
+[projects.platforms.options]
+app_id = "${FEISHU_APP_ID}"
+app_secret = "${FEISHU_APP_SECRET}"
+allow_from = "${FEISHU_PILOT_USER_ID}"

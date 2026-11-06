@@ -1,0 +1,36 @@
+cc-connect + acp-llm-adapter: local tool workflow / 本地工具流程
+2026-11-06; Linux x86_64; adapter 0.10.0 (fdf40ac)
+Real cc-connect and real file tools; synthetic chat + provider.
+真实 cc-connect 与文件操作；聊天及模型服务为模拟，并非飞书实测。
+
+$ cargo build --locked --bin acp-llm-adapter
+$ node scripts/test-cc-connect.mjs /path/to/cc-connect-v1.5.2-beta.1-linux-amd64
+cc-connect v1.5.2-beta.1
+commit:  10442325
+built:   2026-11-05T20:49:33Z
+Disposable workspace: <disposable>/project
+PASS initialization + streamed provider answer through real cc-connect
+PASS read_file returns fixture-note
+PASS approved write_file creates approved.txt
+PASS denied write_file leaves no denied.txt
+PASS /stop cancels a running command; continuation succeeds; no cancelled.txt
+OBSERVED thinking_messages=false: thought in reply=false
+PASS text attachment becomes local path in text prompt, not inline file contents
+PASS image attachment becomes local path text; no image/vision input
+PASS same ACP session retained across turns and cancellation
+OBSERVED /list + /switch: session/resume, original ACP session retained=true
+PASS client preview output (8 starts); platform rendering still requires real Feishu
+LOCAL VALIDATION COMPLETE; synthetic chat/provider, not Feishu or user-adoption evidence
+Fixture evidence retained: <disposable>
+
+The fixture requested write_file(path="approved.txt", content="approved\n").
+cc-connect displayed Allow / Deny / Allow All; the fixture selected Allow.
+The host file contained "approved\n". Repeating with denied.txt + Deny left no file.
+A permitted command wrote started.txt, then slept; /stop prevented its later write.
+模拟端选择 Allow 后，approved.txt 实际写入；选择 Deny 后，denied.txt 不存在。
+运行中的命令被 /stop 取消，后续写入未发生。
+
+Stable v1.5.0 comparison / 稳定版对照:
+  thinking_messages=false: thought in reply=true
+  /switch -> session/load: original ACP session retained=false
+Use the tested beta recipe. No actual Feishu/WeChat or live-provider claim.
