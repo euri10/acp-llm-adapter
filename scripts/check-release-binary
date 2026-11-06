@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Check a release archive in a clean Docker runtime; never use a provider.
+
+Usage: check-release-binary ARCHIVE CHECKSUM VERSION [IMAGE]
+Python and Docker run on the verifier host, not in the installed agent's runtime.
+"""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import uuid
+
+
+def check(archive, checksum, version, image):
+    digest, name = checksum.read_text().split()
+    assert name == archive.name, "checksum must name this archive's basename"
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == digest, "checksum mismatch"
+    with tempfile.TemporaryDirectory(prefix="acp-release-check-") as directory:
+        root = Path(directory)
+        binary = root / "home/.local/bin/acp-llm-adapter"
+        binary.parent.mkdir(parents=True)
+        (root / "project").mkdir()
+        with tarfile.open(archive) as package:
+            assert set(package.getnames()) == {"acp-llm-adapter", "LICENSE", "SOURCE.txt"}
+            member = package.getmember("acp-llm-adapter")
+            assert member.isfile(), "binary must be a regular file"
+            with package.extractfile(member) as source, binary.open("wb") as target:
+                shutil.copyfileobj(source, target)
+            print(package.extractfile("SOURCE.txt").read().decode(), end="", flush=True)
+        binary.chmod(0o755)
+        container = "acp-release-check-" + uuid.uuid4().hex
+        base = [
+            "docker", "run", "--rm", "--network=none", "--read-only",
+            "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "--volume", f"{root}:/pilot", "--workdir", "/pilot/project",
+            "--env", "HOME=/pilot/home", "--env", "XDG_STATE_HOME=/pilot/state",
+            "--env", "PATH=/pilot/home/.local/bin:/usr/bin:/bin",
+        ]
+        launch = subprocess.run(base + [image, "sh", "-ec", """
+            for tool in rustc cargo python python3 node npm; do
+                if command -v "$tool"; then exit 1; fi
+            done
+            exec acp-llm-adapter --version
+        """], capture_output=True, text=True, timeout=120)
+        assert launch.returncode == 0, launch.stderr
+        assert launch.stdout.strip() == f"acp-llm-adapter {version}", launch.stdout
+        print(f"Installed --version passed in {image}; no Rust/Python/Node runtime", flush=True)
+        with (root / "stderr.log").open("wb") as stderr:
+            process = subprocess.Popen(
+                base + ["--name", container, "-i", image,
+                        "acp-llm-adapter", "serve", "--backend", "mock"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+            )
+            buffered = b""
+            request_id = 0
+
+            def send(frame):
+                process.stdin.write(json.dumps(frame).encode() + b"\n")
+                process.stdin.flush()
+
+            def request(method, params, permission=None):
+                nonlocal buffered, request_id
+                request_id += 1
+                send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+                deadline = time.monotonic() + 30
+                permissions = 0
+                while True:
+                    while b"\n" not in buffered:
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, f"timed out: {method}"
+                        assert select.select([process.stdout], [], [], remaining)[0], method
+                        chunk = os.read(process.stdout.fileno(), 65536)
+                        assert chunk, f"unexpected EOF: {method}"
+                        buffered += chunk
+                    line, buffered = buffered.split(b"\n", 1)
+                    frame = json.loads(line)  # Any non-protocol stdout fails here.
+                    assert frame["jsonrpc"] == "2.0", frame
+                    if frame.get("method") == "session/request_permission":
+                        assert permission is not None, "unexpected permission request"
+                        assert not (root / "project/approved.txt").exists()
+                        assert not (root / "project/denied.txt").exists()
+                        option = next(o for o in frame["params"]["options"] if o["kind"] == permission)
+                        send({"jsonrpc": "2.0", "id": frame["id"], "result": {
+                            "outcome": {"outcome": "selected", "optionId": option["optionId"]}}})
+                        permissions += 1
+                    elif "method" in frame:
+                        assert "id" not in frame, f"unexpected server request: {frame}"
+                        assert frame["method"] == "session/update", frame
+                    elif frame.get("id") == request_id:
+                        assert "error" not in frame, frame
+                        assert permissions == (1 if permission else 0), "missing/duplicate approval"
+                        return frame["result"]
+                    else:
+                        raise AssertionError(f"unexpected frame: {frame}")
+
+            try:
+                initialized = request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+                assert initialized["protocolVersion"] == 1
+                session = request("session/new", {"cwd": "/pilot/project", "mcpServers": []})["sessionId"]
+                request("session/set_mode", {"sessionId": session, "modeId": "ask"})
+                for filename, choice in [("denied.txt", "reject_once"), ("approved.txt", "allow_once")]:
+                    result = request("session/prompt", {"sessionId": session, "prompt": [
+                        {"type": "text", "text": f"!tool run_command printf verified > {filename}"}
+                    ]}, choice)
+                    assert result["stopReason"] == "end_turn", result
+                    assert not (root / "project/denied.txt").exists(), "denied command executed"
+                assert (root / "project/approved.txt").read_text() == "verified"
+                result = request("session/prompt", {"sessionId": session, "prompt": [
+                    {"type": "text", "text": "Continue after the permission checks."}
+                ]})
+                assert result["stopReason"] == "end_turn"
+                process.stdin.close()
+                assert process.wait(timeout=10) == 0, "unclean adapter shutdown"
+                assert not buffered.strip() and not process.stdout.read().strip(), "trailing stdout"
+            finally:
+                # Own container only; reap the Docker client even after a failed assertion.
+                if process.poll() is None:
+                    subprocess.run(["docker", "rm", "--force", container],
+                                   check=False, stdout=subprocess.DEVNULL, timeout=15)
+                    process.wait(timeout=10)
+                process.stdout.close()
+                stderr.flush()
+                if process.returncode:
+                    print((root / "stderr.log").read_text(), file=sys.stderr)
+        print("PASS: checksum, install, launch, ACP v1, ask/deny/allow effects, continuation, EOF/reap")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (4, 5):
+        sys.exit(__doc__)
+    check(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3],
+          sys.argv[4] if len(sys.argv) == 5 else "ubuntu:22.04")

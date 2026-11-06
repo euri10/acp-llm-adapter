@@ -1,10 +1,12 @@
 # Release-plz: automated Rust crate releases
 #
-# Two jobs:
+# Three jobs:
 #   1. release-plz-pr     — Opens/updates a release PR with version bumps and
 #                           changelog entries based on conventional commits.
 #   2. release-plz-release — When the release PR is merged, publishes to
 #                           crates.io and creates a GitHub release + git tag.
+#   3. release-binary     — Builds, verifies and attaches Linux x86_64 assets;
+#                           workflow_dispatch backfills an existing release.
 #
 # Tag format: v<version>  (e.g. v0.7.0) — single-crate repo, so release-plz
 # uses the bare `v{version}` tag, not the `<crate_name>-v<version>` workspace form.
@@ -40,13 +42,22 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release to receive missing Linux x86_64 assets (e.g. v0.10.0)
+        required: true
+        type: string
 
 jobs:
   # ── Publish to crates.io when the release PR is merged ──────────────────
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'euri10' }}
+    if: ${{ github.repository_owner == 'euri10' && github.event_name == 'push' }}
+    outputs:
+      releases: ${{ steps.release.outputs.releases }}
+      released: ${{ steps.release.outputs.releases_created }}
 
     permissions:
       contents: write       # push tags, create GitHub releases
@@ -68,6 +79,7 @@ jobs:
           toolchain: "1.99"        # Release automation; MSRV remains 1.95 in CI
 
       - name: Run release-plz release
+        id: release
         uses: release-plz/action@v0.5
         with:
           command: release
@@ -78,7 +90,7 @@ jobs:
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'euri10' }}
+    if: ${{ github.repository_owner == 'euri10' && github.event_name == 'push' }}
 
     permissions:
       contents: write        # push to PR branch
@@ -99,3 +111,110 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Same-workflow outputs work with GITHUB_TOKEN; release/tag events do not.
+  # https://release-plz.dev/docs/github/output
+  release-binary:
+    name: Linux x86_64 release binary
+    needs: release-plz-release
+    if: >-
+      ${{ always() && github.repository_owner == 'euri10' &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'workflow_dispatch' ||
+           (needs.release-plz-release.result == 'success' &&
+            needs.release-plz-release.outputs.released == 'true')) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: release-binary
+      cancel-in-progress: false
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v7
+        with:
+          path: tooling
+          persist-credentials: false
+
+      - name: Resolve an existing published release
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          RELEASES: ${{ needs.release-plz-release.outputs.releases }}
+        run: |
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(jq -er '.[] | select(.package_name == "acp-llm-adapter") | .tag' <<< "$RELEASES")
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh release view "$tag" --json isDraft --jq '.isDraft' | grep -qx false
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact release source
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.target.outputs.tag }}
+          path: source
+          persist-credentials: false
+
+      - name: Install Rust (same MSRV as CI)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+
+      - name: Build and package locked release source
+        working-directory: source
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          cargo build --locked --release --bin acp-llm-adapter --target x86_64-unknown-linux-gnu
+          test "$(target/x86_64-unknown-linux-gnu/release/acp-llm-adapter --version)" = "acp-llm-adapter $VERSION"
+          mkdir -p ../dist/package
+          install -m 755 target/x86_64-unknown-linux-gnu/release/acp-llm-adapter ../dist/package/
+          cp LICENSE ../dist/package/
+          {
+            echo "tag=$TAG"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "target=x86_64-unknown-linux-gnu"
+            echo "features=default"
+            rustc --version
+            sha256sum Cargo.lock
+          } > ../dist/package/SOURCE.txt
+          ldd ../dist/package/acp-llm-adapter
+          cd ../dist
+          archive="acp-llm-adapter-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+          tar -czf "$archive" -C package acp-llm-adapter LICENSE SOURCE.txt
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Verify archive in a clean runtime without language toolchains
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          archive="dist/acp-llm-adapter-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+          python3 tooling/scripts/check-release-binary "$archive" "$archive.sha256" "$VERSION"
+
+      - name: Attach assets (never overwrite existing assets)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          archive="dist/acp-llm-adapter-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+          gh release upload "$TAG" "$archive" "$archive.sha256"
+
+      - name: Download and verify the published assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.target.outputs.tag }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          archive="acp-llm-adapter-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+          gh release download "$TAG" --pattern "$archive" --pattern "$archive.sha256" --dir downloaded
+          python3 tooling/scripts/check-release-binary "downloaded/$archive" "downloaded/$archive.sha256" "$VERSION"
