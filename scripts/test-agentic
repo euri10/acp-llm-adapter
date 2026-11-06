@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Actual pinned client + unchanged example + localhost fake provider. No live API.
+set -Eeuo pipefail
+cd "$(dirname "$0")/.."
+rev=f0bef086b3ed6121d9a18a5a820d071c69f2f0f5
+work=$(mktemp -d /tmp/acp-agentic-check.XXXXXX)
+provider_pid=
+cleanup() {
+  if [ -n "$provider_pid" ]; then
+    kill "$provider_pid" 2>/dev/null || true
+    wait "$provider_pid" 2>/dev/null || true
+  fi
+  printf 'Synthetic evidence retained: %s\n' "$work"
+}
+trap cleanup EXIT
+# Optional pre-fetched archive contents avoid repeat downloads; caller verifies pin.
+plugin=${1:-}
+if [ -z "$plugin" ]; then
+  curl -fsSL "https://codeload.github.com/carlos-algms/agentic.nvim/tar.gz/$rev" |
+    tar -xz -C "$work"
+  plugin="$work/agentic.nvim-$rev"
+fi
+plugin=$(realpath "$plugin")
+# Resolve version-manager shims before isolating HOME and the environment.
+nvim_bin=$(nvim --headless --noplugin -u NONE -i NONE '+lua io.write(vim.v.progpath)' +qa)
+cargo build --locked -q --bin acp-llm-adapter --example fake_provider
+coproc PROVIDER {
+  exec env -i PATH="$PATH" FAKE_PROVIDER_KEY=agentic-offline-key \
+    FAKE_PROVIDER_REPLY='Hello from the offline agentic check.' \
+    target/debug/examples/fake_provider 2>"$work/provider.log"
+}
+provider_pid=$PROVIDER_PID
+read -r base_url <&"${PROVIDER[0]}"
+env -i PATH="$PWD/target/debug:$PATH" HOME="$work/home" TERM=xterm-256color \
+  XDG_CONFIG_HOME="$work/config" XDG_DATA_HOME="$work/data" \
+  XDG_STATE_HOME="$work/state" XDG_CACHE_HOME="$work/cache" \
+  DEEPSEEK_API_KEY=agentic-offline-key LLM_BASE_URL="$base_url" LLM_MODEL=offline-initial \
+  FAKE_PROVIDER_REPLY='Hello from the offline agentic check.' \
+  SNIPPET_PLUGINS="$plugin" AGENTIC_EVIDENCE="$work" \
+  timeout 120 "$nvim_bin" --headless --noplugin -u NONE -l tests/editors/agentic.lua \
+  >"$work/nvim.log" 2>&1 || { cat "$work/nvim.log"; exit 1; }
+cat "$work/nvim.log"

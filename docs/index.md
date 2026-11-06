@@ -12,6 +12,7 @@
 - [ACP v2 support](protocol-v2.md) — experimental v2 enabled by default alongside v1, its validation limits and findings.
 - [Mock backend](mock-backend.md) — offline `--backend mock`, including the `!tool` affordance.
 - [cc-connect pilot / cc-connect 试用](cc-connect.md) — bilingual Feishu recipe, local validation and its limits.
+- [agentic.nvim pilot](agentic.md) — pinned custom-provider recipe, real-client offline checks and a small live-pilot procedure.
 - [Architecture](architecture.md) — channel diagram, module map, transport limits, design principles.
 - [Library API](library.md) — the reusable `llm` module and a streaming example.
 

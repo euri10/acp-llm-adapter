@@ -21,6 +21,9 @@
 //! - a last user message `!tool <name> <json-arguments>` gets that tool call,
 //!   so editor checks can drive permission prompts and edit previews;
 //! - a last tool result gets `tool said: <result>` on one line;
+//! - `!history <text>` reports whether an earlier user message contains that
+//!   text, so a restored chat UI alone cannot prove provider-history retention;
+//! - `!model` reports the model on the incoming request;
 //! - anything else gets the fixed reply.
 //!
 //! Completions require `Authorization: Bearer $FAKE_PROVIDER_KEY` and get 401
@@ -94,14 +97,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// Choose the streamed reply from the last message of the chat request.
 fn respond(request: &str, reply: &str, calls: &AtomicUsize) -> String {
-    let last = serde_json::from_str::<Value>(request)
-        .ok()
-        .and_then(|request| request.get("messages")?.as_array()?.last().cloned())
+    let request = serde_json::from_str::<Value>(request).unwrap_or(Value::Null);
+    let messages = request.get("messages").and_then(Value::as_array);
+    let last = messages
+        .and_then(|messages| messages.last().cloned())
         .unwrap_or(Value::Null);
     let content = last.get("content").and_then(Value::as_str).unwrap_or("");
     if last.get("role").and_then(Value::as_str) == Some("tool") {
         let result = content.split_whitespace().collect::<Vec<_>>().join(" ");
         return text_body(&format!("tool said: {result}"));
+    }
+    if let Some(needle) = content.strip_prefix("!history ") {
+        let retained = messages.is_some_and(|messages| {
+            messages.iter().rev().skip(1).any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("user")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains(needle))
+            })
+        });
+        return text_body(&format!(
+            "history {}: {needle}",
+            if retained { "retained" } else { "missing" }
+        ));
+    }
+    if content == "!model" {
+        let model = request.get("model").and_then(Value::as_str).unwrap_or("");
+        return text_body(&format!("request model: {model}"));
     }
     if let Some((name, arguments)) = content
         .strip_prefix("!tool ")
