@@ -40,6 +40,18 @@ Load and resume retain those settings without requiring another prompt first.
 A failed save reports a storage error and leaves the previous settings intact.
 Selected-content helpers remain ephemeral and retain their immutable limits.
 
+## Replaying tools
+
+Tool execution outcomes are stored alongside their results, but are not sent
+to the provider. ACP v1 load and v2 replay preserve `completed` for successful
+tools and `failed` for unsuccessful or cancelled tools. A reused tool-call ID
+is resolved within its own assistant turn, not against an earlier result.
+
+Tool history without a recorded outcome cannot be replayed. Loading it for
+replay returns an error before restoring the session or emitting transcript
+updates; start a new session instead. Text-only history and silent resume
+without replay are unaffected. Outcomes are never guessed from result text.
+
 ## Clearing history
 
 In ordinary sessions, sending `/clear` as the only text block clears both the

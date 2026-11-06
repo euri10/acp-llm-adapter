@@ -415,6 +415,115 @@ async fn cancellation_during_approval_ignores_late_answers() -> Result<(), Box<d
     connection.stop().await
 }
 
+#[test_log::test(tokio::test)]
+async fn resumed_history_preserves_success_failure_and_cancellation() -> Result<(), Box<dyn Error>>
+{
+    let (mut provider, url) = provider().await?;
+    let mut connection = start(&url).await?;
+    let root = connection.state_dir.join("project");
+    std::fs::create_dir_all(&root)?;
+    let (session, _) = connection.new_session(&root).await?;
+    let mut live_statuses = Vec::new();
+    for (command, status, cancel) in [
+        ("printf x >> executions", "completed", false),
+        ("printf x >> executions; exit 7", "failed", false),
+        (
+            "printf x >> executions; : > started; exec sleep 30",
+            "failed",
+            true,
+        ),
+    ] {
+        let mark = prompt(
+            &mut connection,
+            &session,
+            "run_command",
+            json!({"command":command}),
+        )
+        .await?;
+        let permission = connection
+            .wait_request("session/request_permission")
+            .await?;
+        approve(&mut connection, &permission, true).await?;
+        if cancel {
+            // Observe command execution before pressing the editor's Stop button.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !root.join("started").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            let notification = json!({"jsonrpc":"2.0", "method":"session/cancel",
+                "params":{"sessionId":session}});
+            connection
+                .stdin
+                .write_all(format!("{notification}\n").as_bytes())
+                .await?;
+        }
+        let updates = connection.until_idle(mark).await?;
+        let terminal = tool_updates(&updates)
+            .last()
+            .copied()
+            .ok_or("tool emitted no updates")?;
+        assert_eq!(terminal["status"], status, "{updates:?}");
+        if cancel {
+            assert_eq!(updates.last().ok_or("no idle")?["stopReason"], "cancelled");
+            assert_eq!(terminal["rawOutput"]["error"], "run_command cancelled");
+        }
+        live_statuses.push((terminal["toolCallId"].clone(), terminal["status"].clone()));
+    }
+    assert_eq!(std::fs::read_to_string(root.join("executions"))?, "xxx");
+
+    // Closing removes the in-memory session; resume must reconstruct saved history.
+    let closed = connection
+        .request("session/close", json!({"sessionId":session}))
+        .await?;
+    assert!(closed.get("result").is_some(), "{closed}");
+    let mark = connection.notifications.len();
+    let resumed = connection
+        .request(
+            "session/resume",
+            json!({"sessionId":session,"cwd":root,"replayFrom":{"type":"start"}}),
+        )
+        .await?;
+    assert!(resumed.get("result").is_some(), "{resumed}");
+    let replay = connection.until_idle(mark).await?;
+    let replayed_statuses: Vec<_> = tool_updates(&replay)
+        .iter()
+        .map(|update| (update["toolCallId"].clone(), update["status"].clone()))
+        .collect();
+    assert_eq!(replayed_statuses, live_statuses);
+    assert!(
+        connection.incoming.is_empty(),
+        "replay requested permission"
+    );
+    assert_eq!(std::fs::read_to_string(root.join("executions"))?, "xxx");
+
+    let mark = connection.notifications.len();
+    let accepted = connection
+        .request(
+            "session/prompt",
+            json!({"sessionId":session,"prompt":[{"type":"text","text":"hello after resume"}]}),
+        )
+        .await?;
+    assert!(accepted.get("result").is_some(), "{accepted}");
+    let continued = connection.until_idle(mark).await?;
+    assert_eq!(continued.last().ok_or("no idle")?["stopReason"], "end_turn");
+    assert!(
+        continued
+            .iter()
+            .any(|update| update["sessionUpdate"] == "agent_message_chunk")
+    );
+    assert!(
+        tool_updates(&continued).is_empty(),
+        "fresh prompt reran a tool"
+    );
+    assert_eq!(std::fs::read_to_string(root.join("executions"))?, "xxx");
+    connection.stop().await?;
+    drop(provider.stdin.take());
+    provider.wait().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn http_mcp_receives_headers_and_runs_only_after_approval() -> Result<(), Box<dyn Error>> {
     use axum::{

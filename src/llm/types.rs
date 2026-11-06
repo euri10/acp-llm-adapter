@@ -52,6 +52,8 @@ pub struct ChatMessage {
     tool_calls: Vec<ToolCall>,
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
 }
 
@@ -64,6 +66,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_success: None,
             reasoning_content: None,
         }
     }
@@ -76,6 +79,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_success: None,
             reasoning_content: None,
         }
     }
@@ -88,6 +92,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            tool_success: None,
             reasoning_content: None,
         }
     }
@@ -103,18 +108,26 @@ impl ChatMessage {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            tool_success: None,
             reasoning_content: None,
         }
     }
 
-    /// Create a tool result message.
+    /// Create a tool result message with its execution outcome.
+    ///
+    /// The outcome is persisted for history replay, but is not sent to the provider.
     #[must_use]
-    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        success: bool,
+    ) -> Self {
         Self {
             role: MessageRole::Tool,
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            tool_success: Some(success),
             reasoning_content: None,
         }
     }
@@ -157,6 +170,12 @@ impl ChatMessage {
     #[must_use]
     pub fn tool_call_id(&self) -> Option<&str> {
         self.tool_call_id.as_deref()
+    }
+
+    /// Return the recorded tool outcome, or `None` when no outcome was recorded.
+    #[must_use]
+    pub const fn tool_success(&self) -> Option<bool> {
+        self.tool_success
     }
 }
 

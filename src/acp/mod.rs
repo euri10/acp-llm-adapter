@@ -450,7 +450,7 @@ pub(crate) async fn handle_load_session_request(
 ) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
     validate_load_session_paths(request)?;
     let (session_id, history) =
-        restore_persisted_session(store, &request.session_id, &request.cwd, None).await?;
+        restore_persisted_session(store, &request.session_id, &request.cwd, None, true).await?;
     replay_session_history(&session_id, &history, &mut notify)?;
 
     let mut response = LoadSessionResponse::new()
@@ -469,7 +469,7 @@ pub(crate) async fn handle_resume_session_request(
 ) -> Result<ResumeSessionResponse, agent_client_protocol::Error> {
     validate_resume_session_paths(request)?;
     let (session_id, _) =
-        restore_persisted_session(store, &request.session_id, &request.cwd, None).await?;
+        restore_persisted_session(store, &request.session_id, &request.cwd, None, false).await?;
 
     let mut response = ResumeSessionResponse::new()
         .modes(session_modes(store.session_behavior(&session_id.0)?))
@@ -485,6 +485,7 @@ async fn restore_persisted_session(
     requested_session_id: &SessionId,
     cwd: &std::path::Path,
     setup: Option<&NewSessionRequest>,
+    replay: bool,
 ) -> Result<(SessionId, Vec<ChatMessage>), agent_client_protocol::Error> {
     let mut persisted = {
         let store = store.clone();
@@ -514,6 +515,9 @@ async fn restore_persisted_session(
     if session_id != *requested_session_id {
         return Err(agent_client_protocol::Error::invalid_params()
             .data("persisted session id does not match requested session id"));
+    }
+    if replay {
+        validate_replay_history(&persisted.history)?;
     }
     let servers = if let Some(setup) = setup {
         validate_session_paths(setup)?;
@@ -638,11 +642,25 @@ fn insert_session_record(
     Ok(response)
 }
 
+fn validate_replay_history(history: &[ChatMessage]) -> Result<(), agent_client_protocol::Error> {
+    // Reject incomplete history before restoring resources or emitting updates.
+    for (index, message) in history.iter().enumerate() {
+        if message.role() == MessageRole::Assistant {
+            let results = history.get(index + 1..).unwrap_or_default();
+            for call in message.tool_calls() {
+                stored_tool_result(call.id(), results)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn replay_session_history(
     session_id: &SessionId,
     history: &[ChatMessage],
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<(), agent_client_protocol::Error> {
+    validate_replay_history(history)?;
     for (message_index, message) in history.iter().enumerate() {
         match message.role() {
             MessageRole::User => {
@@ -687,7 +705,10 @@ fn replay_assistant_message(
     for tool_call in message.tool_calls() {
         notify(session_notification(
             session_id.clone(),
-            SessionUpdate::ToolCall(replayed_tool_call(tool_call, history)),
+            SessionUpdate::ToolCall(replayed_tool_call(
+                tool_call,
+                history.get(message_index + 1..).unwrap_or_default(),
+            )?),
         ))?;
     }
 
@@ -722,26 +743,43 @@ pub(crate) fn derived_message_id(
     Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
 }
 
-fn replayed_tool_call(tool_call: &ChatToolCall, history: &[ChatMessage]) -> AcpToolCall {
-    let output = tool_result_content(tool_call.id(), history).unwrap_or_default();
-    AcpToolCall::new(
+fn replayed_tool_call(
+    tool_call: &ChatToolCall,
+    results: &[ChatMessage],
+) -> Result<AcpToolCall, agent_client_protocol::Error> {
+    let (output, success) = stored_tool_result(tool_call.id(), results)?;
+    Ok(AcpToolCall::new(
         tool_call.id().to_string(),
         crate::turn::tool_call_title(tool_call),
     )
-    .status(ToolCallStatus::Completed)
+    .status(if success {
+        ToolCallStatus::Completed
+    } else {
+        ToolCallStatus::Failed
+    })
     .raw_input(tool_raw_input(tool_call))
     .raw_output(serde_json::json!({ "content": output }))
-    .content(vec![ToolCallContent::from(output)])
+    .content(vec![ToolCallContent::from(output.to_string())]))
 }
 
-fn tool_result_content(tool_call_id: &str, history: &[ChatMessage]) -> Option<String> {
-    history.iter().find_map(|message| {
-        if message.role() == MessageRole::Tool && message.tool_call_id() == Some(tool_call_id) {
-            Some(message.content().to_string())
-        } else {
-            None
-        }
-    })
+fn stored_tool_result<'a>(
+    tool_call_id: &str,
+    results: &'a [ChatMessage],
+) -> Result<(&'a str, bool), agent_client_protocol::Error> {
+    // Provider IDs need only identify a call within this assistant's tool batch.
+    results
+        .iter()
+        .take_while(|message| message.role() == MessageRole::Tool)
+        .find(|message| message.tool_call_id() == Some(tool_call_id))
+        .and_then(|message| {
+            message
+                .tool_success()
+                .map(|success| (message.content(), success))
+        })
+        .ok_or_else(|| {
+            agent_client_protocol::Error::internal_error()
+                .data("cannot replay tool history without a recorded execution outcome")
+        })
 }
 
 #[cfg(test)]

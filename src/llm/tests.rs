@@ -584,7 +584,7 @@ async fn deepseek_client_stream_chat_serializes_request_and_parses_events() -> R
             "assistant",
             vec![ToolCall::new("call-1", "echo", r#"{"value":1}"#)],
         ),
-        ChatMessage::tool_result("call-1", "tool output"),
+        ChatMessage::tool_result("call-1", "tool output", true),
     ])
     .with_tools(vec![tool_definition.clone()])
     .with_model("request-model")
@@ -1098,7 +1098,7 @@ fn chat_request_max_tokens_defaults_to_none() {
 
 #[test_log::test]
 fn chat_request_tool_call_id_accessor() {
-    let result = ChatMessage::tool_result("call-42", "done");
+    let result = ChatMessage::tool_result("call-42", "done", true);
 
     assert_eq!(result.tool_call_id(), Some("call-42"));
     assert_eq!(result.role(), MessageRole::Tool);
@@ -1229,6 +1229,33 @@ fn assistant_reasoning_roundtrips_separately_and_only_reaches_supported_wire_for
             "deepseek-v4-pro",
         ))?;
         assert!(wire.get("reasoning_content").is_none());
+    }
+    Ok(())
+}
+
+#[test_log::test]
+fn tool_outcomes_roundtrip_without_entering_provider_requests() -> Result<(), serde_json::Error> {
+    for success in [true, false] {
+        // Identical text must not determine whether the tool succeeded.
+        let message = ChatMessage::tool_result("call", "run_command cancelled", success);
+        let persisted = serde_json::to_value(&message)?;
+        assert_eq!(persisted["tool_success"], success);
+        let restored = serde_json::from_value::<ChatMessage>(persisted)?;
+        assert_eq!(restored.tool_success(), Some(success));
+        for model in ["deepseek-v4-pro", "glm-4.6", "unknown-model"] {
+            let wire =
+                serde_json::to_value(super::types::WireMessage::for_model(&restored, model))?;
+            assert_eq!(
+                wire,
+                json!({
+                    "role": "tool", "content": "run_command cancelled", "tool_call_id": "call"
+                })
+            );
+        }
+    }
+    for message in [ChatMessage::user("user"), ChatMessage::assistant("answer")] {
+        assert_eq!(message.tool_success(), None);
+        assert!(serde_json::to_value(message)?.get("tool_success").is_none());
     }
     Ok(())
 }

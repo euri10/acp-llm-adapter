@@ -769,7 +769,7 @@ mod tests {
             &MockLlmClient,
             ChatRequest::new(vec![
                 ChatMessage::user(format!("{MOCK_TOOL_DIRECTIVE}echo hello")),
-                ChatMessage::tool_result(MOCK_TOOL_CALL_ID, "hello\n"),
+                ChatMessage::tool_result(MOCK_TOOL_CALL_ID, "hello\n", true),
             ]),
         )
         .await?;

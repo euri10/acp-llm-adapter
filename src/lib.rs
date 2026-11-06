@@ -117,7 +117,7 @@ mod tests {
         assert_eq!(user.role(), MessageRole::User);
         let assistant = ChatMessage::assistant("a");
         assert_eq!(assistant.role(), MessageRole::Assistant);
-        let tool = ChatMessage::tool_result("id", "t");
+        let tool = ChatMessage::tool_result("id", "t", true);
         assert_eq!(tool.role(), MessageRole::Tool);
     }
 
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn chat_message_tool_result_accessors() {
-        let msg = ChatMessage::tool_result("call-2", "result");
+        let msg = ChatMessage::tool_result("call-2", "result", true);
         assert_eq!(msg.content(), "result");
         assert_eq!(msg.tool_call_id(), Some("call-2"));
     }

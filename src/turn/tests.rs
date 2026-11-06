@@ -161,7 +161,9 @@ async fn domain_turn_pairs_tool_history_and_cancels_remaining_calls() -> Result<
         assert!(record.active_turn.is_none());
         assert_eq!(record.history.len(), 8);
         assert_eq!(record.history[6].tool_call_id(), Some("second"));
+        assert_eq!(record.history[6].tool_success(), Some(true));
         assert_eq!(record.history[7].tool_call_id(), Some("third"));
+        assert_eq!(record.history[7].tool_success(), Some(false));
         assert!(record.history[7].content().contains("cancelled"));
         Ok(())
     })?;
@@ -3229,7 +3231,7 @@ async fn provider_request_drops_oversized_tool_arguments_with_their_results()
                         .to_string(),
                 )],
             ),
-            ChatMessage::tool_result("call", "saved"),
+            ChatMessage::tool_result("call", "saved", true),
         ];
         super::stream_model_turn(
             StreamContext {
@@ -3285,7 +3287,7 @@ fn size_filter_reserves_current_prompt_before_more_recent_tool_history() -> Resu
     let prompt = ChatMessage::user("CURRENT-USER-PROMPT");
     let call =
         ChatMessage::assistant_with_tool_calls("", vec![ChatToolCall::new("call", "echo", "{}")]);
-    let result = ChatMessage::tool_result("call", "result");
+    let result = ChatMessage::tool_result("call", "result", true);
     let budget = [&system, &call, &result]
         .into_iter()
         .map(super::estimate_message_size)
@@ -3306,7 +3308,7 @@ fn reasoning_counts_toward_the_size_budget_and_keeps_tool_pairs_whole() -> Resul
     let messages = vec![
         first.clone(),
         assistant,
-        ChatMessage::tool_result("call", "done"),
+        ChatMessage::tool_result("call", "done", true),
     ];
     assert_eq!(super::filter_messages_by_size(&messages, 500)?, vec![first]);
     assert_eq!(super::filter_messages_by_size(&messages, 2000)?, messages);
@@ -3358,7 +3360,7 @@ fn filter_messages_by_size_drops_oversized_tool_call_unit_as_a_whole() -> Result
         "checking",
         vec![ChatToolCall::new("call-1", "read_file", r#"{"path":"a"}"#)],
     );
-    let tool_result = ChatMessage::tool_result("call-1", "x".repeat(2_000));
+    let tool_result = ChatMessage::tool_result("call-1", "x".repeat(2_000), true);
     let messages = vec![
         first.clone(),
         older_small.clone(),
@@ -3382,7 +3384,7 @@ fn filter_messages_by_size_keeps_tool_call_unit_together_when_it_fits() -> Resul
         "checking",
         vec![ChatToolCall::new("call-1", "read_file", r#"{"path":"a"}"#)],
     );
-    let tool_result = ChatMessage::tool_result("call-1", "small result");
+    let tool_result = ChatMessage::tool_result("call-1", "small result", true);
     let padding = ChatMessage::user("x".repeat(500));
     let current = ChatMessage::user("current");
     let messages = vec![
@@ -3403,7 +3405,7 @@ fn filter_messages_by_size_keeps_tool_call_unit_together_when_it_fits() -> Resul
 fn validate_tool_results_drops_orphaned_tool_result() {
     let messages = vec![
         ChatMessage::user("hello"),
-        ChatMessage::tool_result("missing-call", "orphaned"),
+        ChatMessage::tool_result("missing-call", "orphaned", true),
     ];
 
     let validated = super::validate_tool_results(&messages);
@@ -3460,8 +3462,8 @@ fn sanitize_conversation_preserves_tool_calls_and_results() {
     let messages = vec![
         ChatMessage::user("go"),
         assistant_call.clone(),
-        ChatMessage::tool_result("call-1", "content a"),
-        ChatMessage::tool_result("call-2", "content b"),
+        ChatMessage::tool_result("call-1", "content a", true),
+        ChatMessage::tool_result("call-2", "content b", true),
     ];
 
     let sanitized = super::sanitize_conversation(messages.clone());

@@ -52,10 +52,12 @@ desktop interruptions; the user's installed editor and configuration were
 unchanged. Evidence is recorded in `daa-ltct`. These checks do not promote the
 draft protocol to stable or change the accepted release policy.
 
-One replay-fidelity defect remains (`daa-6zin`): a cancelled tool is restored
-with status `completed` rather than `failed`, although its cancellation text
-survives. This comes from shared history replay; it does not re-execute the
-command or prevent new prompts after resume.
+Tool outcomes are now persisted and replayed faithfully: successful calls remain
+`completed`, failed or cancelled calls remain `failed` (`daa-6zin`). Reused tool
+IDs are matched within their own assistant turn (`daa-713j`). History without a
+recorded tool outcome cannot be replayed: the adapter returns an error before
+emitting transcript updates rather than inventing a successful result. Start a
+new session for older tool history; text-only history is unaffected.
 
 LouiseLM needs no configuration change: update the adapter
 binary, keeping the same command, arguments, backend and environment. The
@@ -180,5 +182,5 @@ None survived, so nothing was filed.
    SDK 3.1 / schema 1.10.2; the adapter moved to 3.3.0 / 1.11.0.
 
 Findings 5 to 7 were resolved in `daa-acp-v2-followups-5m7j`; `daa-jn8o` covers
-default-build promotion. Real-editor v2 QA completed separately in `daa-ltct`,
-with the replay-status defect tracked in `daa-6zin`.
+default-build promotion. Real-editor v2 QA completed separately in `daa-ltct`;
+the resulting replay-status fix and its verification are tracked in `daa-6zin`.

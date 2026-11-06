@@ -8,7 +8,7 @@ use super::{
     handle_set_session_config_option_request_notifying, handle_set_session_mode_request,
     handle_set_session_mode_request_notifying, replay_assistant_message, replay_session_history,
     replayed_tool_call, restore_persisted_session, serve_with_transport_and_state_dir,
-    tool_result_content, validate_load_session_paths, validate_resume_session_paths,
+    stored_tool_result, validate_load_session_paths, validate_resume_session_paths,
     validate_session_paths,
 };
 use crate::acp::session_options::model_select_options;
@@ -1927,7 +1927,7 @@ async fn load_session_restores_state_and_replays_history()
     let history = vec![
         ChatMessage::user("inspect the manifest"),
         ChatMessage::assistant_with_tool_calls("reading", vec![tool_call]),
-        ChatMessage::tool_result("call-1", "manifest contents"),
+        ChatMessage::tool_result("call-1", "manifest contents", true),
         ChatMessage::assistant("done"),
     ];
     persistence
@@ -2015,6 +2015,142 @@ async fn load_session_restores_state_and_replays_history()
         &history,
     )?;
 
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn load_session_preserves_live_tool_outcomes() -> Result<(), agent_client_protocol::Error> {
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-load-outcomes-{}", Uuid::new_v4()));
+    let workspace = state_dir.join("workspace");
+    std::fs::create_dir_all(&workspace)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    std::fs::write(workspace.join("present.txt"), "tool output")
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let persistence = FilesystemSessionStore::new(&state_dir);
+
+    for (path, cancelled, expected_status) in [
+        ("present.txt", false, ToolCallStatus::Completed),
+        ("missing.txt", false, ToolCallStatus::Failed),
+        ("present.txt", true, ToolCallStatus::Failed),
+    ] {
+        let store = test_store().with_persistence(persistence.clone());
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
+        let mut live_status = None;
+        let response = handle_prompt_request(
+            &store,
+            &MockLlmClient,
+            &AdapterToolRegistry,
+            None,
+            PromptRequest::new(
+                session.session_id.clone(),
+                vec![ContentBlock::from(format!("!tool read_file {path}"))],
+            ),
+            DEFAULT_MAX_TURN_REQUESTS,
+            |notification| {
+                match notification.update {
+                    SessionUpdate::ToolCall(_) if cancelled => {
+                        store.cancel_active_turn(&session.session_id.0)?;
+                    }
+                    SessionUpdate::ToolCallUpdate(update) => {
+                        live_status = update.fields.status;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        assert_eq!(live_status, Some(expected_status));
+        assert_eq!(
+            response.stop_reason,
+            if cancelled {
+                agent_client_protocol::schema::v1::StopReason::Cancelled
+            } else {
+                agent_client_protocol::schema::v1::StopReason::EndTurn
+            }
+        );
+        drop(store);
+
+        let restored = test_store().with_persistence(persistence.clone());
+        let mut replayed_status = None;
+        handle_load_session_request(
+            &restored,
+            &LoadSessionRequest::new(session.session_id, workspace.clone()),
+            |notification| {
+                if let SessionUpdate::ToolCall(call) = notification.update {
+                    replayed_status = Some(call.status);
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        assert_eq!(
+            replayed_status, live_status,
+            "{path}, cancelled={cancelled}"
+        );
+    }
+    std::fs::remove_dir_all(state_dir)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn load_session_rejects_unknown_outcome_without_changing_state()
+-> Result<(), agent_client_protocol::Error> {
+    let state_dir = std::env::temp_dir().join(format!("acp-llm-load-invalid-{}", Uuid::new_v4()));
+    let workspace = state_dir.join("workspace");
+    let persistence = FilesystemSessionStore::new(&state_dir);
+    let unknown = serde_json::from_value(serde_json::json!({
+        "role": "tool", "content": "failed", "tool_calls": [], "tool_call_id": "call"
+    }))
+    .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let history = [
+        ChatMessage::assistant_with_tool_calls(
+            "",
+            vec![acp_llm_adapter::llm::ToolCall::new("call", "echo", "{}")],
+        ),
+        unknown,
+    ];
+    for existing in [false, true] {
+        let store = test_store().with_persistence(persistence.clone());
+        let session = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
+        store.persist_history(&session.session_id.0, &[]).await?;
+        let persisted = persistence
+            .load_record(&session.session_id.0)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        persistence
+            .persist_turn(&persisted.meta, &history)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        if !existing {
+            store.remove_session(&session.session_id.0)?;
+        }
+        let mut notifications = Vec::new();
+        assert!(
+            handle_load_session_request(
+                &store,
+                &LoadSessionRequest::new(session.session_id.clone(), workspace.clone()),
+                |notification| {
+                    notifications.push(notification);
+                    Ok(())
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(notifications.is_empty());
+        let state = store
+            .state
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let current = state.sessions.get(session.session_id.0.as_ref());
+        if existing {
+            assert!(current.is_some_and(|record| record.history.is_empty()));
+        } else {
+            assert!(current.is_none());
+        }
+    }
+    std::fs::remove_dir_all(state_dir)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
     Ok(())
 }
 
@@ -2667,37 +2803,47 @@ fn config_value_id_rejects_boolean_value() -> Result<(), agent_client_protocol::
     Ok(())
 }
 
-// ── tool_result_content ─────────────────────────────────
+// ── stored_tool_result ──────────────────────────────────
 
 #[test]
-fn tool_result_content_finds_matching_tool_result() {
+fn stored_tool_result_finds_matching_tool_result() -> Result<(), agent_client_protocol::Error> {
     let history = vec![
-        ChatMessage::user("run tool"),
-        ChatMessage::assistant_with_tool_calls(
-            "calling",
-            vec![acp_llm_adapter::llm::ToolCall::new("call-1", "echo", "{}")],
-        ),
-        ChatMessage::tool_result("call-1", "tool output"),
+        ChatMessage::tool_result("other-call", "other output", false),
+        ChatMessage::tool_result("call-1", "tool output", true),
         ChatMessage::assistant("done"),
     ];
 
     assert_eq!(
-        tool_result_content("call-1", &history),
-        Some("tool output".to_string())
+        stored_tool_result("call-1", &history)?,
+        ("tool output", true)
     );
+    Ok(())
 }
 
 #[test]
-fn tool_result_content_returns_none_when_not_found() {
+fn stored_tool_result_rejects_missing_result() {
     let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("hello")];
 
-    assert_eq!(tool_result_content("missing-call", &history), None);
+    assert!(stored_tool_result("missing-call", &history).is_err());
 }
 
 #[test]
-fn tool_result_content_returns_none_for_empty_history() {
+fn stored_tool_result_rejects_empty_history() {
     let history: Vec<ChatMessage> = Vec::new();
-    assert_eq!(tool_result_content("any-call", &history), None);
+    assert!(stored_tool_result("any-call", &history).is_err());
+}
+
+#[test]
+fn stored_tool_result_does_not_search_later_turns() {
+    let history = vec![
+        ChatMessage::tool_result("other-call", "other output", true),
+        ChatMessage::assistant_with_tool_calls(
+            "",
+            vec![acp_llm_adapter::llm::ToolCall::new("call-1", "echo", "{}")],
+        ),
+        ChatMessage::tool_result("call-1", "later result", false),
+    ];
+    assert!(stored_tool_result("call-1", &history).is_err());
 }
 
 // ── replayed_tool_call ──────────────────────────────────
@@ -2705,7 +2851,7 @@ fn tool_result_content_returns_none_for_empty_history() {
 #[test]
 fn replayed_tool_call_formats_acp_tool_call_with_output() -> Result<(), agent_client_protocol::Error>
 {
-    let history = vec![
+    let history = [
         ChatMessage::user("run echo"),
         ChatMessage::assistant_with_tool_calls(
             "using echo",
@@ -2715,11 +2861,11 @@ fn replayed_tool_call_formats_acp_tool_call_with_output() -> Result<(), agent_cl
                 r#"{"message":"hi"}"#,
             )],
         ),
-        ChatMessage::tool_result("call-1", "echo: hi"),
+        ChatMessage::tool_result("call-1", "echo: hi", true),
     ];
 
     let tool_call = acp_llm_adapter::llm::ToolCall::new("call-1", "echo", r#"{"message":"hi"}"#);
-    let replayed = replayed_tool_call(&tool_call, &history);
+    let replayed = replayed_tool_call(&tool_call, &history[2..])?;
 
     assert_eq!(replayed.tool_call_id.0.as_ref(), "call-1");
     assert_eq!(replayed.title, "echo");
@@ -2747,30 +2893,10 @@ fn replayed_tool_call_formats_acp_tool_call_with_output() -> Result<(), agent_cl
 }
 
 #[test]
-fn replayed_tool_call_defaults_output_when_tool_result_missing()
--> Result<(), agent_client_protocol::Error> {
+fn replayed_tool_call_rejects_missing_tool_result() {
     let tool_call = acp_llm_adapter::llm::ToolCall::new("call-2", "echo", r#"{"message":"hi"}"#);
     let history: Vec<ChatMessage> = Vec::new();
-    let replayed = replayed_tool_call(&tool_call, &history);
-
-    assert_eq!(replayed.tool_call_id.0.as_ref(), "call-2");
-    assert_eq!(replayed.status, ToolCallStatus::Completed);
-    assert_eq!(
-        replayed.raw_output,
-        Some(serde_json::json!({ "content": "" }))
-    );
-    assert_eq!(replayed.content.len(), 1);
-    let ToolCallContent::Content(content) = &replayed.content[0] else {
-        return Err(agent_client_protocol::Error::internal_error()
-            .data("expected Content tool call content"));
-    };
-    let ContentBlock::Text(text) = &content.content else {
-        return Err(
-            agent_client_protocol::Error::internal_error().data("expected Text content block")
-        );
-    };
-    assert_eq!(text.text, "");
-    Ok(())
+    assert!(replayed_tool_call(&tool_call, &history).is_err());
 }
 
 // ── replay_session_history ──────────────────────────────
@@ -2811,7 +2937,7 @@ fn replay_session_history_skips_system_and_tool_messages()
     let history = vec![
         ChatMessage::system("system prompt"),
         ChatMessage::user("user prompt"),
-        ChatMessage::tool_result("call-1", "result"),
+        ChatMessage::tool_result("call-1", "result", true),
     ];
     let mut notifications = Vec::new();
 
@@ -2838,7 +2964,7 @@ fn replay_session_history_replays_tool_calls_for_assistant()
     let history = vec![
         ChatMessage::user("use echo"),
         ChatMessage::assistant_with_tool_calls("using tool", vec![tool_call]),
-        ChatMessage::tool_result("call-1", "echo: hi"),
+        ChatMessage::tool_result("call-1", "echo: hi", true),
     ];
     let mut notifications = Vec::new();
 
@@ -2865,6 +2991,80 @@ fn replay_session_history_replays_tool_calls_for_assistant()
     assert!(user_chunk.message_id.is_some());
     assert!(assistant_chunk.message_id.is_some());
     assert_ne!(user_chunk.message_id, assistant_chunk.message_id);
+    Ok(())
+}
+
+#[test]
+fn replay_session_history_scopes_reused_tool_ids_to_their_turn()
+-> Result<(), agent_client_protocol::Error> {
+    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-reused-call");
+    let call = acp_llm_adapter::llm::ToolCall::new("reused", "echo", "{}");
+    let history = vec![
+        ChatMessage::assistant_with_tool_calls("", vec![call.clone()]),
+        ChatMessage::tool_result("reused", "first result", true),
+        ChatMessage::user("again"),
+        ChatMessage::assistant_with_tool_calls("", vec![call]),
+        ChatMessage::tool_result("reused", "second result", false),
+    ];
+    let mut outputs = Vec::new();
+    replay_session_history(&session_id, &history, &mut |notification| {
+        if let SessionUpdate::ToolCall(call) = notification.update {
+            outputs.push((call.raw_output, call.status));
+        }
+        Ok(())
+    })?;
+    assert_eq!(
+        outputs,
+        vec![
+            (
+                Some(serde_json::json!({ "content": "first result" })),
+                ToolCallStatus::Completed,
+            ),
+            (
+                Some(serde_json::json!({ "content": "second result" })),
+                ToolCallStatus::Failed,
+            ),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_session_history_rejects_unknown_tool_outcome_before_notifications()
+-> Result<(), agent_client_protocol::Error> {
+    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-unknown-outcome");
+    let mut persisted =
+        serde_json::to_value(ChatMessage::tool_result("unknown", "tool failed", false))
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+    persisted
+        .as_object_mut()
+        .ok_or_else(agent_client_protocol::Error::internal_error)?
+        .remove("tool_success");
+    let unknown = serde_json::from_value(persisted)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let history = vec![
+        ChatMessage::user("first turn"),
+        ChatMessage::assistant_with_tool_calls(
+            "",
+            vec![acp_llm_adapter::llm::ToolCall::new("known", "echo", "{}")],
+        ),
+        ChatMessage::tool_result("known", "known result", true),
+        ChatMessage::user("second turn"),
+        ChatMessage::assistant_with_tool_calls(
+            "",
+            vec![acp_llm_adapter::llm::ToolCall::new("unknown", "echo", "{}")],
+        ),
+        unknown,
+    ];
+    let mut notifications = Vec::new();
+    assert!(
+        replay_session_history(&session_id, &history, &mut |notification| {
+            notifications.push(notification);
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(notifications.is_empty());
     Ok(())
 }
 
@@ -2930,9 +3130,12 @@ fn replay_session_history_uses_stable_message_ids() -> Result<(), agent_client_p
 fn replay_assistant_message_emits_content_and_tool_calls()
 -> Result<(), agent_client_protocol::Error> {
     let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-asst");
-    let history: Vec<ChatMessage> = Vec::new();
     let tool_calls = vec![acp_llm_adapter::llm::ToolCall::new("call-1", "echo", "{}")];
     let message = ChatMessage::assistant_with_tool_calls("assistant text", tool_calls);
+    let history = vec![
+        message.clone(),
+        ChatMessage::tool_result("call-1", "output", true),
+    ];
     let mut notifications = Vec::new();
 
     replay_assistant_message(&session_id, &history, 0, &message, &mut |notification| {
@@ -3047,7 +3250,8 @@ async fn restore_persisted_session_rejects_mismatched_id()
     std::fs::write(meta_dir.join("meta.json"), meta_json.as_bytes())
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-    let Err(error) = restore_persisted_session(&store, &session_id, &workspace, None).await else {
+    let Err(error) = restore_persisted_session(&store, &session_id, &workspace, None, false).await
+    else {
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected mismatched persisted session id to fail"));
     };

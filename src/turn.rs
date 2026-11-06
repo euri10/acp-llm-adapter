@@ -646,6 +646,7 @@ async fn run_prompt_turn(
             messages.push(ChatMessage::tool_result(
                 tool_call.id(),
                 tool_result.content_for_model(),
+                tool_result.success,
             ));
         }
 

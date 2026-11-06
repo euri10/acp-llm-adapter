@@ -309,11 +309,12 @@ async fn resume_session(
         &request.session_id.to_string().into(),
         &setup.cwd,
         Some(&setup),
+        request.replay_from.is_some(),
     )
     .await?;
     if request.replay_from.is_some() {
         super::replay_session_history(&session_id, &history, &mut |notification| {
-            match replayed_update(notification.update) {
+            match replayed_update(notification.update)? {
                 Some(update) => send(connection, &request.session_id, update),
                 None => Ok(()),
             }
@@ -326,16 +327,20 @@ async fn resume_session(
 }
 
 /// Translate v1's history replay into v2 whole-message snapshots.
-fn replayed_update(update: v1::SessionUpdate) -> Option<v2::SessionUpdate> {
-    match update {
+fn replayed_update(update: v1::SessionUpdate) -> AcpResult<Option<v2::SessionUpdate>> {
+    Ok(match update {
         v1::SessionUpdate::UserMessageChunk(chunk) => {
-            let id = chunk.message_id?.to_string();
+            let Some(id) = chunk.message_id.map(|id| id.to_string()) else {
+                return Ok(None);
+            };
             Some(v2::SessionUpdate::UserMessage(
                 v2::UserMessage::new(id).content(vec![v1_text(&chunk.content).into()]),
             ))
         }
         v1::SessionUpdate::AgentMessageChunk(chunk) => {
-            let id = chunk.message_id?.to_string();
+            let Some(id) = chunk.message_id.map(|id| id.to_string()) else {
+                return Ok(None);
+            };
             Some(v2::SessionUpdate::AgentMessage(
                 v2::AgentMessage::new(id).content(vec![v1_text(&chunk.content).into()]),
             ))
@@ -344,14 +349,23 @@ fn replayed_update(update: v1::SessionUpdate) -> Option<v2::SessionUpdate> {
             let mut update = v2::ToolCallUpdate::new(call.tool_call_id.to_string())
                 .title(call.title)
                 .kind(v2_tool_kind(call.kind.into()))
-                .status(v2::ToolCallStatus::Completed);
+                .status(match call.status {
+                    v1::ToolCallStatus::Pending => v2::ToolCallStatus::Pending,
+                    v1::ToolCallStatus::InProgress => v2::ToolCallStatus::InProgress,
+                    v1::ToolCallStatus::Completed => v2::ToolCallStatus::Completed,
+                    v1::ToolCallStatus::Failed => v2::ToolCallStatus::Failed,
+                    _ => {
+                        return Err(agent_client_protocol::Error::internal_error()
+                            .data("unsupported stored tool status"));
+                    }
+                });
             if let Some(output) = call.raw_output {
                 update = update.raw_output(output);
             }
             Some(v2::SessionUpdate::ToolCallUpdate(update))
         }
         _ => None,
-    }
+    })
 }
 
 fn v1_text(content: &v1::ContentBlock) -> String {
@@ -776,15 +790,16 @@ mod tests {
     }
 
     #[test]
-    fn replay_keeps_message_ids_and_drops_unknown_updates() {
+    fn replay_keeps_message_ids_and_drops_unknown_updates() -> AcpResult<()> {
         let user = v1::SessionUpdate::UserMessageChunk(
             v1::ContentChunk::new("hello".into()).message_id(v1::MessageId::new("u-1")),
         );
         assert!(matches!(
-            replayed_update(user),
+            replayed_update(user)?,
             Some(v2::SessionUpdate::UserMessage(message)) if message.message_id.to_string() == "u-1"
         ));
         let without_id = v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new("x".into()));
-        assert!(replayed_update(without_id).is_none());
+        assert!(replayed_update(without_id)?.is_none());
+        Ok(())
     }
 }
