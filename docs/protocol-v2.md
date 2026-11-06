@@ -30,14 +30,32 @@ and schema 1.13.0: the protocol remains Draft and the SDK still requires
 `unstable_protocol_v2`. Zed's beta path still requests v2; the pinned LouiseLM
 and CodeCompanion clients still use v1. Schema 1.13 represents slash commands
 as a tagged union, so session creation and resume now advertise each command
-with `type: "command"`. This upgrade does not establish real-editor v2 QA.
+with `type: "command"`. The SDK upgrade alone did not establish real-editor v2 QA.
 
-The remaining non-blocking QA task (`daa-ltct`) is a real v2 session. Zed
-1.27.0-pre includes the v2 client, but its
+Real-editor QA (`daa-ltct`) completed on 2026-11-06. Zed 1.27.0-pre includes
+the v2 client, but its
 [release build only honors feature-flag overrides for staff](https://github.com/zed-industries/zed/blob/1a91814bd79e80e8f21ed7bea8e228852cd13def/crates/feature_flags/src/store.rs#L99).
 An isolated check with `acp-beta: on` still negotiated v1. That is a v1 pass,
-not a v2 pass. Real-editor v2 interoperability is not yet verified; this limit
-does not block default builds under the maintainer's accepted release policy.
+not a v2 pass.
+
+On 2026-11-06, an unmodified debug build of
+[Zed 1.28.0-pre](https://github.com/zed-industries/zed/tree/8e1ba5b4e08e8b96c03dee14ca584581e9f33a3a)
+negotiated v2 in both initialize frames against the adapter, using an isolated
+profile and localhost fake provider. Real UI checks passed for session creation,
+prompt/reply, command approval and denial, a rendered red/green edit preview
+before approval, and application of the approved edit. The editor's Stop action
+sent `session/cancel`, stopped the running shell and its child, and reached
+`idle(cancelled)`; the session then answered another prompt. Restarting the
+editor resumed that same session with `replayFrom: start`, restored history,
+and accepted a fresh prompt. Final checks used a separate Xvfb display to avoid
+desktop interruptions; the user's installed editor and configuration were
+unchanged. Evidence is recorded in `daa-ltct`. These checks do not promote the
+draft protocol to stable or change the accepted release policy.
+
+One replay-fidelity defect remains (`daa-6zin`): a cancelled tool is restored
+with status `completed` rather than `failed`, although its cancellation text
+survives. This comes from shared history replay; it does not re-execute the
+command or prevent new prompts after resume.
 
 LouiseLM needs no configuration change: update the adapter
 binary, keeping the same command, arguments, backend and environment. The
@@ -162,4 +180,5 @@ None survived, so nothing was filed.
    SDK 3.1 / schema 1.10.2; the adapter moved to 3.3.0 / 1.11.0.
 
 Findings 5 to 7 were resolved in `daa-acp-v2-followups-5m7j`; `daa-jn8o` covers
-default-build promotion. Real-editor v2 QA remains separate in `daa-ltct`.
+default-build promotion. Real-editor v2 QA completed separately in `daa-ltct`,
+with the replay-status defect tracked in `daa-6zin`.
