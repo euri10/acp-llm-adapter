@@ -129,8 +129,9 @@ require("codecompanion").setup({
 })
 ```
 
-Then `:CodeCompanionChat`. Tested with CodeCompanion `v19.27.0` on Neovim
-0.12.5, 2026-10-09.
+Then `:CodeCompanionChat`. Rechecked with CodeCompanion `v19.27.0`, Neovim
+0.12.5 and the downloaded adapter `v0.10.0` binary on 2026-11-06, using a
+localhost fake provider.
 
 > [!NOTE]
 > CodeCompanion attaches its rules files to every chat by default, including
