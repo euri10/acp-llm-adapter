@@ -179,5 +179,22 @@ smoke.run("agentic", function()
     "agentic: read/search/edit, preview, denied write, cancellation, mode/model controls and restored continuation passed\n"
   )
 end, function()
-  require("agentic.acp.agent_instance"):cleanup_all()
+  local instances = require("agentic.acp.agent_instance")
+  local client = instances._instances["deepseek-adapter"]
+  local exited = true
+  if client and client.transport.process then
+    local transport = client.transport
+    vim.fn.writefile({ tostring(transport.pid) }, evidence .. "/adapter.pid")
+    -- Pinned upstream stop closes its process handle before the exit callback.
+    -- Let our adapter exit on EOF and be reaped before releasing that handle.
+    if transport.stdin and not transport.stdin:is_closing() then
+      transport.stdin:close()
+      transport.stdin = nil
+    end
+    exited = vim.wait(5000, function()
+      return transport.process == nil
+    end, 10)
+  end
+  instances:cleanup_all()
+  assert(exited, "adapter was not reaped after stdin EOF")
 end)

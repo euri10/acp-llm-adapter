@@ -35,6 +35,12 @@ filesystem sandbox**. The mock check runs it only in a disposable project.
 Long-history restoration, restoration across editor restarts, ACP v2, attachments,
 and other backends are outside this recipe's evidence.
 
+Shutdown caveat: the pinned client's forced-stop path can leave a dead,
+unreaped adapter process under a Linux subreaper. The checker closes the
+adapter's stdin and waits for its exit before releasing the transport; this
+does not fix upstream's normal forced-stop path. No command remains running
+in the observed cases. Tracked locally as `daa-agentic-stop-reap-6bjc`.
+
 ## Run a small pilot
 
 From this adapter checkout, with Rust 1.95+, Neovim, curl, and tar installed:
@@ -105,8 +111,8 @@ URL, and a bounded timeout. It retains synthetic `chat.txt`, the preview's
 new file, provider log, and project path in the printed temporary directory.
 Neovim removes the temporary project itself when it exits; file effects and
 absence checks run before teardown.
-It stops its provider and the client-owned adapter on exit. No automated test
-calls a live provider. No adapter runtime behavior changed. The existing fake
+It stops and reaps its provider and the client-owned adapter on exit. No
+automated test calls a live provider. No adapter runtime behavior changed. The existing fake
 provider gained `!history` and `!model` probes; their new assertions were run
 red before adding the probes, then green, including a missing-history control.
 The documentation itself needs no artificial failing product test.
