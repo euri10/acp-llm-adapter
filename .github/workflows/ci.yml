@@ -171,5 +171,8 @@ jobs:
           echo "$RUNNER_TEMP/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
           sudo apt-get update -q && sudo apt-get install -yq sqlite3
 
+      - name: Plugin checkout failure handling
+        run: python3 scripts/test-editor-snippets-fetch
+
       - name: Run editor snippets against the fake provider
         run: ./scripts/test-editor-snippets

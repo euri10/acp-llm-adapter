@@ -108,6 +108,14 @@ failures in unrelated in-flight files; do not fix another agent's work.
 
 ## Conventions
 
+The editor smoke script must stop on any plugin checkout failure before starting
+Neovim or running a later Git command. Run `python3 scripts/test-editor-snippets-fetch`
+for offline fault injection through the real script: init, fetch, checkout and
+rename failures, fresh checkouts, reuse and pruned caches. It verifies that the
+parent repository stays unchanged. CI runs this alongside the real editor checks.
+Keep fetch results in standalone assignments so failed substitutions propagate
+their status; argument substitutions hide that status (`daa-797s`).
+
 New tests that benefit from tracing output use `test-log`, declared in
 `[workspace.dependencies]` and picked up via `[dev-dependencies] test-log = { workspace = true }`.
 Only the `trace` feature is enabled, so events flow through `tracing-subscriber`,

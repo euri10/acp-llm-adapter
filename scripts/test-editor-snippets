@@ -31,13 +31,14 @@ fetch() { # name url rev -> prints checkout path
   # makes git find this repo instead) and git reports nothing missing.
   if [ -d "$dir" ] && ! { [ "$(git -C "$dir" rev-parse --git-dir 2>/dev/null)" = .git ] &&
     [ -z "$(git -C "$dir" status --porcelain)" ]; }; then
-    rm -rf "$dir"
+    rm -rf "$dir" || return
   fi
   if [ ! -d "$dir" ]; then
-    git init -q "$dir.tmp"
-    git -C "$dir.tmp" fetch -q --depth 1 "$2" "$3"
-    git -C "$dir.tmp" checkout -q FETCH_HEAD
-    mv "$dir.tmp" "$dir"
+    # Command substitutions clear errexit; never continue into the parent repo.
+    git init -q "$dir.tmp" || return
+    git -C "$dir.tmp" fetch -q --depth 1 "$2" "$3" || return
+    git -C "$dir.tmp" checkout -q FETCH_HEAD || return
+    mv "$dir.tmp" "$dir" || return
   fi
   printf '%s' "$dir"
 }
@@ -108,12 +109,13 @@ check_zed() {
 for client in "$@"; do
   case $client in
     louiselm)
-      check_neovim louiselm \
-        "$(fetch louiselm https://github.com/euri10/louiselm "$LOUISELM_REV")" ;;
+      # An assignment preserves fetch's status; a Neovim argument would hide it.
+      louiselm_plugin=$(fetch louiselm https://github.com/euri10/louiselm "$LOUISELM_REV")
+      check_neovim louiselm "$louiselm_plugin" ;;
     codecompanion)
-      check_neovim codecompanion \
-        "$(fetch plenary https://github.com/nvim-lua/plenary.nvim "$PLENARY_REV")" \
-        "$(fetch codecompanion https://github.com/olimorris/codecompanion.nvim "$CODECOMPANION_REV")" ;;
+      plenary_plugin=$(fetch plenary https://github.com/nvim-lua/plenary.nvim "$PLENARY_REV")
+      codecompanion_plugin=$(fetch codecompanion https://github.com/olimorris/codecompanion.nvim "$CODECOMPANION_REV")
+      check_neovim codecompanion "$plenary_plugin" "$codecompanion_plugin" ;;
     zed)
       check_zed ;;
     *)

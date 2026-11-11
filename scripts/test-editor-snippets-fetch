@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Exercise the real smoke script's plugin setup using local Git repositories."""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+SCRIPT = Path(__file__).with_name("test-editor-snippets")
+GIT = shutil.which("git")
+MV = shutil.which("mv")
+
+
+class FetchTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="acp-editor-fetch-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.trace = self.root / "trace.jsonl"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.env = {
+            "PATH": str(self.bin) + os.pathsep + os.defpath,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "REAL_GIT": GIT,
+            "REAL_MV": MV,
+            "TRACE_FILE": str(self.trace),
+            "PLUGIN_REPO": str(self.root / "plugin"),
+        }
+        for repository in (self.project, self.root / "plugin"):
+            self.git("init", "-q", str(repository))
+            (repository / "content.txt").write_text(repository.name)
+            self.git("-C", str(repository), "add", "content.txt")
+            self.git("-C", str(repository), "-c", "user.name=Fixture", "-c",
+                     "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
+        self.parent_head = self.git("-C", str(self.project), "rev-parse", "HEAD")
+        (self.project / "scripts").mkdir()
+        shutil.copy2(SCRIPT, self.project / "scripts/test-editor-snippets")
+        provider = self.project / "target/debug/examples/fake_provider"
+        provider.parent.mkdir(parents=True)
+        self.executable(provider, "#!/bin/sh\nprintf 'http://127.0.0.1:1\\n'\nexec sleep 60\n")
+        self.executable(self.bin / "cargo", "#!/bin/sh\nexit 0\n")
+        self.executable(self.bin / "nvim", f"#!{sys.executable}\n" + r"""
+import json, os
+with open(os.environ["TRACE_FILE"], "a") as trace:
+    trace.write(json.dumps(["nvim", os.environ["SNIPPET_PLUGINS"]]) + "\n")
+""")
+        shim = f"#!{sys.executable}\n" + r"""
+import json, os, pathlib, sys
+tool = pathlib.Path(sys.argv[0]).name
+args = sys.argv[1:]
+phase = "mv" if tool == "mv" else (args[2] if args[0] == "-C" else args[0])
+with open(os.environ["TRACE_FILE"], "a") as trace:
+    trace.write(json.dumps([tool, phase, *args]) + "\n")
+if (phase == os.environ.get("FAIL_PHASE")
+        and os.environ.get("FAIL_PLUGIN", "") in " ".join(args)):
+    if phase == "init":
+        pathlib.Path(args[-1]).mkdir(parents=True, exist_ok=True)
+    print("intentional " + phase + " failure", file=sys.stderr)
+    sys.exit(73)
+if tool == "git" and phase == "fetch":
+    args[-2:] = [os.environ["PLUGIN_REPO"], "HEAD"]
+os.execv(os.environ["REAL_" + tool.upper()], [tool, *args])
+"""
+        for tool in ("git", "mv"):
+            self.executable(self.bin / tool, shim)
+
+    @staticmethod
+    def executable(path, content):
+        path.write_text(content)
+        path.chmod(0o755)
+
+    def git(self, *args):
+        return subprocess.run([GIT, *args], env=self.env, check=True,
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+
+    def smoke(self, client, **fault):
+        self.trace.write_text("")
+        result = subprocess.run(["bash", "scripts/test-editor-snippets", client],
+                                cwd=self.project, env={**self.env, **fault},
+                                capture_output=True, text=True, timeout=10)
+        events = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(self.git("-C", str(self.project), "rev-parse", "HEAD"),
+                         self.parent_head, result.stderr)
+        self.assertEqual((self.project / "content.txt").read_text(), "project")
+        return result, events
+
+    def test_failed_setup_stops_before_editors_or_later_git_commands(self):
+        for client, plugin in (("louiselm", "louiselm"),
+                               ("codecompanion", "plenary"),
+                               ("codecompanion", "codecompanion")):
+            for phase in ("init", "fetch", "checkout", "mv"):
+                with self.subTest(client=client, plugin=plugin, phase=phase):
+                    # Retry from a fresh cache so every requested phase executes.
+                    shutil.rmtree(self.project / "target/editor-snippets", ignore_errors=True)
+                    result, events = self.smoke(client, FAIL_PHASE=phase, FAIL_PLUGIN=plugin)
+                    self.assertEqual(result.returncode, 73, result.stderr)
+                    self.assertIn("intentional " + phase + " failure", result.stderr)
+                    self.assertFalse(any(event[0] == "nvim" for event in events))
+                    self.assertEqual(events[-1][1], phase)
+
+    def test_fresh_checkout_and_cache_reuse(self):
+        for client, count in (("louiselm", 1), ("codecompanion", 2)):
+            with self.subTest(client=client):
+                result, events = self.smoke(client)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plugins = events[-1][1].split(":")
+                self.assertEqual(len(plugins), count)
+                for plugin in plugins:
+                    self.assertEqual((Path(plugin) / "content.txt").read_text(), "plugin")
+                result, events = self.smoke(client)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(any(event[1] in ("init", "fetch", "checkout", "mv")
+                                     for event in events))
+                self.assertEqual(events[-1], ["nvim", ":".join(plugins)])
+
+    def test_pruned_cache_is_replaced(self):
+        result, events = self.smoke("louiselm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plugin = Path(events[-1][1])
+        shutil.rmtree(plugin / ".git")
+        result, events = self.smoke("louiselm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(event[:2] == ["git", "fetch"] for event in events))
+        self.assertEqual((plugin / "content.txt").read_text(), "plugin")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
