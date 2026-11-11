@@ -17,7 +17,7 @@ pub(crate) struct Limits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::NewSessionRequest;
+    use agent_client_protocol::v1::schema::NewSessionRequest;
 
     #[test]
     fn rejects_malformed_or_amplifying_creation_contracts() {

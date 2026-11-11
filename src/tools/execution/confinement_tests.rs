@@ -5,7 +5,7 @@ use crate::acp::handle_new_session_request;
 use crate::test_utils::{
     CountingReadTextFileRequester, FakePermissionRequester, RecordingWriteTextFileRequester,
 };
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ClientCapabilities, FileSystemCapabilities, NewSessionRequest,
 };
 use std::fs;
@@ -170,17 +170,17 @@ struct SwapOnApproval {
 impl PermissionRequester for SwapOnApproval {
     fn request_permission(
         &self,
-        _request: agent_client_protocol::schema::v1::RequestPermissionRequest,
+        _request: agent_client_protocol::v1::schema::RequestPermissionRequest,
         _tool_name: &str,
         _cwd: &std::path::Path,
     ) -> futures_util::future::BoxFuture<
         '_,
         Result<
-            agent_client_protocol::schema::v1::RequestPermissionResponse,
+            agent_client_protocol::v1::schema::RequestPermissionResponse,
             agent_client_protocol::Error,
         >,
     > {
-        use agent_client_protocol::schema::v1::{
+        use agent_client_protocol::v1::schema::{
             RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome,
         };
         Box::pin(async move {

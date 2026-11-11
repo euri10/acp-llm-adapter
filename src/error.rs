@@ -186,7 +186,9 @@ impl From<agent_client_protocol::Error> for AdapterError {
 mod tests {
     use std::error::Error as _;
 
-    use agent_client_protocol::ErrorCode::{InternalError, InvalidParams, InvalidRequest};
+    use agent_client_protocol::v1::schema::ErrorCode::{
+        InternalError, InvalidParams, InvalidRequest,
+    };
 
     use super::*;
 
@@ -319,7 +321,7 @@ mod tests {
         let acp_err: agent_client_protocol::Error = adapter_err.into();
         assert_eq!(
             acp_err.code,
-            agent_client_protocol::ErrorCode::InvalidParams
+            agent_client_protocol::ErrorCode::INVALID_PARAMS
         );
         assert_eq!(acp_err.data, Some("invalid method parameters".into()));
     }
@@ -330,7 +332,7 @@ mod tests {
         let acp_err: agent_client_protocol::Error = adapter_err.into();
         assert_eq!(
             acp_err.code,
-            agent_client_protocol::ErrorCode::InvalidRequest
+            agent_client_protocol::ErrorCode::INVALID_REQUEST
         );
         assert_eq!(acp_err.data, Some("invalid request".into()));
     }
@@ -350,7 +352,7 @@ mod tests {
         let acp_err: agent_client_protocol::Error = adapter_err.into();
         assert_eq!(
             acp_err.code,
-            agent_client_protocol::ErrorCode::InternalError
+            agent_client_protocol::ErrorCode::INTERNAL_ERROR
         );
         assert_eq!(
             acp_err.data,
@@ -365,7 +367,7 @@ mod tests {
         let acp_err: agent_client_protocol::Error = adapter_err.into();
         assert_eq!(
             acp_err.code,
-            agent_client_protocol::ErrorCode::InternalError
+            agent_client_protocol::ErrorCode::INTERNAL_ERROR
         );
         assert_eq!(acp_err.data, Some("session storage failed".into()));
     }
@@ -376,7 +378,7 @@ mod tests {
         let acp_err: agent_client_protocol::Error = adapter_err.into();
         assert_eq!(
             acp_err.code,
-            agent_client_protocol::ErrorCode::InternalError
+            agent_client_protocol::ErrorCode::INTERNAL_ERROR
         );
         assert_eq!(acp_err.data, Some("adapter operation failed".into()));
     }

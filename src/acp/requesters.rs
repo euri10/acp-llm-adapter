@@ -3,7 +3,7 @@
 //! These traits abstract over ACP client connections so that tool execution and
 //! permission logic can be unit-tested without a real transport.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
@@ -68,7 +68,7 @@ pub(crate) trait TerminalRequester: Send + Sync {
     ) -> AcpRequestFuture<'_, KillTerminalResponse>;
 }
 
-impl TerminalRequester for agent_client_protocol::ConnectionTo<Client> {
+impl TerminalRequester for agent_client_protocol::v1::ConnectionTo<Client> {
     fn create_terminal(
         &self,
         request: CreateTerminalRequest,
@@ -211,7 +211,7 @@ pub(crate) trait ToolProgressReporter: Send + Sync {
     fn report_in_progress(&self, session_id: &SessionId, tool_call_id: &str);
 }
 
-impl ToolProgressReporter for agent_client_protocol::ConnectionTo<Client> {
+impl ToolProgressReporter for agent_client_protocol::v1::ConnectionTo<Client> {
     fn report_in_progress(&self, session_id: &SessionId, tool_call_id: &str) {
         // Best effort. A client that has gone away will fail the tool call's
         // own notifications too, and the turn reports that; failing the command
@@ -261,7 +261,7 @@ pub(crate) trait PermissionRequester: Send + Sync {
 // `ConnectionTo<Agent>`). Only `read_text_file` is needed for that seam, so the
 // other requester traits are intentionally implemented for `ConnectionTo<Client>`
 // alone.
-impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
+impl ReadTextFileRequester for agent_client_protocol::v1::ConnectionTo<Agent> {
     fn read_text_file(
         &self,
         request: ReadTextFileRequest,
@@ -270,7 +270,7 @@ impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Agent> {
     }
 }
 
-impl ReadTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
+impl ReadTextFileRequester for agent_client_protocol::v1::ConnectionTo<Client> {
     fn read_text_file(
         &self,
         request: ReadTextFileRequest,
@@ -284,7 +284,7 @@ pub(crate) fn recover_null_write_response(
 ) -> Result<WriteTextFileResponse, agent_client_protocol::Error> {
     result.or_else(|err| {
         let is_null_payload_deser_failure = err.code
-            == agent_client_protocol::ErrorCode::ParseError
+            == agent_client_protocol::ErrorCode::PARSE_ERROR
             && err.data.as_ref().is_some_and(|d| {
                 d.get("json").is_some_and(serde_json::Value::is_null)
                     && d.get("phase").and_then(serde_json::Value::as_str) == Some("deserialization")
@@ -297,7 +297,7 @@ pub(crate) fn recover_null_write_response(
     })
 }
 
-impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
+impl WriteTextFileRequester for agent_client_protocol::v1::ConnectionTo<Client> {
     fn write_text_file(
         &self,
         request: WriteTextFileRequest,
@@ -308,7 +308,7 @@ impl WriteTextFileRequester for agent_client_protocol::ConnectionTo<Client> {
     }
 }
 
-impl PermissionRequester for agent_client_protocol::ConnectionTo<Client> {
+impl PermissionRequester for agent_client_protocol::v1::ConnectionTo<Client> {
     fn request_permission(
         &self,
         request: RequestPermissionRequest,
@@ -329,7 +329,7 @@ use crate::tools::{ToolContext, ToolEdit};
 use crate::turn::tool_raw_input;
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::ToolCall as ChatToolCall;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
 };
 use tokio_util::sync::CancellationToken;
@@ -375,7 +375,7 @@ pub(crate) async fn request_tool_permission(
     }
 
     let fields = ToolCallUpdateFields::new()
-        .kind(agent_client_protocol::schema::v1::ToolKind::from(kind))
+        .kind(agent_client_protocol::v1::schema::ToolKind::from(kind))
         .status(ToolCallStatus::Pending)
         .title(crate::turn::tool_call_title(call))
         .raw_input(tool_raw_input(call))

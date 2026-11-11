@@ -6,7 +6,7 @@ use crate::session::{
     SESSION_CONFIG_MODEL_ID, SESSION_CONFIG_REASONING_EFFORT_ID, SessionBehavior, SessionRecord,
 };
 use acp_llm_adapter::error::AdapterError;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ClientCapabilities, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOption, SessionMode, SessionModeState,
 };
@@ -178,7 +178,7 @@ impl From<ClientCapabilities> for crate::session::ClientCapabilities {
     }
 }
 
-use agent_client_protocol::schema::v1::NewSessionRequest;
+use agent_client_protocol::v1::schema::NewSessionRequest;
 
 impl crate::selected_content::Limits {
     pub(crate) fn from_request(

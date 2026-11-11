@@ -3,7 +3,7 @@
 use super::*;
 use crate::acp::handle_new_session_request;
 use crate::test_utils::{FakePermissionRequester, RecordingWriteTextFileRequester};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ClientCapabilities, Diff, FileSystemCapabilities, NewSessionRequest, ReadTextFileResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, ToolCallContent,
@@ -204,7 +204,11 @@ impl ReadTextFileRequester for ChangeOnApproval {
                 .lock()
                 .map_err(agent_client_protocol::Error::into_internal_error)?
                 .map(ReadTextFileResponse::new)
-                .ok_or_else(|| agent_client_protocol::Error::resource_not_found(None))
+                .ok_or_else(|| {
+                    agent_client_protocol::Error::from(
+                        agent_client_protocol::v1::schema::Error::resource_not_found(None),
+                    )
+                })
         })
     }
 }

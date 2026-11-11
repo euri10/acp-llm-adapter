@@ -1,6 +1,6 @@
 //! v2 changes-list diffs, shared by approval previews and completed edits.
 
-use agent_client_protocol::schema::v2;
+use agent_client_protocol::v2::schema as v2;
 use std::fmt::Write;
 use std::path::Path;
 

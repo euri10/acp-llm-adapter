@@ -790,17 +790,17 @@ async fn v2_clear_command_empties_the_history() -> Result<(), Box<dyn Error>> {
 /// Updates for one prompt: everything after `running` up to its `idle`.
 async fn sdk_until_idle(
     updates: &mut tokio::sync::mpsc::UnboundedReceiver<
-        agent_client_protocol::schema::v2::UpdateSessionNotification,
+        agent_client_protocol::v2::schema::UpdateSessionNotification,
     >,
-    session_id: &agent_client_protocol::schema::v2::SessionId,
+    session_id: &agent_client_protocol::v2::schema::SessionId,
 ) -> Result<
     (
-        Vec<agent_client_protocol::schema::v2::SessionUpdate>,
-        Option<agent_client_protocol::schema::v2::StopReason>,
+        Vec<agent_client_protocol::v2::schema::SessionUpdate>,
+        Option<agent_client_protocol::v2::schema::StopReason>,
     ),
     agent_client_protocol::Error,
 > {
-    use agent_client_protocol::schema::v2;
+    use agent_client_protocol::v2::schema as v2;
     let mut running = false;
     let mut seen = Vec::new();
     loop {
@@ -825,12 +825,12 @@ async fn sdk_until_idle(
 #[cfg(feature = "protocol-v2")]
 /// The test client's permission policy: approve once.
 fn allow_once(
-    request: &agent_client_protocol::schema::v2::RequestPermissionRequest,
+    request: &agent_client_protocol::v2::schema::RequestPermissionRequest,
 ) -> Result<
-    agent_client_protocol::schema::v2::RequestPermissionResponse,
+    agent_client_protocol::v2::schema::RequestPermissionResponse,
     agent_client_protocol::Error,
 > {
-    use agent_client_protocol::schema::v2;
+    use agent_client_protocol::v2::schema as v2;
     let allow = request
         .options
         .iter()
@@ -847,8 +847,9 @@ fn allow_once(
 #[cfg(feature = "protocol-v2")]
 #[tokio::test]
 async fn the_sdk_v2_client_drives_a_session_end_to_end() -> Result<(), Box<dyn Error>> {
-    use agent_client_protocol::schema::v2;
-    use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, V2ConnectionTo};
+    use agent_client_protocol::v2::schema as v2;
+    use agent_client_protocol::v2::{ConnectionTo as V2ConnectionTo, Responder};
+    use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
     use tokio::sync::mpsc::unbounded_channel;
 
     let state_dir = std::env::temp_dir().join(format!("acp-v2-sdk-{}", uuid::Uuid::new_v4()));
@@ -872,9 +873,7 @@ async fn the_sdk_v2_client_drives_a_session_end_to_end() -> Result<(), Box<dyn E
         )
         .on_receive_request(
             async move |request: v2::RequestPermissionRequest,
-                        responder: agent_client_protocol::Responder<
-                v2::RequestPermissionResponse,
-            >,
+                        responder: Responder<v2::RequestPermissionResponse>,
                         _connection: V2ConnectionTo<Agent>| {
                 responder.respond(allow_once(&request)?)
             },
@@ -899,7 +898,7 @@ async fn the_sdk_v2_client_drives_a_session_end_to_end() -> Result<(), Box<dyn E
                 .start_session()
                 .block_task()
                 .await?
-                .into_session();
+                .session;
 
             // A permission-gated command, approved by the client's handler.
             session
