@@ -15,14 +15,15 @@ use acp_llm_adapter::llm::{
     StreamEvent, ToolCallDelta,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::util::MatchDispatch;
+use agent_client_protocol::v1::schema::{
     ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
     NewSessionResponse, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
     StopReason,
 };
-use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo, SessionMessage};
+use agent_client_protocol::v1::{SessionMessage, SessionSetup};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo};
 use clap::ValueEnum;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
@@ -183,7 +184,7 @@ pub(crate) async fn run_smoke_flow(
     prompt: String,
 ) -> Result<DevSmokeResult, agent_client_protocol::Error> {
     Client
-        .builder()
+        .v1()
         .name("acp-llm-adapter-dev-client")
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _cx| {
@@ -206,16 +207,19 @@ pub(crate) async fn run_smoke_flow(
                 .send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await?;
-            let mut session = cx.build_session_cwd()?.block_task().start_session().await?;
-            let new_session_response = session.response();
+            let SessionSetup {
+                mut session,
+                response: new_session_response,
+                ..
+            } = cx.build_session_cwd()?.block_task().start_session().await?;
             session.send_prompt(prompt.as_str())?;
 
             let mut updates = Vec::new();
             let mut response_text = String::new();
             loop {
                 match session.read_update().await? {
-                    SessionMessage::SessionMessage(dispatch) => {
-                        MatchDispatch::new(dispatch)
+                    SessionMessage::Message(dispatch) => {
+                        MatchDispatch::new(dispatch.into_raw())
                             .if_notification(async |notification: SessionNotification| {
                                 updates.push(format!("{:?}", notification.update));
                                 if let SessionUpdate::AgentMessageChunk(ContentChunk {
@@ -230,13 +234,13 @@ pub(crate) async fn run_smoke_flow(
                             .await
                             .otherwise_ignore()?;
                     }
-                    SessionMessage::StopReason(stop_reason) => {
+                    SessionMessage::PromptResponse(response) => {
                         return Ok(DevSmokeResult {
                             initialize_response,
                             new_session_response,
                             updates,
                             response_text,
-                            stop_reason,
+                            stop_reason: response?.stop_reason,
                         });
                     }
                     _ => {
@@ -470,7 +474,7 @@ mod tests {
     };
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::ProtocolVersion;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
         SessionId, StopReason, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
@@ -631,7 +635,7 @@ mod tests {
     fn print_dev_smoke_result_is_callable() {
         let result = DevSmokeResult {
             initialize_response: build_initialize_response(ProtocolVersion::V1),
-            new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
+            new_session_response: agent_client_protocol::v1::schema::NewSessionResponse::new(
                 "session-1",
             ),
             updates: vec!["update-1".to_string()],
@@ -922,7 +926,7 @@ mod tests {
     fn dev_smoke_result_clones() {
         let original = DevSmokeResult {
             initialize_response: build_initialize_response(ProtocolVersion::V1),
-            new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
+            new_session_response: agent_client_protocol::v1::schema::NewSessionResponse::new(
                 "session-clone",
             ),
             updates: vec!["clone-me".to_string()],
@@ -947,7 +951,7 @@ mod tests {
     fn print_dev_smoke_result_handles_empty_updates() {
         let result = DevSmokeResult {
             initialize_response: build_initialize_response(ProtocolVersion::V1),
-            new_session_response: agent_client_protocol::schema::v1::NewSessionResponse::new(
+            new_session_response: agent_client_protocol::v1::schema::NewSessionResponse::new(
                 "session-empty",
             ),
             updates: vec![],

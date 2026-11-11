@@ -8,7 +8,7 @@ fn idle_record(cwd: &str) -> Result<crate::session::SessionRecord, Box<dyn std::
     let store = crate::test_store();
     let session = crate::acp::handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new(cwd),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new(cwd),
     )?
     .session_id;
     store
@@ -127,7 +127,7 @@ fn session_publication_preserves_active_turn_and_resources()
     let store = crate::test_store();
     let session = crate::acp::handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?
     .session_id;
     let replacement_record = idle_record("/replacement")?;

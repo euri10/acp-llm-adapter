@@ -30,7 +30,7 @@ use crate::tools::{
 use crate::{AdapterState, SessionStore, initial_model};
 use acp_llm_adapter::llm::{ChatMessage, LlmClient};
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ClientCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest,
     FileSystemCapabilities, Implementation, InitializeRequest, ListSessionsRequest,
     LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
@@ -82,7 +82,7 @@ fn assert_log_meta(
 }
 
 fn select_current_value(
-    options: &[agent_client_protocol::schema::v1::SessionConfigOption],
+    options: &[agent_client_protocol::v1::schema::SessionConfigOption],
     id: &str,
 ) -> Result<String, agent_client_protocol::Error> {
     crate::test_utils::select_current_value(options, id)
@@ -90,7 +90,7 @@ fn select_current_value(
 
 fn assert_stored_session_state(
     store: &SessionStore,
-    session_id: &agent_client_protocol::schema::v1::SessionId,
+    session_id: &agent_client_protocol::v1::schema::SessionId,
     expected_cwd: &std::path::Path,
     expected_mode: SessionBehavior,
     expected_model: &str,
@@ -118,8 +118,8 @@ fn new_session_with_mcp_servers_rejected_synchronously() -> Result<(), agent_cli
 {
     let store = test_store();
     let request = NewSessionRequest::new("/tmp").mcp_servers(vec![
-        agent_client_protocol::schema::v1::McpServer::Stdio(
-            agent_client_protocol::schema::v1::McpServerStdio::new("test", "/usr/bin/true"),
+        agent_client_protocol::v1::schema::McpServer::Stdio(
+            agent_client_protocol::v1::schema::McpServerStdio::new("test", "/usr/bin/true"),
         ),
     ]);
     let Err(error) = handle_new_session_request(&store, &request) else {
@@ -228,7 +228,7 @@ async fn prompt_request_empty_prompt_is_invalid_params() -> Result<(), agent_cli
     // Empty prompt is a caller error: it must surface as `Invalid params`
     // (-32602), not as a mis-classified `Internal error` (-32603) produced by a
     // lossy acp::Error -> AdapterError::Internal round-trip.
-    assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
     assert!(
         error
             .to_string()
@@ -621,7 +621,7 @@ fn set_config_option_rejects_unknown_option() -> Result<(), agent_client_protoco
             .data("expected unknown config option to fail"));
     };
 
-    assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
 
     Ok(())
 }
@@ -992,7 +992,7 @@ async fn serve_with_transport_handles_authenticate_and_mode_updates()
     });
 
     Agent
-        .builder()
+        .v1()
         .connect_with(client_transport, async move |cx| {
             let initialize_response = cx
                 .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -1003,7 +1003,7 @@ async fn serve_with_transport_handles_authenticate_and_mode_updates()
             assert!(initialize_response.agent_capabilities.mcp_capabilities.sse);
 
             let authenticate_response = cx
-                .send_request(agent_client_protocol::schema::v1::AuthenticateRequest::new(
+                .send_request(agent_client_protocol::v1::schema::AuthenticateRequest::new(
                     "none",
                 ))
                 .block_task()
@@ -1051,7 +1051,7 @@ fn handle_set_session_mode_request_rejects_invalid_inputs()
     let Err(error) = handle_set_session_mode_request(
         &store,
         &SetSessionModeRequest::new(
-            agent_client_protocol::schema::v1::SessionId::new("missing"),
+            agent_client_protocol::v1::schema::SessionId::new("missing"),
             "ask",
         ),
     ) else {
@@ -1073,7 +1073,7 @@ async fn handle_prompt_request_rejects_unknown_session() -> Result<(), agent_cli
         &EmptyToolRegistry,
         None,
         PromptRequest::new(
-            agent_client_protocol::schema::v1::SessionId::new("missing"),
+            agent_client_protocol::v1::schema::SessionId::new("missing"),
             vec![ContentBlock::from("hi")],
         ),
         DEFAULT_MAX_TURN_REQUESTS,
@@ -1300,7 +1300,7 @@ async fn require_tool_permission_cancelled() -> Result<(), agent_client_protocol
 async fn require_tool_permission_missing_requester() {
     let store = test_store();
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("no-connection").to_string(),
+        session_id: agent_client_protocol::v1::schema::SessionId::new("no-connection").to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
         client_capabilities: None,
@@ -1327,7 +1327,7 @@ async fn request_permission_handles_unknown_session_and_cancelled()
 -> Result<(), agent_client_protocol::Error> {
     let missing_store = test_store();
     let missing_context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("missing-session")
+        session_id: agent_client_protocol::v1::schema::SessionId::new("missing-session")
             .to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
         additional_directories: Vec::new(),
@@ -1515,7 +1515,7 @@ fn set_config_option_rejects_unknown_session() -> Result<(), agent_client_protoc
     let Err(error) = handle_set_session_config_option_request(
         &store,
         &SetSessionConfigOptionRequest::new(
-            agent_client_protocol::schema::v1::SessionId::new("missing"),
+            agent_client_protocol::v1::schema::SessionId::new("missing"),
             SESSION_CONFIG_MODEL_ID,
             "deepseek-v4-flash",
         ),
@@ -1533,7 +1533,7 @@ fn set_mode_rejects_unknown_session() -> Result<(), agent_client_protocol::Error
     let Err(error) = handle_set_session_mode_request(
         &store,
         &SetSessionModeRequest::new(
-            agent_client_protocol::schema::v1::SessionId::new("missing"),
+            agent_client_protocol::v1::schema::SessionId::new("missing"),
             "ask",
         ),
     ) else {
@@ -1595,7 +1595,7 @@ async fn serve_with_transport_exercises_list_close_and_logout()
     });
 
     Agent
-        .builder()
+        .v1()
         .connect_with(client_transport, async move |cx| {
             cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
@@ -1607,18 +1607,18 @@ async fn serve_with_transport_exercises_list_close_and_logout()
                 .await?;
 
             let list = cx
-                .send_request(agent_client_protocol::schema::v1::ListSessionsRequest::new())
+                .send_request(agent_client_protocol::v1::schema::ListSessionsRequest::new())
                 .block_task()
                 .await?;
             assert_eq!(list.sessions.len(), 1);
 
-            cx.send_request(agent_client_protocol::schema::v1::CloseSessionRequest::new(
+            cx.send_request(agent_client_protocol::v1::schema::CloseSessionRequest::new(
                 new_session.session_id,
             ))
             .block_task()
             .await?;
 
-            cx.send_request(agent_client_protocol::schema::v1::LogoutRequest::new())
+            cx.send_request(agent_client_protocol::v1::schema::LogoutRequest::new())
                 .block_task()
                 .await?;
 
@@ -1655,7 +1655,7 @@ async fn serve_with_transport_drives_new_session_config_prompt_and_cancel()
     });
 
     Agent
-        .builder()
+        .v1()
         .connect_with(client_transport, async move |cx| {
             cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
@@ -1693,17 +1693,17 @@ async fn serve_with_transport_drives_new_session_config_prompt_and_cancel()
                 .await?;
             assert_eq!(
                 prompt_response.stop_reason,
-                agent_client_protocol::schema::v1::StopReason::EndTurn
+                agent_client_protocol::v1::schema::StopReason::EndTurn
             );
 
             // cancel notification handler (no active turn -> a no-op).
-            cx.send_notification(agent_client_protocol::schema::v1::CancelNotification::new(
+            cx.send_notification(agent_client_protocol::v1::schema::CancelNotification::new(
                 session_id,
             ))?;
 
             // A trailing round-trip request guarantees in-order delivery has
             // processed the cancel notification above before the server stops.
-            cx.send_request(agent_client_protocol::schema::v1::ListSessionsRequest::new())
+            cx.send_request(agent_client_protocol::v1::schema::ListSessionsRequest::new())
                 .block_task()
                 .await?;
 
@@ -1860,7 +1860,7 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
     let active = handle_new_session_request(&store, &NewSessionRequest::new(&workspace))?;
     store.save_history(&active.session_id.0, &[ChatMessage::user("active")])?;
 
-    let persisted_id = agent_client_protocol::schema::v1::SessionId::new("session-persisted-list");
+    let persisted_id = agent_client_protocol::v1::schema::SessionId::new("session-persisted-list");
     persistence
         .persist_turn(
             &PersistedSessionMeta {
@@ -1921,7 +1921,7 @@ async fn load_session_restores_state_and_replays_history()
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone());
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-load");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-load");
     let tool_call =
         acp_llm_adapter::llm::ToolCall::new("call-1", "read_file", r#"{"path":"Cargo.toml"}"#);
     let history = vec![
@@ -2064,9 +2064,9 @@ async fn load_session_preserves_live_tool_outcomes() -> Result<(), agent_client_
         assert_eq!(
             response.stop_reason,
             if cancelled {
-                agent_client_protocol::schema::v1::StopReason::Cancelled
+                agent_client_protocol::v1::schema::StopReason::Cancelled
             } else {
-                agent_client_protocol::schema::v1::StopReason::EndTurn
+                agent_client_protocol::v1::schema::StopReason::EndTurn
             }
         );
         drop(store);
@@ -2162,7 +2162,7 @@ async fn resume_session_restores_state_without_replay() -> Result<(), agent_clie
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone());
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-resume");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-resume");
     let history = vec![
         ChatMessage::user("restore me"),
         ChatMessage::assistant("restored"),
@@ -2238,7 +2238,7 @@ async fn load_session_rejects_mismatched_cwd() -> Result<(), agent_client_protoc
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone());
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-load-cwd");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-load-cwd");
     persistence
         .persist_turn(
             &PersistedSessionMeta {
@@ -2298,7 +2298,7 @@ fn close_session_removes_session() -> Result<(), agent_client_protocol::Error> {
 #[test]
 fn close_session_rejects_unknown_session() -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
-    let unknown_id = agent_client_protocol::schema::v1::SessionId::new("nonexistent");
+    let unknown_id = agent_client_protocol::v1::schema::SessionId::new("nonexistent");
 
     let Err(error) = handle_close_session_request(&store, &CloseSessionRequest::new(unknown_id))
     else {
@@ -2316,7 +2316,7 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
     let persistence = FilesystemSessionStore::new(&state_dir);
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone());
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-delete");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-delete");
     let active_turn = CancellationToken::new();
     store.insert_session(
         session_id.0.to_string(),
@@ -2403,7 +2403,7 @@ use super::{
     recover_null_write_response,
 };
 use agent_client_protocol::Agent;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionRequest, TerminalExitStatus, TerminalId, TerminalOutputRequest,
@@ -2420,7 +2420,7 @@ async fn connection_to_client_terminal_requester_delegation()
 
     let server = tokio::spawn(async move {
         Client
-            .builder()
+            .v1()
             .on_receive_request(
                 async move |_request: CreateTerminalRequest, responder, _cx| {
                     responder.respond(CreateTerminalResponse::new(TerminalId::new("term-1")))
@@ -2464,11 +2464,11 @@ async fn connection_to_client_terminal_requester_delegation()
     // driving requests through the requester wrappers covers the production
     // delegation impls (not the raw library `send_request`).
     Agent
-        .builder()
+        .v1()
         .connect_with(client_transport, async move |cx| {
             let create_response = cx
                 .create_terminal(CreateTerminalRequest::new(
-                    agent_client_protocol::schema::v1::SessionId::new("session-terminal"),
+                    agent_client_protocol::v1::schema::SessionId::new("session-terminal"),
                     "echo hi",
                 ))
                 .await?;
@@ -2476,7 +2476,7 @@ async fn connection_to_client_terminal_requester_delegation()
 
             let output_response = cx
                 .terminal_output(TerminalOutputRequest::new(
-                    agent_client_protocol::schema::v1::SessionId::new("session-terminal"),
+                    agent_client_protocol::v1::schema::SessionId::new("session-terminal"),
                     TerminalId::new("term-1"),
                 ))
                 .await?;
@@ -2484,7 +2484,7 @@ async fn connection_to_client_terminal_requester_delegation()
 
             let wait_response = cx
                 .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
-                    agent_client_protocol::schema::v1::SessionId::new("session-terminal"),
+                    agent_client_protocol::v1::schema::SessionId::new("session-terminal"),
                     TerminalId::new("term-1"),
                 ))
                 .await?;
@@ -2492,7 +2492,7 @@ async fn connection_to_client_terminal_requester_delegation()
 
             let release_response = cx
                 .release_terminal(ReleaseTerminalRequest::new(
-                    agent_client_protocol::schema::v1::SessionId::new("session-terminal"),
+                    agent_client_protocol::v1::schema::SessionId::new("session-terminal"),
                     TerminalId::new("term-1"),
                 ))
                 .await?;
@@ -2500,7 +2500,7 @@ async fn connection_to_client_terminal_requester_delegation()
 
             let kill_response = cx
                 .kill_terminal(KillTerminalRequest::new(
-                    agent_client_protocol::schema::v1::SessionId::new("session-terminal"),
+                    agent_client_protocol::v1::schema::SessionId::new("session-terminal"),
                     TerminalId::new("term-1"),
                 ))
                 .await?;
@@ -2523,7 +2523,7 @@ async fn connection_to_client_read_write_requester_delegation()
 
     let server = tokio::spawn(async move {
         Client
-            .builder()
+            .v1()
             .on_receive_request(
                 async move |_request: ReadTextFileRequest, responder, _cx| {
                     responder.respond(ReadTextFileResponse::new("server read this content"))
@@ -2547,18 +2547,18 @@ async fn connection_to_client_read_write_requester_delegation()
     });
 
     Agent
-        .builder()
+        .v1()
         .connect_with(client_transport, async move |cx| {
             let read_response = cx
                 .read_text_file(ReadTextFileRequest::new(
-                    agent_client_protocol::schema::v1::SessionId::new("session-read-write"),
+                    agent_client_protocol::v1::schema::SessionId::new("session-read-write"),
                     std::path::PathBuf::from("/tmp/file.txt"),
                 ))
                 .await?;
             assert_eq!(read_response.content, "server read this content");
 
             cx.write_text_file(WriteTextFileRequest::new(
-                agent_client_protocol::schema::v1::SessionId::new("session-read-write"),
+                agent_client_protocol::v1::schema::SessionId::new("session-read-write"),
                 std::path::PathBuf::from("/tmp/written.txt"),
                 "client data",
             ))
@@ -2592,7 +2592,7 @@ async fn connection_to_client_permission_requester_delegation()
 
     let server = tokio::spawn(async move {
         Client
-            .builder()
+            .v1()
             .on_receive_request(
                 async move |request: RequestPermissionRequest, responder, _cx| {
                     let outcome = request.options.first().map_or(
@@ -2612,23 +2612,23 @@ async fn connection_to_client_permission_requester_delegation()
     });
 
     let response = Agent
-        .builder()
+        .v1()
         .connect_with(client_transport, async move |cx| {
             cx.request_permission(
                 RequestPermissionRequest::new(
-                    agent_client_protocol::schema::v1::SessionId::new("session-permission"),
-                    agent_client_protocol::schema::v1::ToolCallUpdate::new(
+                    agent_client_protocol::v1::schema::SessionId::new("session-permission"),
+                    agent_client_protocol::v1::schema::ToolCallUpdate::new(
                         "call-permission",
-                        agent_client_protocol::schema::v1::ToolCallUpdateFields::new()
-                            .kind(agent_client_protocol::schema::v1::ToolKind::Execute)
-                            .status(agent_client_protocol::schema::v1::ToolCallStatus::Pending)
+                        agent_client_protocol::v1::schema::ToolCallUpdateFields::new()
+                            .kind(agent_client_protocol::v1::schema::ToolKind::Execute)
+                            .status(agent_client_protocol::v1::schema::ToolCallStatus::Pending)
                             .title("run_command")
                             .raw_input(serde_json::json!({ "command": "echo hi" })),
                     ),
-                    vec![agent_client_protocol::schema::v1::PermissionOption::new(
+                    vec![agent_client_protocol::v1::schema::PermissionOption::new(
                         "allow-once",
                         "Allow once",
-                        agent_client_protocol::schema::v1::PermissionOptionKind::AllowOnce,
+                        agent_client_protocol::v1::schema::PermissionOptionKind::AllowOnce,
                     )],
                 ),
                 "run_command",
@@ -2677,7 +2677,7 @@ fn recover_null_write_response_propagates_unrelated_parse_error()
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected unrelated parse error to propagate"));
     };
-    assert_eq!(returned.code, agent_client_protocol::ErrorCode::ParseError);
+    assert_eq!(returned.code, agent_client_protocol::ErrorCode::PARSE_ERROR);
     Ok(())
 }
 
@@ -2904,7 +2904,7 @@ fn replayed_tool_call_rejects_missing_tool_result() {
 #[test]
 fn replay_session_history_emits_user_and_assistant_notifications()
 -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-test");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-test");
     let history = vec![ChatMessage::user("hello"), ChatMessage::assistant("world")];
     let mut notifications = Vec::new();
 
@@ -2933,7 +2933,7 @@ fn replay_session_history_emits_user_and_assistant_notifications()
 #[test]
 fn replay_session_history_skips_system_and_tool_messages()
 -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-skip");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-skip");
     let history = vec![
         ChatMessage::system("system prompt"),
         ChatMessage::user("user prompt"),
@@ -2959,7 +2959,7 @@ fn replay_session_history_skips_system_and_tool_messages()
 #[test]
 fn replay_session_history_replays_tool_calls_for_assistant()
 -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-tools");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-tools");
     let tool_call = acp_llm_adapter::llm::ToolCall::new("call-1", "echo", r#"{"message":"hi"}"#);
     let history = vec![
         ChatMessage::user("use echo"),
@@ -2997,7 +2997,7 @@ fn replay_session_history_replays_tool_calls_for_assistant()
 #[test]
 fn replay_session_history_scopes_reused_tool_ids_to_their_turn()
 -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-reused-call");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-reused-call");
     let call = acp_llm_adapter::llm::ToolCall::new("reused", "echo", "{}");
     let history = vec![
         ChatMessage::assistant_with_tool_calls("", vec![call.clone()]),
@@ -3032,7 +3032,7 @@ fn replay_session_history_scopes_reused_tool_ids_to_their_turn()
 #[test]
 fn replay_session_history_rejects_unknown_tool_outcome_before_notifications()
 -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-unknown-outcome");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-unknown-outcome");
     let mut persisted =
         serde_json::to_value(ChatMessage::tool_result("unknown", "tool failed", false))
             .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -3070,7 +3070,7 @@ fn replay_session_history_rejects_unknown_tool_outcome_before_notifications()
 
 #[test]
 fn replay_session_history_uses_stable_message_ids() -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-stable");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-stable");
     let history = vec![
         ChatMessage::user("same user text"),
         ChatMessage::assistant("same assistant text"),
@@ -3129,7 +3129,7 @@ fn replay_session_history_uses_stable_message_ids() -> Result<(), agent_client_p
 #[test]
 fn replay_assistant_message_emits_content_and_tool_calls()
 -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-asst");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-asst");
     let tool_calls = vec![acp_llm_adapter::llm::ToolCall::new("call-1", "echo", "{}")];
     let message = ChatMessage::assistant_with_tool_calls("assistant text", tool_calls);
     let history = vec![
@@ -3159,7 +3159,7 @@ fn replay_assistant_message_emits_content_and_tool_calls()
 
 #[test]
 fn replay_assistant_message_skips_empty_content() -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-empty");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-empty");
     let history: Vec<ChatMessage> = Vec::new();
     let message = ChatMessage::assistant_with_tool_calls("", vec![]);
     let mut notifications = Vec::new();
@@ -3176,7 +3176,7 @@ fn replay_assistant_message_skips_empty_content() -> Result<(), agent_client_pro
 #[test]
 fn replay_assistant_message_content_only_no_tool_calls() -> Result<(), agent_client_protocol::Error>
 {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("replay-content");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("replay-content");
     let history: Vec<ChatMessage> = Vec::new();
     let message = ChatMessage::assistant("just text");
     let mut notifications = Vec::new();
@@ -3209,7 +3209,7 @@ async fn restore_persisted_session_rejects_mismatched_id()
 
     // Persist a session normally with matching meta.session_id and
     // directory name, so load_record succeeds.
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-restore-id");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-restore-id");
     persistence
         .persist_turn(
             &PersistedSessionMeta {
@@ -3362,7 +3362,7 @@ async fn load_session_response_includes_history_jsonl_path_in_meta()
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone())
         .with_logging_enabled(true);
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-load-meta");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-load-meta");
     persistence
         .persist_turn(
             &PersistedSessionMeta {
@@ -3420,7 +3420,7 @@ async fn resume_session_response_includes_history_jsonl_path_in_meta()
     let store = SessionStore::new(Arc::new(Mutex::new(AdapterState::default())))
         .with_persistence(persistence.clone())
         .with_logging_enabled(true);
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-resume-meta");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-resume-meta");
     persistence
         .persist_turn(
             &PersistedSessionMeta {

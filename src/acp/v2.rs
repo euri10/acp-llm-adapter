@@ -23,9 +23,10 @@ use crate::turn::{PromptInput, PromptResult, TurnEvent};
 use crate::{ADAPTER_NAME, ADAPTER_VERSION, adapter_available_commands};
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{LlmClient, MessageRole};
-use agent_client_protocol::schema::v1;
-use agent_client_protocol::schema::{ProtocolVersion, v2};
-use agent_client_protocol::{Agent, Client, ConnectTo, Responder, V2ConnectionTo};
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema as v1;
+use agent_client_protocol::v2::{ConnectionTo as V2ConnectionTo, Responder, schema as v2};
+use agent_client_protocol::{Agent, Client, ConnectTo};
 
 mod diff;
 mod tools;
@@ -159,7 +160,7 @@ fn require_active_session(store: &SessionStore, id: &v2::SessionId) -> AcpResult
         .lookup_session(&id.to_string())
         .map_err(|error| match error {
             AdapterError::InvalidParams(_) => {
-                agent_client_protocol::Error::resource_not_found(None)
+                agent_client_protocol::Error::from(v2::Error::resource_not_found())
             }
             other => other.into(),
         })
@@ -768,7 +769,7 @@ mod tests {
             return Err("usage was not encoded".into());
         };
         assert_eq!((usage.used, usage.size), (10, 100));
-        assert_eq!(usage.cost.map(|cost| cost.amount), Some(1.5));
+        assert_eq!(serde_json::to_value(&usage)?["cost"]["amount"], 1.5);
         Ok(())
     }
 

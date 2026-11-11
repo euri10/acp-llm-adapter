@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{ChatMessage, LlmClient, MessageRole, ToolCall as ChatToolCall};
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentAuthCapabilities, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     AvailableCommandsUpdate, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, DeleteSessionRequest,
@@ -127,7 +127,7 @@ async fn serve_with_transport_impl(
     let delete_session_store = store.clone();
 
     let v1 = Agent
-        .builder()
+        .v1()
         .name("acp-llm-adapter")
         .on_receive_request(
             async move |request: InitializeRequest, responder, _cx| {
@@ -372,7 +372,7 @@ pub(crate) fn handle_list_sessions_request(
         sessions
             .into_iter()
             .map(|summary| {
-                let mut info = agent_client_protocol::schema::v1::SessionInfo::new(
+                let mut info = agent_client_protocol::v1::schema::SessionInfo::new(
                     summary.session_id,
                     summary.cwd,
                 )
@@ -496,7 +496,9 @@ async fn restore_persisted_session(
                 AdapterError::SessionPersistence(
                     acp_llm_adapter::error::SessionPersistenceError::Io(error),
                 ) if setup.is_some() && error.kind() == std::io::ErrorKind::NotFound => {
-                    agent_client_protocol::Error::resource_not_found(None)
+                    agent_client_protocol::Error::from(
+                        agent_client_protocol::v1::schema::Error::resource_not_found(None),
+                    )
                 }
                 // Keep v1's existing presentation of storage failures; v2 only
                 // distinguishes an absent record, not corrupt or unreadable state.
@@ -826,7 +828,7 @@ pub(crate) fn handle_set_session_config_option_request_notifying(
 
     match request.config_id.0.as_ref() {
         SESSION_CONFIG_MODE_ID => {
-            let mode_id = agent_client_protocol::schema::v1::SessionModeId::new(value.0.clone());
+            let mode_id = agent_client_protocol::v1::schema::SessionModeId::new(value.0.clone());
             let Some(mode) = SessionBehavior::from_mode_id_str(&mode_id.0) else {
                 return Err(
                     agent_client_protocol::Error::invalid_params().data("unsupported session mode")
@@ -955,7 +957,7 @@ pub(crate) fn build_initialize_response(_protocol_version: ProtocolVersion) -> I
             AgentCapabilities::new()
                 .load_session(true)
                 .prompt_capabilities(
-                    agent_client_protocol::schema::v1::PromptCapabilities::new()
+                    agent_client_protocol::v1::schema::PromptCapabilities::new()
                         .embedded_context(true),
                 )
                 .mcp_capabilities(McpCapabilities::new().http(true).sse(true))

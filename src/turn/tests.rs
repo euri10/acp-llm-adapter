@@ -24,7 +24,7 @@ use acp_llm_adapter::llm::{
     ChatError, ChatMessage, ChatRequest, FinishReason, LlmClient, MessageRole, StreamEvent,
     ToolCall as ChatToolCall, ToolCallDelta, ToolDefinition, UsageData,
 };
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CancelNotification, ContentBlock, DeleteSessionRequest, ListSessionsRequest,
     LoadSessionRequest, NewSessionRequest, PromptRequest, RequestPermissionRequest,
     RequestPermissionResponse, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
@@ -330,7 +330,7 @@ async fn handle_prompt_request(
     request: PromptRequest,
     limit: std::num::NonZeroUsize,
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
-) -> Result<agent_client_protocol::schema::v1::PromptResponse, AdapterError> {
+) -> Result<agent_client_protocol::v1::schema::PromptResponse, AdapterError> {
     let input = crate::acp::translate_prompt(
         &request,
         store
@@ -357,7 +357,7 @@ async fn stream_model_turn(
     context: StreamContext<'_>,
     settings: ModelRequestSettings<'_>,
     cancellation: CancellationToken,
-    session_id: &agent_client_protocol::schema::v1::SessionId,
+    session_id: &agent_client_protocol::v1::schema::SessionId,
     notify: &mut impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<super::ModelTurn, AdapterError> {
     let temporary = test_store();
@@ -724,11 +724,11 @@ impl PermissionRequester for TransitionRequester {
 impl ReadTextFileRequester for TransitionRequester {
     fn read_text_file(
         &self,
-        _request: agent_client_protocol::schema::v1::ReadTextFileRequest,
+        _request: agent_client_protocol::v1::schema::ReadTextFileRequest,
     ) -> BoxFuture<
         '_,
         Result<
-            agent_client_protocol::schema::v1::ReadTextFileResponse,
+            agent_client_protocol::v1::schema::ReadTextFileResponse,
             agent_client_protocol::Error,
         >,
     > {
@@ -742,11 +742,11 @@ impl ReadTextFileRequester for TransitionRequester {
 impl WriteTextFileRequester for TransitionRequester {
     fn write_text_file(
         &self,
-        _request: agent_client_protocol::schema::v1::WriteTextFileRequest,
+        _request: agent_client_protocol::v1::schema::WriteTextFileRequest,
     ) -> BoxFuture<
         '_,
         Result<
-            agent_client_protocol::schema::v1::WriteTextFileResponse,
+            agent_client_protocol::v1::schema::WriteTextFileResponse,
             agent_client_protocol::Error,
         >,
     > {
@@ -760,7 +760,7 @@ impl WriteTextFileRequester for TransitionRequester {
 impl crate::ToolProgressReporter for TransitionRequester {
     fn report_in_progress(
         &self,
-        _session_id: &agent_client_protocol::schema::v1::SessionId,
+        _session_id: &agent_client_protocol::v1::schema::SessionId,
         _tool_call_id: &str,
     ) {
     }
@@ -769,11 +769,11 @@ impl crate::ToolProgressReporter for TransitionRequester {
 impl TerminalRequester for TransitionRequester {
     fn create_terminal(
         &self,
-        _request: agent_client_protocol::schema::v1::CreateTerminalRequest,
+        _request: agent_client_protocol::v1::schema::CreateTerminalRequest,
     ) -> BoxFuture<
         '_,
         Result<
-            agent_client_protocol::schema::v1::CreateTerminalResponse,
+            agent_client_protocol::v1::schema::CreateTerminalResponse,
             agent_client_protocol::Error,
         >,
     > {
@@ -785,11 +785,11 @@ impl TerminalRequester for TransitionRequester {
 
     fn terminal_output(
         &self,
-        _request: agent_client_protocol::schema::v1::TerminalOutputRequest,
+        _request: agent_client_protocol::v1::schema::TerminalOutputRequest,
     ) -> BoxFuture<
         '_,
         Result<
-            agent_client_protocol::schema::v1::TerminalOutputResponse,
+            agent_client_protocol::v1::schema::TerminalOutputResponse,
             agent_client_protocol::Error,
         >,
     > {
@@ -801,11 +801,11 @@ impl TerminalRequester for TransitionRequester {
 
     fn wait_for_terminal_exit(
         &self,
-        _request: agent_client_protocol::schema::v1::WaitForTerminalExitRequest,
+        _request: agent_client_protocol::v1::schema::WaitForTerminalExitRequest,
     ) -> BoxFuture<
         '_,
         Result<
-            agent_client_protocol::schema::v1::WaitForTerminalExitResponse,
+            agent_client_protocol::v1::schema::WaitForTerminalExitResponse,
             agent_client_protocol::Error,
         >,
     > {
@@ -817,11 +817,11 @@ impl TerminalRequester for TransitionRequester {
 
     fn release_terminal(
         &self,
-        _request: agent_client_protocol::schema::v1::ReleaseTerminalRequest,
+        _request: agent_client_protocol::v1::schema::ReleaseTerminalRequest,
     ) -> BoxFuture<
         '_,
         Result<
-            agent_client_protocol::schema::v1::ReleaseTerminalResponse,
+            agent_client_protocol::v1::schema::ReleaseTerminalResponse,
             agent_client_protocol::Error,
         >,
     > {
@@ -833,11 +833,11 @@ impl TerminalRequester for TransitionRequester {
 
     fn kill_terminal(
         &self,
-        _request: agent_client_protocol::schema::v1::KillTerminalRequest,
+        _request: agent_client_protocol::v1::schema::KillTerminalRequest,
     ) -> BoxFuture<
         '_,
         Result<
-            agent_client_protocol::schema::v1::KillTerminalResponse,
+            agent_client_protocol::v1::schema::KillTerminalResponse,
             agent_client_protocol::Error,
         >,
     > {
@@ -1123,7 +1123,7 @@ async fn prompt_uses_updated_session_model_and_reasoning()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     handle_set_session_config_option_request(
         &store,
@@ -1172,7 +1172,7 @@ async fn prompt_uses_updated_session_max_tokens() -> Result<(), agent_client_pro
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     handle_set_session_config_option_request(
         &store,
@@ -1210,7 +1210,7 @@ async fn prompt_omits_max_tokens_by_default() -> Result<(), agent_client_protoco
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
 
     let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
@@ -1310,7 +1310,7 @@ async fn plan_mode_injects_instructions_and_filters_mutating_tools()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
 
@@ -1375,7 +1375,7 @@ async fn plan_mode_refuses_disallowed_tool_calls_before_execution()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
 
@@ -1425,7 +1425,7 @@ async fn leaving_plan_mode_restores_normal_request_assembly()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let client = FakeLlmClient::with_streams(vec![
         vec![
@@ -1508,7 +1508,7 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
 
@@ -1697,7 +1697,7 @@ async fn prompt_persistence_failure_prevents_provider_work_and_releases_turn()
         test_store().with_persistence(crate::session_store::FilesystemSessionStore::new(&root));
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
     for _ in 0..2 {
@@ -1735,7 +1735,7 @@ async fn prompt_streams_updates_and_stores_history() -> Result<(), agent_client_
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let client = FakeLlmClient::new(vec![
         Ok(StreamEvent::Thought("thinking".to_string())),
@@ -1819,7 +1819,7 @@ async fn prompt_does_not_emit_plan_from_plain_text() -> Result<(), agent_client_
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
     let mut notifications = Vec::new();
@@ -1860,7 +1860,7 @@ async fn prompt_emits_explicit_plan_update_from_tool_call()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let client = FakeLlmClient::with_streams(vec![
         vec![
@@ -1929,20 +1929,20 @@ async fn prompt_emits_explicit_plan_update_from_tool_call()
     assert_eq!(plan.entries[0].content, "Inspect the failing tests");
     assert_eq!(
         plan.entries[0].priority,
-        agent_client_protocol::schema::v1::PlanEntryPriority::High
+        agent_client_protocol::v1::schema::PlanEntryPriority::High
     );
     assert_eq!(
         plan.entries[0].status,
-        agent_client_protocol::schema::v1::PlanEntryStatus::InProgress
+        agent_client_protocol::v1::schema::PlanEntryStatus::InProgress
     );
     assert_eq!(plan.entries[1].content, "Land the fix");
     assert_eq!(
         plan.entries[1].priority,
-        agent_client_protocol::schema::v1::PlanEntryPriority::Medium
+        agent_client_protocol::v1::schema::PlanEntryPriority::Medium
     );
     assert_eq!(
         plan.entries[1].status,
-        agent_client_protocol::schema::v1::PlanEntryStatus::Pending
+        agent_client_protocol::v1::schema::PlanEntryStatus::Pending
     );
     assert!(matches!(
         notifications[4].update,
@@ -1963,7 +1963,7 @@ async fn prompt_omits_unchanged_title_in_session_info_update()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
 
     let first_client = FakeLlmClient::new(vec![Ok(StreamEvent::Finished(FinishReason::EndTurn))]);
@@ -2018,7 +2018,7 @@ async fn cancel_notification_stops_active_prompt() -> Result<(), agent_client_pr
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let session_id = session.session_id.clone();
     let client = Arc::new(FakeLlmClient::with_steps(vec![
@@ -2101,7 +2101,7 @@ async fn delete_session_cancels_prompt_without_failing_cleanup()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let session_id = session.session_id.clone();
     let started = Arc::new(Notify::new());
@@ -2265,7 +2265,7 @@ async fn stream_model_turn_respects_cancellation_token() -> Result<(), agent_cli
     let client = PendingLlmClient::new(Arc::clone(&started));
     let cancellation_token = CancellationToken::new();
     let task_token = cancellation_token.clone();
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-cancel");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-cancel");
     let messages: Vec<ChatMessage> = Vec::new();
     let tool_definitions: Vec<ToolDefinition> = Vec::new();
 
@@ -2324,7 +2324,7 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let session_id = session.session_id;
     let messages: Vec<ChatMessage> = Vec::new();
@@ -2358,7 +2358,7 @@ async fn stream_model_turn_fills_missing_context_window_from_model_table()
         usage_totals
             .into_usage()
             .map(crate::acp::turn_events::encode_usage),
-        Some(agent_client_protocol::schema::v1::Usage::new(10, 3, 4))
+        Some(agent_client_protocol::v1::schema::Usage::new(10, 3, 4))
     );
 
     let usage_updates: Vec<&SessionUpdate> = notifications
@@ -2608,7 +2608,7 @@ async fn discovered_windows_follow_selected_model_and_usage_precedence()
     })?;
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     for (model, streamed_window, expected) in [
         ("new-model", 0, 123_456),
@@ -2671,7 +2671,7 @@ async fn stream_model_turn_skips_usage_update_for_unknown_model()
         })),
         Ok(StreamEvent::Finished(FinishReason::EndTurn)),
     ]);
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("session-usage-unknown");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("session-usage-unknown");
     let messages: Vec<ChatMessage> = Vec::new();
     let tool_definitions: Vec<ToolDefinition> = Vec::new();
     let mut notifications = Vec::new();
@@ -2703,7 +2703,7 @@ async fn stream_model_turn_skips_usage_update_for_unknown_model()
         usage_totals
             .into_usage()
             .map(crate::acp::turn_events::encode_usage),
-        Some(agent_client_protocol::schema::v1::Usage::new(7, 3, 4))
+        Some(agent_client_protocol::v1::schema::Usage::new(7, 3, 4))
     );
     assert!(
         notifications
@@ -2721,7 +2721,7 @@ async fn prompt_executes_tool_calls_and_replays_results() -> Result<(), agent_cl
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let client = FakeLlmClient::with_streams(vec![
         vec![
@@ -2825,7 +2825,7 @@ async fn prompt_tool_loop_stops_at_max_turn_requests() -> Result<(), agent_clien
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let limit = DEFAULT_MAX_TURN_REQUESTS.get();
     let mut streams = (0..limit)
@@ -2952,7 +2952,7 @@ async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protoc
     let store = test_store();
     let session = handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let first_client = FakeLlmClient::new(vec![
         Ok(StreamEvent::Message("first answer".to_string())),
@@ -3003,7 +3003,7 @@ async fn prompt_replays_history_on_next_turn() -> Result<(), agent_client_protoc
 #[test_log::test(tokio::test)]
 async fn report_tool_call_generates_correct_notification()
 -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("report-test");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("report-test");
     let call = ChatToolCall::new(
         "call-rtc",
         "write_file",
@@ -3031,7 +3031,7 @@ async fn report_tool_call_generates_correct_notification()
 #[test_log::test(tokio::test)]
 async fn report_tool_result_with_edit_generates_diff_and_location()
 -> Result<(), agent_client_protocol::Error> {
-    let session_id = agent_client_protocol::schema::v1::SessionId::new("report-result");
+    let session_id = agent_client_protocol::v1::schema::SessionId::new("report-result");
     let call = ChatToolCall::new("call-rt", "write_file", "{}");
     let exec = ToolExecution {
         content: "ok".to_string(),

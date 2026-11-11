@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
 use http::{HeaderName, HeaderValue};

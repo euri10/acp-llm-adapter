@@ -32,6 +32,14 @@ and CodeCompanion clients still use v1. Schema 1.13 represents slash commands
 as a tagged union, so session creation and resume now advertise each command
 with `type: "command"`. The SDK upgrade alone did not establish real-editor v2 QA.
 
+Rechecked 2026-11-11 with [SDK 5.0.0](https://agentclientprotocol.github.io/rust-sdk/migration-v5.html)
+and schema 1.15.1: ACP still lists v2 as Draft, and the SDK still gates it
+behind `unstable_protocol_v2`. The adapter now uses the versioned SDK entry
+points, connection handles and schema modules. The SDK and wire regression
+checks cover both the default dual-protocol build and the explicit v1-only
+fallback. Editor adoption and the real-editor evidence below remain separate
+from protocol and SDK stability; this upgrade does not promote v2 to stable.
+
 Real-editor QA (`daa-ltct`) completed on 2026-11-06. Zed 1.27.0-pre includes
 the v2 client, but its
 [release build only honors feature-flag overrides for staff](https://github.com/zed-industries/zed/blob/1a91814bd79e80e8f21ed7bea8e228852cd13def/crates/feature_flags/src/store.rs#L99).

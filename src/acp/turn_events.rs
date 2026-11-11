@@ -7,8 +7,8 @@ use crate::turn::{PromptResult, TurnEvent, UsageTotals};
 use crate::{session_notification, tool_raw_input};
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::ToolCall as ChatToolCall;
-use agent_client_protocol::schema::v1::ToolCall as AcpToolCall;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::ToolCall as AcpToolCall;
+use agent_client_protocol::v1::schema::{
     ConfigOptionUpdate, ContentChunk, Cost, CurrentModeUpdate, Diff, MessageId, Plan,
     PromptResponse, SessionId, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
     ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,

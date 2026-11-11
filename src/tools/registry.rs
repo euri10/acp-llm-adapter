@@ -135,7 +135,7 @@ mod tests {
     use crate::test_store;
     use acp_llm_adapter::error::AdapterError;
     use acp_llm_adapter::llm::ToolCall as ChatToolCall;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         ClientCapabilities, CreateTerminalRequest, CreateTerminalResponse, FileSystemCapabilities,
         KillTerminalRequest, KillTerminalResponse, NewSessionRequest, ReadTextFileRequest,
         ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
@@ -233,7 +233,7 @@ mod tests {
     impl crate::ToolProgressReporter for RecordingToolCallRequester {
         fn report_in_progress(
             &self,
-            _session_id: &agent_client_protocol::schema::v1::SessionId,
+            _session_id: &agent_client_protocol::v1::schema::SessionId,
             _tool_call_id: &str,
         ) {
             self.progress.fetch_add(1, Ordering::SeqCst);
@@ -292,7 +292,7 @@ mod tests {
 
     fn registry_context(cwd: std::path::PathBuf) -> ToolContext {
         ToolContext {
-            session_id: agent_client_protocol::schema::v1::SessionId::new("session-registry-test")
+            session_id: agent_client_protocol::v1::schema::SessionId::new("session-registry-test")
                 .to_string(),
             cwd,
             additional_directories: Vec::new(),

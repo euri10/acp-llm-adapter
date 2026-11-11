@@ -7,7 +7,7 @@ use std::process::Stdio;
 
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateTerminalRequest, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
     ReadTextFileRequest, TerminalOutputRequest, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
@@ -787,7 +787,7 @@ pub(crate) async fn run_command_tool_execution(
 
     if let Some(progress) = progress {
         progress.report_in_progress(
-            &agent_client_protocol::schema::v1::SessionId::new(context.session_id.clone()),
+            &agent_client_protocol::v1::schema::SessionId::new(context.session_id.clone()),
             call.id(),
         );
     }
@@ -869,7 +869,7 @@ pub(crate) async fn run_command_via_terminal(
     // behind the permission prompt above.
     if let Some(progress) = progress {
         progress.report_in_progress(
-            &agent_client_protocol::schema::v1::SessionId::new(session_id),
+            &agent_client_protocol::v1::schema::SessionId::new(session_id),
             tool_call_id,
         );
     }
@@ -881,7 +881,7 @@ pub(crate) async fn run_command_via_terminal(
         // terminal so the client frees its resources.
         () = cancellation_token.cancelled() => {
             // Cleanup logs failed/unanswered RPCs and attempts both operations.
-            let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::schema::v1::SessionId::new(session_id), &terminal_id, true).await;
+            let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::v1::schema::SessionId::new(session_id), &terminal_id, true).await;
             return ToolExecution::failed("run_command cancelled");
         }
         result = terminal_requester.wait_for_terminal_exit(wait_request) => match result {
@@ -889,7 +889,7 @@ pub(crate) async fn run_command_via_terminal(
             Err(error) => {
                 tracing::warn!(code = ?error.code, "terminal/wait_for_exit failed");
                 // An unsuccessful wait does not prove the command exited.
-                let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::schema::v1::SessionId::new(session_id), &terminal_id, true).await;
+                let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::v1::schema::SessionId::new(session_id), &terminal_id, true).await;
                 return ToolExecution::failed("terminal/wait_for_exit failed");
             }
         },
@@ -900,14 +900,14 @@ pub(crate) async fn run_command_via_terminal(
         biased;
         () = cancellation_token.cancelled() => {
             // Keep cancellation cleanup consistent even after exit notification.
-            let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::schema::v1::SessionId::new(session_id), &terminal_id, true).await;
+            let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::v1::schema::SessionId::new(session_id), &terminal_id, true).await;
             return ToolExecution::failed("run_command cancelled");
         }
         result = terminal_requester.terminal_output(output_request) => match result {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(code = ?error.code, "terminal/output failed");
-                let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::schema::v1::SessionId::new(session_id), &terminal_id, false).await;
+                let _ = crate::acp::cleanup_terminal(terminal_requester, &agent_client_protocol::v1::schema::SessionId::new(session_id), &terminal_id, false).await;
                 return ToolExecution::failed("terminal/output failed");
             }
         },
@@ -915,7 +915,7 @@ pub(crate) async fn run_command_via_terminal(
 
     if crate::acp::cleanup_terminal(
         terminal_requester,
-        &agent_client_protocol::schema::v1::SessionId::new(session_id),
+        &agent_client_protocol::v1::schema::SessionId::new(session_id),
         &terminal_id,
         false,
     )
@@ -1251,7 +1251,7 @@ async fn read_existing_text(
             .await
         {
             Ok(response) => Ok(ExistingText::Text(response.content)),
-            Err(error) if error.code == agent_client_protocol::ErrorCode::ResourceNotFound => {
+            Err(error) if error.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND => {
                 Ok(ExistingText::Missing)
             }
             Err(error) => Err(read_file_client_error(&path, &error.to_string())),

@@ -10,7 +10,7 @@ use crate::session::{PERMISSION_ALLOW_ONCE_OPTION_ID, PermissionDecision};
 use crate::tools::{AdapterToolRegistry, ToolContext, ToolRegistry};
 use crate::{PermissionRequester, test_store};
 use acp_llm_adapter::llm::ToolCall as ChatToolCall;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     EnvVariable, HttpHeader, McpServer, McpServerAcp, McpServerHttp, McpServerSse, McpServerStdio,
     NewSessionRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SetSessionModeRequest, ToolKind,
@@ -464,7 +464,7 @@ async fn connect_mcp_sessions_rejects_acp_transport() {
 
 #[test]
 fn mcp_http_headers_parses_custom_headers() -> Result<(), agent_client_protocol::Error> {
-    let headers = [agent_client_protocol::schema::v1::HttpHeader::new(
+    let headers = [agent_client_protocol::v1::schema::HttpHeader::new(
         "X-Client-Trace",
         "trace-id",
     )];
@@ -485,8 +485,8 @@ fn mcp_http_headers_parses_custom_headers() -> Result<(), agent_client_protocol:
 #[test]
 fn mcp_http_headers_duplicate_names_keep_last_value() -> Result<(), agent_client_protocol::Error> {
     let headers = [
-        agent_client_protocol::schema::v1::HttpHeader::new("X-Trace", "first"),
-        agent_client_protocol::schema::v1::HttpHeader::new("x-trace", "second"),
+        agent_client_protocol::v1::schema::HttpHeader::new("X-Trace", "first"),
+        agent_client_protocol::v1::schema::HttpHeader::new("x-trace", "second"),
     ];
 
     let parsed = mcp_http_headers(&headers, "remote")?;
@@ -504,7 +504,7 @@ fn mcp_http_headers_duplicate_names_keep_last_value() -> Result<(), agent_client
 
 #[test]
 fn mcp_http_headers_rejects_invalid_header_name() -> Result<(), agent_client_protocol::Error> {
-    let headers = [agent_client_protocol::schema::v1::HttpHeader::new(
+    let headers = [agent_client_protocol::v1::schema::HttpHeader::new(
         "bad header",
         "secret",
     )];
@@ -940,7 +940,7 @@ fn sanitize_tool_name_keeps_numeric_alphanumeric_parts() {
 
 #[test]
 fn mcp_http_headers_rejects_invalid_header_value() -> Result<(), agent_client_protocol::Error> {
-    let headers = [agent_client_protocol::schema::v1::HttpHeader::new(
+    let headers = [agent_client_protocol::v1::schema::HttpHeader::new(
         "X-Token", "val\0ue",
     )];
 
@@ -1190,7 +1190,7 @@ async fn mcp_tool_execution_is_error_flag() -> Result<(), agent_client_protocol:
 async fn mcp_tool_execution_unknown_session() {
     let store = test_store();
     let context = ToolContext {
-        session_id: agent_client_protocol::schema::v1::SessionId::new("nonexistent-session")
+        session_id: agent_client_protocol::v1::schema::SessionId::new("nonexistent-session")
             .to_string(),
         cwd: PathBuf::from("/tmp"),
         additional_directories: Vec::new(),

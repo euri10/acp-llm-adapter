@@ -3,7 +3,7 @@ use super::{PendingToolCalls, PermissionDecision, ReasoningEffort, SessionBehavi
 use crate::tools::ToolKind;
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{ChatError, ToolCall, ToolCallDelta};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome,
 };
 use tokio_util::sync::CancellationToken;
@@ -16,7 +16,7 @@ async fn clear_history_preserves_settings_permissions_and_spend()
         .with_persistence(crate::session_store::FilesystemSessionStore::new(&root));
     let session = crate::acp::handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?
     .session_id;
     let history = vec![acp_llm_adapter::llm::ChatMessage::user(
@@ -58,7 +58,7 @@ async fn clear_history_failure_keeps_memory_and_disk_conversation()
         .with_persistence(crate::session_store::FilesystemSessionStore::new(&root));
     let session = crate::acp::handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?
     .session_id;
     let history = vec![acp_llm_adapter::llm::ChatMessage::user("keep this context")];
@@ -85,7 +85,7 @@ async fn clear_history_failure_keeps_memory_and_disk_conversation()
 /// Return type for [`permission_mode_fixture`].
 pub(crate) type PermissionModeFixture = (
     crate::SessionStore,
-    agent_client_protocol::schema::v1::SessionId,
+    agent_client_protocol::v1::schema::SessionId,
     crate::tools::ToolContext,
     acp_llm_adapter::llm::ToolCall,
     acp_llm_adapter::llm::ToolCall,
@@ -104,7 +104,7 @@ pub(crate) fn permission_mode_fixture()
     let store = test_store();
     let session = crate::acp::handle_new_session_request(
         &store,
-        &agent_client_protocol::schema::v1::NewSessionRequest::new("/tmp"),
+        &agent_client_protocol::v1::schema::NewSessionRequest::new("/tmp"),
     )?;
     let context = crate::tools::ToolContext {
         session_id: session.session_id.0.to_string(),

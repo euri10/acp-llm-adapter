@@ -5,8 +5,9 @@ use crate::acp::{
     PermissionRequester, ReadTextFileRequester, TerminalRequester, ToolProgressReporter,
     WriteTextFileRequester,
 };
-use agent_client_protocol::schema::{v1, v2};
-use agent_client_protocol::{Client, V2ConnectionTo};
+use agent_client_protocol::Client;
+use agent_client_protocol::v1::schema as v1;
+use agent_client_protocol::v2::{ConnectionTo as V2ConnectionTo, schema as v2};
 use futures_util::future::BoxFuture;
 
 /// The tool layer's view of a v2 connection. Permission prompts reach the
