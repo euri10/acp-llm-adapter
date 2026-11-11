@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/euri10/acp-llm-adapter/compare/v0.10.0...v0.10.1) - 2026-11-11
+
+### Fixed
+
+- *(ci)* stop failed plugin checkout setup
+- *(acp)* migrate to SDK 5
+- *(tests)* reap editor-check children
+- *(release)* own container creation and cleanup
+- *(release)* reap timed-out version probes
+
+### Other
+
+- *(beads)* checkpoint local tracker updates
+- *(beads)* close editor fetch failure
+- *(beads)* record dependency CI outcomes
+- Merge remote-tracking branch 'origin/main' into fix/acp-sdk5-nov11
+- Merge remote-tracking branch 'origin/main' into fix/acp-sdk5-nov11
+- Merge remote-tracking branch 'origin/main' into fix/dependabot-nov11
+- *(deps)* bump uuid from 1.29.0 to 1.29.1
+- *(deps)* bump rmcp from 3.8.0 to 3.9.0
+- *(deps)* bump agent-client-protocol from 3.6.0 to 5.0.0
+- *(beads)* checkpoint marketing rollout
+- verify CodeCompanion release setup
+- link the tested ACP pilot recipes
+- *(beads)* record marketing pilot evidence
+- add verified binary installation path
+- publish verified Linux release binaries
+- record live agentic.nvim pilot
+- reap agentic smoke adapter on exit
+- add tested agentic.nvim pilot recipe
+- add tested cc-connect pilot recipe
+- *(beads)* sync acceptance and marketing plan
+
 ## [0.10.0](https://github.com/euri10/acp-llm-adapter/compare/v0.9.6...v0.10.0) - 2026-11-06
 
 ### Added
