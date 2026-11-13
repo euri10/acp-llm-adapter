@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/euri10/acp-llm-adapter/compare/v0.10.1...v0.10.2) - 2026-11-13
+
+### Fixed
+
+- *(deps)* bump quinn-proto and quinn-udp for audit
+
+### Other
+
+- Merge pull request #98 from euri10/dependabot/cargo/uuid-1.29.2
+- Merge pull request #99 from euri10/dependabot/cargo/agent-client-protocol-5.1.0
+- *(deps)* bump agent-client-protocol from 5.0.0 to 5.1.0
+- *(deps)* bump uuid from 1.29.1 to 1.29.2
+
 ## [0.10.1](https://github.com/euri10/acp-llm-adapter/compare/v0.10.0...v0.10.1) - 2026-11-11
 
 ### Fixed
