@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Scheduled provider-price drift check; never invoked by tests or push CI."""
+
+from decimal import Decimal, ROUND_DOWN
+from html.parser import HTMLParser
+from pathlib import Path
+import re
+import sys
+from urllib.request import Request, urlopen
+
+
+class Page(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text = []
+        self.rows = []
+        self.row = None
+        self.cell = None
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.hidden += 1
+        elif tag == "tr":
+            self.row = []
+        elif tag in ("td", "th") and self.row is not None:
+            self.cell = []
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.hidden -= 1
+        elif tag in ("td", "th") and self.cell is not None:
+            self.row.append(" ".join("".join(self.cell).split()))
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self.rows.append(self.row)
+            self.row = None
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.text.append(data)
+            if self.cell is not None:
+                self.cell.append(data)
+
+
+def fetch(url):
+    page = Page()
+    request = Request(url, headers={"User-Agent": "acp-llm-adapter-pricing-check"})
+    with urlopen(request, timeout=30) as response:
+        page.feed(response.read().decode("utf-8"))
+    return page
+
+
+def rates(source, model):
+    arm = re.search(
+        rf'"{re.escape(model)}"(?:\s*\|\s*"[^"]+")*\s*=>\s*\(\s*Pricing\s*\{{([^}}]+)\}}',
+        source,
+        re.DOTALL,
+    )
+    if not arm:
+        raise ValueError(f"cannot find pricing arm for {model}")
+    fields = dict(re.findall(r"(cache_hit|cache_miss|output):\s*([\d_]+)", arm.group(1)))
+    if fields.keys() != {"cache_hit", "cache_miss", "output"}:
+        raise ValueError(f"cannot read all rates for {model}")
+    return {key: Decimal(value.replace("_", "")) / 1_000_000 for key, value in fields.items()}
+
+
+def money(value):
+    if not value.startswith("$"):
+        raise ValueError(f"expected a dollar amount, got {value!r}")
+    return Decimal(value.removeprefix("$"))
+
+
+def check_deepseek(source):
+    # Fetched 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
+    page = fetch("https://api-docs.deepseek.com/quick_start/pricing/")
+    flash = rates(source, "deepseek-flash")
+    pro = rates(source, "deepseek-v4-pro")
+    models = next((row for row in page.rows if row and row[0] == "MODEL"), [])
+    if len(models) != 3 or not re.fullmatch(r"deepseek-flash(?:\(\d+\))?", models[1]) or models[2] != "deepseek-v4-pro":
+        raise ValueError(f"DeepSeek model columns changed: {models!r}")
+    labels = [row[-4] for row in page.rows if len(row) >= 4 and row[-3] == "OFF-PEAK"]
+    if labels != ["1M INPUT TOKENS(CACHE HIT)", "1M INPUT TOKENS(CACHE MISS)", "1M OUTPUT TOKENS"]:
+        raise ValueError(f"DeepSeek token categories changed: {labels!r}")
+    observed = [row[-3:] for row in page.rows if len(row) >= 3 and row[-3] in ("OFF-PEAK", "PEAK")]
+    expected = []
+    for field in ("cache_hit", "cache_miss", "output"):
+        expected.extend([
+            ("OFF-PEAK", flash[field], pro[field]),
+            ("PEAK", 2 * flash[field], 2 * pro[field]),
+        ])
+    parsed = [(period, money(left), money(right)) for period, left, right in observed]
+    if parsed != expected:
+        raise ValueError(f"DeepSeek pricing table changed: {parsed!r}")
+    text = " ".join(" ".join(page.text).split())
+    for name in ("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
+        if name not in text:
+            raise ValueError(f"DeepSeek model or alias disappeared: {name}")
+    if not re.search(r"Peak hours are 01:00\s*-\s*04:00 and 06:00\s*-\s*10:00 UTC, Monday through Friday, excluding Chinese public holidays", text):
+        raise ValueError("DeepSeek peak hours or holiday policy changed")
+
+
+def check_groq(source, model):
+    # Fetched 2026-11-24: https://console.groq.com/docs/model/openai/gpt-oss-120b
+    # and https://console.groq.com/docs/model/openai/gpt-oss-20b
+    page = fetch(f"https://console.groq.com/docs/model/{model}")
+    text = " ".join(" ".join(page.text).split())
+    section = re.search(r"PRICING\s+Input\s+(\$[\d.]+).*?Cached Input\s+(\$[\d.]+).*?Output\s+(\$[\d.]+).*?LIMITS", text)
+    if model not in text or not section:
+        raise ValueError(f"cannot find Groq model pricing: {model}")
+    published = [money(value) for value in section.groups()]
+    price = rates(source, model)
+    # Groq truncates the 20b cache rate in its table; its 50% discount is
+    # documented at https://console.groq.com/docs/prompt-caching (2026-11-24).
+    displayed_cache = price["cache_hit"].quantize(published[1], rounding=ROUND_DOWN)
+    if published != [price["cache_miss"], displayed_cache, price["output"]] or price["cache_hit"] * 2 != price["cache_miss"]:
+        raise ValueError(f"Groq pricing changed for {model}: {published!r}")
+
+
+def main():
+    source = (Path(__file__).resolve().parent.parent / "src/llm/pricing.rs").read_text()
+    check_deepseek(source)
+    check_groq(source, "openai/gpt-oss-120b")
+    check_groq(source, "openai/gpt-oss-20b")
+    # Fetched 2026-11-24: https://console.groq.com/docs/prompt-caching
+    cache_page = fetch("https://console.groq.com/docs/prompt-caching")
+    if "50% discount for cached input tokens" not in " ".join(" ".join(cache_page.text).split()):
+        raise ValueError("Groq prompt-cache discount changed")
+    print("Provider prices match the built-in rates.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        sys.exit(f"Pricing drift check failed: {error}")

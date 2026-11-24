@@ -1,0 +1,16 @@
+name: Pricing drift
+
+on:
+  schedule:
+    - cron: "37 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  pricing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check provider pricing pages
+        run: python3 scripts/check-pricing

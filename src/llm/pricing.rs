@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde_json::Value;
 
 use super::{ChatError, UsageData};
@@ -16,10 +19,26 @@ struct Pricing {
     output: u64,
 }
 
+#[derive(Debug, Default)]
+struct PricingOverride {
+    cache_hit: Option<u64>,
+    cache_miss: Option<u64>,
+    output: Option<u64>,
+}
+
+/// Validate `LLM_PRICING` after tracing is initialized, warning on invalid input.
+///
+/// Invalid overrides are ignored; diagnostics never include their contents.
+pub fn validate_pricing_overrides() {
+    if let Err(reason) = pricing_overrides() {
+        tracing::warn!(reason, "invalid LLM_PRICING; ignoring pricing overrides");
+    }
+}
+
 /// Return the cost for one provider usage report in microdollars.
 ///
-/// Returns `None` for a model with no known published rates, which leaves the
-/// `usage_update` without a cost rather than reporting an invented one.
+/// Returns `None` for a model with no known or overridden rates, which leaves
+/// the `usage_update` without a cost rather than reporting an invented one.
 ///
 /// # Errors
 ///
@@ -46,80 +65,247 @@ fn cost_micros(pricing: Pricing, usage: &UsageData) -> Result<u64, ChatError> {
 }
 
 fn pricing_for(model: &str) -> Option<Pricing> {
-    let defaults = match model {
-        "deepseek-v4-flash" => Pricing {
-            cache_hit: 2_800,
-            cache_miss: 140_000,
-            output: 280_000,
-        },
-        "deepseek-v4-pro" => Pricing {
-            cache_hit: 3_625,
-            cache_miss: 435_000,
-            output: 870_000,
-        },
-        // Groq does have a prompt-cache tier, at half the uncached input rate.
-        // <https://console.groq.com/docs/model/openai/gpt-oss-120b>
-        // <https://console.groq.com/docs/model/openai/gpt-oss-20b>
-        // The 20b page rounds its cached rate to $0.037; the exact value is
-        // half of $0.075, matching the ratio the 120b page states in full.
-        "openai/gpt-oss-120b" => Pricing {
-            cache_hit: 75_000,
-            cache_miss: 150_000,
-            output: 600_000,
-        },
-        "openai/gpt-oss-20b" => Pricing {
-            cache_hit: 37_500,
-            cache_miss: 75_000,
-            output: 300_000,
-        },
-        _ => return None,
+    let defaults = builtin_pricing_at(model, SystemTime::now());
+    // Invalid environment values were reported once during startup.
+    let Ok(overrides) = pricing_overrides() else {
+        return defaults;
     };
-    let Ok(raw) = std::env::var(ENV_PRICING) else {
-        return Some(defaults);
-    };
-    let Ok(overrides) = serde_json::from_str::<Value>(&raw) else {
-        return Some(defaults);
-    };
-    let Some(values) = overrides.get(model).and_then(Value::as_object) else {
-        return Some(defaults);
+    let Some(values) = overrides.get(model) else {
+        return defaults;
     };
     Some(Pricing {
-        cache_hit: price_override(values, "cache_hit", defaults.cache_hit),
-        cache_miss: price_override(values, "cache_miss", defaults.cache_miss),
-        output: price_override(values, "output", defaults.output),
+        cache_hit: values.cache_hit.or(defaults.map(|price| price.cache_hit))?,
+        cache_miss: values
+            .cache_miss
+            .or(defaults.map(|price| price.cache_miss))?,
+        output: values.output.or(defaults.map(|price| price.output))?,
     })
 }
 
-fn price_override(values: &serde_json::Map<String, Value>, key: &str, default: u64) -> u64 {
-    values
-        .get(key)
-        .and_then(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| Some(value.to_string()))
+fn builtin_pricing_at(model: &str, at: SystemTime) -> Option<Pricing> {
+    let (price, deepseek) = match model {
+        // USD/M tokens, off-peak; fetched 2026-11-24:
+        // https://api-docs.deepseek.com/quick_start/pricing/
+        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp" => (
+            Pricing {
+                cache_hit: 3_000,
+                cache_miss: 150_000,
+                output: 600_000,
+            },
+            true,
+        ),
+        // USD/M tokens, off-peak; fetched 2026-11-24:
+        // https://api-docs.deepseek.com/quick_start/pricing/
+        "deepseek-v4-pro" => (
+            Pricing {
+                cache_hit: 22_000,
+                cache_miss: 660_000,
+                output: 1_980_000,
+            },
+            true,
+        ),
+        // USD/M tokens; fetched 2026-11-24:
+        // https://console.groq.com/docs/model/openai/gpt-oss-120b
+        "openai/gpt-oss-120b" => (
+            Pricing {
+                cache_hit: 75_000,
+                cache_miss: 150_000,
+                output: 600_000,
+            },
+            false,
+        ),
+        // USD/M tokens; fetched 2026-11-24:
+        // https://console.groq.com/docs/model/openai/gpt-oss-20b
+        // The displayed $0.037 is rounded; Groq documents a 50% cache discount:
+        // https://console.groq.com/docs/prompt-caching (fetched 2026-11-24).
+        "openai/gpt-oss-20b" => (
+            Pricing {
+                cache_hit: 37_500,
+                cache_miss: 75_000,
+                output: 300_000,
+            },
+            false,
+        ),
+        _ => return None,
+    };
+    // Peak rates are twice off-peak: fetched 2026-11-24,
+    // https://api-docs.deepseek.com/quick_start/pricing/
+    if deepseek && is_deepseek_peak(at) {
+        Some(Pricing {
+            cache_hit: price.cache_hit * 2,
+            cache_miss: price.cache_miss * 2,
+            output: price.output * 2,
         })
-        .and_then(|value| parse_price_micros(&value))
-        .unwrap_or(default)
+    } else {
+        Some(price)
+    }
+}
+
+fn is_deepseek_peak(at: SystemTime) -> bool {
+    let seconds = match at.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i128::from(duration.as_secs()),
+        Err(error) => {
+            let duration = error.duration();
+            -i128::from(duration.as_secs()) - i128::from(duration.subsec_nanos() > 0)
+        }
+    };
+    // Unix day zero was Thursday; Monday is weekday zero here. Windows fetched
+    // 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
+    let weekday = (seconds.div_euclid(86_400) + 3).rem_euclid(7);
+    let second_of_day = seconds.rem_euclid(86_400);
+    weekday < 5
+        && ((3_600..14_400).contains(&second_of_day) || (21_600..36_000).contains(&second_of_day))
+}
+
+fn pricing_overrides() -> Result<HashMap<String, PricingOverride>, &'static str> {
+    let raw = match std::env::var(ENV_PRICING) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(HashMap::new()),
+        Err(std::env::VarError::NotUnicode(_)) => return Err("value is not UTF-8"),
+    };
+    parse_pricing_overrides(&raw)
+}
+
+fn parse_pricing_overrides(raw: &str) -> Result<HashMap<String, PricingOverride>, &'static str> {
+    let models: HashMap<String, serde_json::Map<String, Value>> =
+        serde_json::from_str(raw).map_err(|_| "expected a JSON object of model rates")?;
+    let mut result = HashMap::new();
+    for (model, fields) in models {
+        let mut values = PricingOverride::default();
+        for (field, value) in fields {
+            let price = match value {
+                Value::String(price) => price,
+                Value::Number(price) => price.to_string(),
+                _ => return Err("rate must be a non-negative decimal"),
+            };
+            let price = parse_price_micros(&price).ok_or("invalid or unrepresentable rate")?;
+            match field.as_str() {
+                "cache_hit" => values.cache_hit = Some(price),
+                "cache_miss" => values.cache_miss = Some(price),
+                "output" => values.output = Some(price),
+                _ => return Err("unknown rate field"),
+            }
+        }
+        if builtin_pricing_at(&model, UNIX_EPOCH).is_none()
+            && (values.cache_hit.is_none()
+                || values.cache_miss.is_none()
+                || values.output.is_none())
+        {
+            return Err("unknown model requires all three rates");
+        }
+        result.insert(model, values);
+    }
+    Ok(result)
 }
 
 fn parse_price_micros(value: &str) -> Option<u64> {
-    let (whole, fraction) = value.split_once('.').map_or((value, ""), |parts| parts);
-    if whole.is_empty() || !whole.chars().all(|character| character.is_ascii_digit()) {
+    let (mantissa, exponent) = match value.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (value, 0),
+    };
+    let (whole, fraction) = mantissa
+        .split_once('.')
+        .map_or((mantissa, ""), |parts| parts);
+    if whole.is_empty()
+        || !whole.chars().all(|character| character.is_ascii_digit())
+        || !fraction.chars().all(|character| character.is_ascii_digit())
+    {
         return None;
     }
-    let whole = whole.parse::<u64>().ok()?.checked_mul(1_000_000)?;
-    let fraction = fraction.chars().take(6).collect::<String>();
-    if !fraction.chars().all(|character| character.is_ascii_digit()) {
-        return None;
+    let digits = format!("{whole}{fraction}").parse::<u128>().ok()?;
+    if digits == 0 {
+        return Some(0);
     }
-    let fraction = format!("{fraction:0<6}").parse::<u64>().ok()?;
-    whole.checked_add(fraction)
+    let scale = 6 + i64::from(exponent) - i64::try_from(fraction.len()).ok()?;
+    let factor = 10_u128.checked_pow(u32::try_from(scale.unsigned_abs()).ok()?)?;
+    let micros = if scale >= 0 {
+        digits.checked_mul(factor)?
+    } else if digits % factor == 0 {
+        digits / factor
+    } else {
+        return None;
+    };
+    u64::try_from(micros).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn override_rates_accept_exact_json_exponents_without_rounding() {
+        let parsed = parse_pricing_overrides(
+            r#"{"fixture":{"cache_hit":0.000001,"cache_miss":1e-6,"output":2}}"#,
+        );
+        let prices = parsed
+            .as_ref()
+            .ok()
+            .and_then(|models| models.get("fixture"));
+        assert_eq!(prices.and_then(|value| value.cache_hit), Some(1));
+        assert_eq!(prices.and_then(|value| value.cache_miss), Some(1));
+        assert!(
+            parse_pricing_overrides(
+                r#"{"fixture":{"cache_hit":0.0000001,"cache_miss":1,"output":2}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deepseek_prices_follow_utc_weekday_windows() -> Result<(), ChatError> {
+        let usage = UsageData {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            context_length: 1_000_000,
+            total_tokens: None,
+            thought_tokens: None,
+            cached_read_tokens: Some(400_000),
+            cached_write_tokens: Some(600_000),
+        };
+        // 1970-01-06 was Tuesday. Rates and windows: fetched 2026-11-24,
+        // https://api-docs.deepseek.com/quick_start/pricing/
+        let tuesday = UNIX_EPOCH + Duration::from_hours(120);
+        let peak = builtin_pricing_at("deepseek-v4-pro", tuesday + Duration::from_hours(2))
+            .ok_or_else(|| ChatError::InvalidResponse("missing Pro price".into()))?;
+        let off_peak = builtin_pricing_at("deepseek-v4-pro", tuesday + Duration::from_hours(12))
+            .ok_or_else(|| ChatError::InvalidResponse("missing Pro price".into()))?;
+        assert_eq!(
+            cost_micros(peak, &usage)?,
+            2 * cost_micros(off_peak, &usage)?
+        );
+        for (day, hour, minute, peak) in [
+            (5, 0, 59, false),
+            (5, 1, 0, true),
+            (5, 2, 0, true),
+            (5, 4, 0, false),
+            (5, 5, 59, false),
+            (5, 6, 0, true),
+            (5, 10, 0, false),
+            (5, 12, 0, false),
+            (2, 2, 0, false),
+            (3, 2, 0, false),
+            (4, 2, 0, true),
+        ] {
+            let at = UNIX_EPOCH + Duration::from_secs(day * 86_400 + hour * 3_600 + minute * 60);
+            for (model, off_peak) in [
+                ("deepseek-flash", 691_200),
+                ("deepseek-v4-flash", 691_200),
+                ("deepseek-v4-flash-vision-exp", 691_200),
+                ("deepseek-v4-pro", 2_384_800),
+            ] {
+                let price = builtin_pricing_at(model, at).ok_or_else(|| {
+                    ChatError::InvalidResponse(format!("missing price for {model}"))
+                })?;
+                assert_eq!(
+                    cost_micros(price, &usage)?,
+                    off_peak * if peak { 2 } else { 1 },
+                    "{model} day={day} {hour}:{minute:02}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test_log::test]
     fn wide_cost_intermediates_preserve_representable_results() -> Result<(), ChatError> {
@@ -152,6 +338,26 @@ mod tests {
     }
 
     #[test]
+    fn current_deepseek_flash_has_a_published_price() -> Result<(), ChatError> {
+        let usage = UsageData {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            context_length: 1_000_000,
+            total_tokens: None,
+            thought_tokens: None,
+            cached_read_tokens: None,
+            cached_write_tokens: None,
+        };
+        assert!(
+            builtin_pricing_at("deepseek-flash", UNIX_EPOCH)
+                .map(|price| cost_micros(price, &usage))
+                .transpose()?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn prices_deepseek_flash_cache_and_output_tokens() -> Result<(), ChatError> {
         let usage = UsageData {
             input_tokens: 1_000_000,
@@ -162,10 +368,10 @@ mod tests {
             cached_read_tokens: Some(400_000),
             cached_write_tokens: Some(600_000),
         };
-        assert_eq!(
-            model_cost_micros("deepseek-v4-flash", &usage)?,
-            Some(365_120)
-        );
+        // Off-peak, fetched 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
+        let price = builtin_pricing_at("deepseek-v4-flash", UNIX_EPOCH)
+            .ok_or_else(|| ChatError::InvalidResponse("missing Flash price".into()))?;
+        assert_eq!(cost_micros(price, &usage)?, 691_200);
         Ok(())
     }
 

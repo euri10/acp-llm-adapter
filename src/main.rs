@@ -173,12 +173,18 @@ fn run() -> Result<(), AdapterError> {
 }
 
 fn init_tracing(connection: Option<ConnectionLog>) -> Result<(), AdapterError> {
+    let filter = if std::env::var_os("RUST_LOG").is_none_or(|value| value.is_empty()) {
+        EnvFilter::new("error,acp_llm_adapter::llm::pricing=warn")
+    } else {
+        EnvFilter::from_default_env()
+    };
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
+        .with(filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(SessionLogLayer::new(connection))
         .try_init()
         .map_err(|e| AdapterError::Internal(e.to_string()))?;
+    acp_llm_adapter::llm::validate_pricing_overrides();
     Ok(())
 }
 

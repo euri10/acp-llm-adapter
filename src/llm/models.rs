@@ -37,8 +37,13 @@ impl ModelCatalog {
 ///   model it serves, so these values are transcribed rather than estimated —
 ///   note `qwen3.8-27b` is `131_042`, not a rounded `131_072`.
 const KNOWN_CONTEXT_WINDOWS: &[(&str, u64)] = &[
+    // Fetched 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
+    ("deepseek-flash", 1_000_000),
+    // Fetched 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
     ("deepseek-v4-pro", 1_000_000),
+    // Fetched 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
     ("deepseek-v4-flash", 1_000_000),
+    // Fetched 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
     ("deepseek-v4-flash-vision-exp", 1_000_000),
     ("deepseek-chat", 4_096),
     ("glm-4.6", 131_072),
@@ -67,6 +72,8 @@ mod tests {
 
     #[test]
     fn known_deepseek_v4_models_report_1m_window() {
+        // Fetched 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
+        assert_eq!(context_window_for_model("deepseek-flash"), Some(1_000_000));
         assert_eq!(context_window_for_model("deepseek-v4-pro"), Some(1_000_000));
         assert_eq!(
             context_window_for_model("deepseek-v4-flash"),

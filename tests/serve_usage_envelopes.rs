@@ -40,8 +40,12 @@ async fn spawn_provider_fixture()
             get(|| async {
                 (
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    json!({"data": [{"id": "openai/gpt-oss-120b", "context_window": 4096}]})
-                        .to_string(),
+                    json!({"data": [
+                        {"id": "openai/gpt-oss-120b", "context_window": 4096},
+                        {"id": "deepseek-flash"},
+                        {"id": "fixture-priced", "context_window": 4096}
+                    ]})
+                    .to_string(),
                 )
             }),
         )
@@ -69,6 +73,99 @@ async fn spawn_provider_fixture()
     let mut server = tokio::task::JoinSet::new();
     server.spawn(async move { axum::serve(listener, router).await });
     Ok((base_url, server))
+}
+
+#[test_log::test(tokio::test)]
+async fn deepseek_flash_usage_reports_cost_and_fallback_context() -> Result<(), Box<dyn Error>> {
+    let (base_url, mut server) = spawn_provider_fixture().await?;
+    let state_dir = std::env::temp_dir().join(format!("acp-flash-usage-{}", uuid::Uuid::new_v4()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+    command
+        .args(["serve", "--backend", "deepseek"])
+        .env("LLM_API_KEY", "fixture-key")
+        .env("LLM_BASE_URL", base_url)
+        .env("LLM_MODEL", "deepseek-flash")
+        .env("XDG_STATE_HOME", &state_dir)
+        .env_remove("LLM_PRICING")
+        .env_remove("ACP_LOG");
+    let mut serve = Serve::start_with(command, json!({"cwd": "/tmp", "mcpServers": []})).await?;
+    let prompt =
+        json!({"sessionId": serve.session_id(), "prompt": [{"type": "text", "text": "hello"}]});
+    let response = serve.request("session/prompt", &prompt).await?;
+    assert_eq!(
+        response
+            .pointer("/result/stopReason")
+            .and_then(Value::as_str),
+        Some("end_turn")
+    );
+    let updates = serve.updates("usage_update");
+    let update = updates.last().ok_or("no usage update")?;
+    // Fetched 2026-11-24: https://api-docs.deepseek.com/quick_start/pricing/
+    assert_eq!(update.get("size").and_then(Value::as_u64), Some(1_000_000));
+    assert!(
+        update
+            .pointer("/cost/amount")
+            .and_then(Value::as_f64)
+            .is_some_and(|cost| cost > 0.0)
+    );
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    server.shutdown().await;
+    std::fs::remove_dir_all(state_dir)?;
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn override_can_price_an_unknown_model() -> Result<(), Box<dyn Error>> {
+    let (base_url, mut server) = spawn_provider_fixture().await?;
+    let state_dir =
+        std::env::temp_dir().join(format!("acp-override-usage-{}", uuid::Uuid::new_v4()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"));
+    command
+        .args(["serve", "--backend", "groq"])
+        .env("LLM_API_KEY", "fixture-key")
+        .env("LLM_BASE_URL", base_url)
+        .env("LLM_MODEL", "fixture-priced")
+        .env(
+            "LLM_PRICING",
+            r#"{"fixture-priced":{"cache_hit":2,"cache_miss":2,"output":2}}"#,
+        )
+        .env("XDG_STATE_HOME", &state_dir)
+        .env_remove("ACP_LOG");
+    let mut serve = Serve::start_with(command, json!({"cwd": "/tmp", "mcpServers": []})).await?;
+    let prompt =
+        json!({"sessionId": serve.session_id(), "prompt": [{"type": "text", "text": "hello"}]});
+    serve.request("session/prompt", &prompt).await?;
+    let updates = serve.updates("usage_update");
+    let update = updates.last().ok_or("no usage update")?;
+    assert_eq!(
+        update.pointer("/cost/amount").and_then(Value::as_f64),
+        Some(0.000_014)
+    );
+    serve.disconnect();
+    assert!(serve.wait(Duration::from_secs(5)).await?.success());
+    server.shutdown().await;
+    std::fs::remove_dir_all(state_dir)?;
+    Ok(())
+}
+
+#[test]
+fn invalid_pricing_warns_once_at_startup() -> Result<(), Box<dyn Error>> {
+    for invalid in [
+        "{secret-payload",
+        r#"{"fixture":{"cache_hit":1,"unknown":2}}"#,
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_acp-llm-adapter"))
+            .args(["dev", "--backend", "mock"])
+            .env_remove("RUST_LOG")
+            .env("LLM_PRICING", invalid)
+            .output()?;
+        assert!(output.status.success());
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(stderr.matches("invalid LLM_PRICING").count(), 1, "{stderr}");
+        assert!(!stderr.contains("secret-payload"));
+    }
+    Ok(())
 }
 
 #[test_log::test(tokio::test)]
