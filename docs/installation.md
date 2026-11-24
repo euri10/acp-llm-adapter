@@ -13,7 +13,7 @@ Alpine/musl, ARM, macOS and Windows binaries are not supplied or verified.
 You need `curl`, `sha256sum` and `tar` for installation. Run in a shell:
 
 ```sh
-version=0.10.1
+version=0.10.2
 archive="acp-llm-adapter-v$version-x86_64-unknown-linux-gnu.tar.gz"
 release_url="https://github.com/euri10/acp-llm-adapter/releases/download/v$version"
 download_dir=$(mktemp -d)
