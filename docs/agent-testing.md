@@ -98,6 +98,8 @@ while denying them nowhere is how two findings aged quietly into daa-pb93. A red
 scheduled run is a notification; triage it into Beads and fix it on your own
 schedule. Verify any change to that gate by restoring a known-bad version and
 watching it fail, not by watching a clean tree pass.
+The narrowly scoped exceptions shared by both audits, their reasons, and their
+revisit triggers are in `.cargo/audit.toml`.
 
 A test must never depend on a live provider endpoint. Use the mock `LlmClient`
 or a local fixture server; if a test cannot be written without the network, it

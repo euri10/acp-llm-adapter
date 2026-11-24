@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+  # chrono is unmaintained, with no patched release. rmcp 3.11.0, used for MCP
+  # support, requires it even with default features disabled.
+  # Revisit on an rmcp release, by 2026-12-24, or on a new chrono advisory:
+  # daa-qymu tracks https://github.com/modelcontextprotocol/rust-sdk/issues/1469.
+  "RUSTSEC-2026-0543",
+]

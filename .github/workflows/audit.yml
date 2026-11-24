@@ -47,7 +47,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      # Warnings fail here and only here. Cargo.lock is the input, so this needs
-      # no build — a new advisory against an unchanged tree still trips it.
+      # Non-ignored warnings fail here and only here. Cargo.lock is the input, so
+      # a new advisory against an unchanged tree still trips it without a build.
       - name: cargo audit
         run: cargo audit --deny warnings
