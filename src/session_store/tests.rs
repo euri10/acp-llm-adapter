@@ -27,7 +27,7 @@ fn acknowledged_settings_persist_without_another_prompt() -> Result<(), Box<dyn 
     let persistence = FilesystemSessionStore::new(&root);
     let store = crate::test_store().with_persistence(persistence.clone());
     let id = "idle-settings";
-    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new(), Vec::new())?;
+    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new())?;
     store.set_mode(id, SessionBehavior::Yolo)?;
     let history = vec![ChatMessage::user("save automatic approval")];
     store.save_history(id, &history)?;
@@ -73,7 +73,7 @@ fn failed_settings_save_preserves_memory_and_disk() -> Result<(), Box<dyn std::e
     let persistence = FilesystemSessionStore::new(&root);
     let store = crate::test_store().with_persistence(persistence.clone());
     let id = "failed-settings";
-    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new(), Vec::new())?;
+    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new())?;
     store.save_history(id, &[ChatMessage::user("persist original")])?;
     let original = persistence.load_record(id)?;
     // A directory at the atomic-write staging path reliably rejects a save,
@@ -112,7 +112,7 @@ fn selected_content_settings_remain_ephemeral() -> Result<(), Box<dyn std::error
         timeout_ms: 1000,
     });
     let id = "ephemeral-settings";
-    store.insert_session_with_resources(id.into(), record, Vec::new(), Vec::new())?;
+    store.insert_session_with_resources(id.into(), record, Vec::new())?;
     store.set_mode(id, SessionBehavior::Yolo)?;
     store.set_model(id, "deepseek-v4-pro".into())?;
     store.set_reasoning_effort(id, ReasoningEffort::High)?;
@@ -133,12 +133,8 @@ fn session_publication_preserves_active_turn_and_resources()
     let replacement_record = idle_record("/replacement")?;
     let token = tokio_util::sync::CancellationToken::new();
     store.begin_turn(&session.0, token.clone(), ChatMessage::user("active"), None)?;
-    let result = store.insert_session_with_resources(
-        session.0.to_string(),
-        replacement_record,
-        vec![serde_json::json!({"name": "replacement"})],
-        Vec::new(),
-    );
+    let result =
+        store.insert_session_with_resources(session.0.to_string(), replacement_record, Vec::new());
     assert!(
         matches!(
             result,
@@ -153,7 +149,6 @@ fn session_publication_preserves_active_turn_and_resources()
             .insert_session_with_resources(
                 session.0.to_string(),
                 idle_record("/replacement")?,
-                Vec::new(),
                 Vec::new(),
             )
             .is_err(),
@@ -171,7 +166,7 @@ fn session_publication_preserves_active_turn_and_resources()
             .map_err(|error| error.to_string())?
             .resources
             .get(session.0.as_ref())
-            .is_some_and(|resources| resources.servers.is_empty())
+            .is_some_and(|resources| resources.sessions.is_empty())
     );
     assert!(
         store
@@ -189,7 +184,6 @@ fn session_publication_preserves_active_turn_and_resources()
         session.0.to_string(),
         idle_record("/replacement")?,
         Vec::new(),
-        Vec::new(),
     )?;
     store.with_session(&session.0, |record| {
         assert_eq!(record.cwd, std::path::Path::new("/replacement"));
@@ -203,7 +197,7 @@ async fn session_publication_rechecks_turn_admitted_during_async_setup()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = crate::test_store();
     let id = "restore-race";
-    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new(), Vec::new())?;
+    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new())?;
     let (setup_done, setup_wait) = tokio::sync::oneshot::channel();
     let (publish, publish_wait) = tokio::sync::oneshot::channel();
     let replacement = idle_record("/replacement")?;
@@ -212,12 +206,7 @@ async fn session_publication_rechecks_turn_admitted_during_async_setup()
         tokio::spawn(async move {
             let _ = setup_done.send(());
             publish_wait.await.map_err(|error| error.to_string())?;
-            Ok::<_, String>(store.insert_session_with_resources(
-                id.into(),
-                replacement,
-                Vec::new(),
-                Vec::new(),
-            ))
+            Ok::<_, String>(store.insert_session_with_resources(id.into(), replacement, Vec::new()))
         })
     };
     setup_wait.await?;
@@ -243,7 +232,7 @@ async fn session_publication_rechecks_turn_admitted_during_async_setup()
 fn closing_an_active_session_cancels_its_owned_turn() -> Result<(), Box<dyn std::error::Error>> {
     let store = crate::test_store();
     let id = "close-active";
-    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new(), Vec::new())?;
+    store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new())?;
     let token = tokio_util::sync::CancellationToken::new();
     store.begin_turn(id, token.clone(), ChatMessage::user("active"), None)?;
     assert!(store.remove_session(id)?);
@@ -258,12 +247,7 @@ fn removed_active_session_cannot_be_republished_before_cleanup()
         let root = std::env::temp_dir().join(format!("acp-retired-turn-{}", Uuid::new_v4()));
         let store = crate::test_store().with_persistence(FilesystemSessionStore::new(&root));
         let id = "removed-active";
-        store.insert_session_with_resources(
-            id.into(),
-            idle_record("/tmp")?,
-            Vec::new(),
-            Vec::new(),
-        )?;
+        store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new())?;
         let original_history = vec![ChatMessage::user("before removal")];
         store.save_history(id, &original_history)?;
         let token = tokio_util::sync::CancellationToken::new();
@@ -275,12 +259,7 @@ fn removed_active_session_cannot_be_republished_before_cleanup()
         }
         assert!(
             store
-                .insert_session_with_resources(
-                    id.into(),
-                    idle_record("/tmp")?,
-                    Vec::new(),
-                    Vec::new()
-                )
+                .insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new())
                 .is_err(),
             "removed active owner was replaced before its cleanup (delete={delete})"
         );
@@ -302,12 +281,7 @@ fn removed_active_session_cannot_be_republished_before_cleanup()
                 .contains_key(id)
         );
         store.clear_active_turn(id, &token)?;
-        store.insert_session_with_resources(
-            id.into(),
-            idle_record("/tmp")?,
-            Vec::new(),
-            Vec::new(),
-        )?;
+        store.insert_session_with_resources(id.into(), idle_record("/tmp")?, Vec::new())?;
         let next = tokio_util::sync::CancellationToken::new();
         store.begin_turn(id, next.clone(), ChatMessage::user("next"), None)?;
         store.clear_active_turn(id, &token)?;
@@ -332,7 +306,6 @@ fn round_trips_session_metadata_and_history()
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::Max,
         max_tokens: Some(8_192),
-        mcp_servers: Vec::new(),
         title: None,
         updated_at: None,
         cost_micros: 0,
@@ -369,7 +342,6 @@ fn delete_session_removes_persisted_record()
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::High,
         max_tokens: None,
-        mcp_servers: Vec::new(),
         title: Some("delete me".to_string()),
         updated_at: Some("2026-06-14T00:00:00Z".to_string()),
         cost_micros: 0,
@@ -425,7 +397,6 @@ fn proxy_logs_never_surface_as_resumable_sessions()
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::Max,
         max_tokens: None,
-        mcp_servers: Vec::new(),
         title: None,
         updated_at: None,
         cost_micros: 0,

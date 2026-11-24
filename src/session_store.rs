@@ -22,10 +22,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ReasoningEffort, SessionBehavior};
 
-/// Live I/O handles and reconnect settings owned by the session-store boundary.
+/// Live I/O handles owned by the session-store boundary.
 #[derive(Debug, Default)]
 struct SessionResources {
-    servers: Vec<serde_json::Value>,
     sessions: Vec<McpSession>,
 }
 
@@ -408,13 +407,7 @@ impl SessionStore {
         let session = state.sessions.get_mut(session_id).ok_or_else(|| {
             AdapterError::InvalidParams(format!("unknown session id: {session_id}"))
         })?;
-        let mut meta = session.persisted_meta(
-            session_id,
-            state
-                .resources
-                .get(session_id)
-                .map_or(&[], |resources| resources.servers.as_slice()),
-        );
+        let mut meta = session.persisted_meta(session_id);
         update(&mut meta)?;
         if session.selected_content.is_none()
             && let Some(persistence) = &self.persistence
@@ -565,8 +558,6 @@ pub(crate) struct PersistedSessionMeta {
     /// Max output token cap selected for the session (absent in sessions
     /// created before this field was added, treated as unset).
     pub(crate) max_tokens: Option<u32>,
-    /// MCP servers originally attached to the session.
-    pub(crate) mcp_servers: Vec<serde_json::Value>,
     /// Human-readable session title (absent in sessions created before this field was added).
     pub(crate) title: Option<String>,
     /// ISO 8601 timestamp of last activity (absent in sessions created before this field was added).
@@ -605,7 +596,7 @@ impl FilesystemSessionStore {
         messages: &[ChatMessage],
     ) -> Result<(), SessionPersistenceError> {
         let session_dir = self.session_dir(&meta.session_id)?;
-        fs::create_dir_all(&session_dir)?;
+        acp_llm_adapter::paths::create_private_dirs(&self.state_dir, &session_dir)?;
         Self::write_meta(&session_dir, meta)?;
         Self::append_history(&session_dir, messages)?;
         Ok(())
@@ -617,9 +608,13 @@ impl FilesystemSessionStore {
         meta: &PersistedSessionMeta,
     ) -> Result<(), SessionPersistenceError> {
         let session_dir = self.session_dir(&meta.session_id)?;
-        fs::create_dir_all(&session_dir)?;
+        acp_llm_adapter::paths::create_private_dirs(&self.state_dir, &session_dir)?;
         let temporary_history = session_dir.join("history.jsonl.tmp");
-        File::create(&temporary_history)?.sync_all()?;
+        acp_llm_adapter::paths::open_private_file(
+            OpenOptions::new().write(true).create(true).truncate(true),
+            &temporary_history,
+        )?
+        .sync_all()?;
         // Settings may have changed since the last prompt. A failed metadata
         // write must not destroy the existing conversation.
         Self::write_meta(&session_dir, meta)?;
@@ -628,13 +623,52 @@ impl FilesystemSessionStore {
     }
 
     /// Load one persisted session record by id.
+    #[cfg(test)]
     pub(crate) fn load_record(
         &self,
         session_id: &str,
     ) -> Result<PersistedSessionRecord, SessionPersistenceError> {
         let session_dir = self.session_dir(session_id)?;
-        let meta = Self::read_meta(&session_dir)?;
-        let history = Self::read_history(&session_dir)?;
+        let (meta, had_servers) = Self::read_meta(&session_dir)?;
+        self.load_record_contents(&session_dir, meta, had_servers)
+    }
+
+    fn load_record_for_restore(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+    ) -> Result<PersistedSessionRecord, AdapterError> {
+        let session_dir = self.session_dir(session_id)?;
+        let (meta, had_servers) = Self::read_meta(&session_dir)?;
+        if meta.cwd != cwd {
+            return Err(AdapterError::InvalidParams(
+                "session was persisted for cwd different from the requested cwd".to_string(),
+            ));
+        }
+        if meta.session_id != session_id {
+            return Err(AdapterError::InvalidParams(
+                "persisted session id does not match requested session id".to_string(),
+            ));
+        }
+        Ok(self.load_record_contents(&session_dir, meta, had_servers)?)
+    }
+
+    fn load_record_contents(
+        &self,
+        session_dir: &Path,
+        meta: PersistedSessionMeta,
+        had_servers: bool,
+    ) -> Result<PersistedSessionRecord, SessionPersistenceError> {
+        acp_llm_adapter::paths::create_private_dirs(&self.state_dir, session_dir)?;
+        if had_servers {
+            Self::write_meta(session_dir, &meta)?;
+        } else {
+            acp_llm_adapter::paths::open_private_file(
+                OpenOptions::new().read(true),
+                &session_dir.join(META_FILE),
+            )?;
+        }
+        let history = Self::read_history(session_dir)?;
         Ok(PersistedSessionRecord { meta, history })
     }
 
@@ -667,7 +701,7 @@ impl FilesystemSessionStore {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            if let Ok(meta) = Self::read_meta(&entry.path()) {
+            if let Ok((meta, _)) = Self::read_meta(&entry.path()) {
                 if cwd_filter.is_some_and(|cwd| meta.cwd != cwd) {
                     continue;
                 }
@@ -716,7 +750,10 @@ impl FilesystemSessionStore {
         meta: &PersistedSessionMeta,
     ) -> Result<(), SessionPersistenceError> {
         let tmp_path = session_dir.join("meta.json.tmp");
-        let mut file = File::create(&tmp_path)?;
+        let mut file = acp_llm_adapter::paths::open_private_file(
+            OpenOptions::new().write(true).create(true).truncate(true),
+            &tmp_path,
+        )?;
         serde_json::to_writer_pretty(&mut file, meta)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -732,10 +769,10 @@ impl FilesystemSessionStore {
             return Ok(());
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(session_dir.join(HISTORY_FILE))?;
+        let mut file = acp_llm_adapter::paths::open_private_file(
+            OpenOptions::new().create(true).append(true),
+            &session_dir.join(HISTORY_FILE),
+        )?;
         for message in messages {
             serde_json::to_writer(&mut file, message)?;
             file.write_all(b"\n")?;
@@ -744,9 +781,13 @@ impl FilesystemSessionStore {
         Ok(())
     }
 
-    fn read_meta(session_dir: &Path) -> Result<PersistedSessionMeta, SessionPersistenceError> {
+    fn read_meta(
+        session_dir: &Path,
+    ) -> Result<(PersistedSessionMeta, bool), SessionPersistenceError> {
         let file = File::open(session_dir.join(META_FILE))?;
-        Ok(serde_json::from_reader(file)?)
+        let value: serde_json::Value = serde_json::from_reader(file)?;
+        let had_servers = value.get("mcp_servers").is_some();
+        Ok((serde_json::from_value(value)?, had_servers))
     }
 
     fn read_history(session_dir: &Path) -> Result<Vec<ChatMessage>, SessionPersistenceError> {
@@ -755,7 +796,7 @@ impl FilesystemSessionStore {
             return Ok(Vec::new());
         }
 
-        let file = File::open(path)?;
+        let file = acp_llm_adapter::paths::open_private_file(OpenOptions::new().read(true), &path)?;
         let reader = BufReader::new(file);
         let mut messages = Vec::new();
         for line in reader.lines() {
@@ -794,11 +835,7 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionPersistenceError> 
 }
 
 impl SessionRecord {
-    fn persisted_meta(
-        &self,
-        session_id: &str,
-        servers: &[serde_json::Value],
-    ) -> PersistedSessionMeta {
+    fn persisted_meta(&self, session_id: &str) -> PersistedSessionMeta {
         PersistedSessionMeta {
             session_id: session_id.to_string(),
             cwd: self.cwd.clone(),
@@ -807,7 +844,6 @@ impl SessionRecord {
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort,
             max_tokens: self.max_tokens,
-            mcp_servers: servers.to_vec(),
             title: Some(self.title.clone()),
             updated_at: Some(self.updated_at.clone()),
             cost_micros: self.cost_micros,
@@ -817,6 +853,7 @@ impl SessionRecord {
 
 impl SessionStore {
     /// Load a persisted session record from the filesystem store.
+    #[cfg(test)]
     pub(crate) fn load_persisted_record(
         &self,
         session_id: &str,
@@ -827,9 +864,32 @@ impl SessionStore {
             ));
         };
 
+        // Metadata scrubbing is a write and must share the history/settings lock.
+        let _guard = self
+            .state
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?;
         persistence
             .load_record(session_id)
             .map_err(AdapterError::from)
+    }
+
+    /// Validate the requested identity before restricting or scrubbing disk state.
+    pub(crate) fn load_persisted_record_for_restore(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+    ) -> Result<PersistedSessionRecord, AdapterError> {
+        let Some(persistence) = &self.persistence else {
+            return Err(AdapterError::InvalidRequest(
+                "session/load requires filesystem persistence".to_string(),
+            ));
+        };
+        let _guard = self
+            .state
+            .lock()
+            .map_err(|error| AdapterError::Internal(error.to_string()))?;
+        persistence.load_record_for_restore(session_id, cwd)
     }
 
     /// Return the absolute path to the session's `history.jsonl` file, if
@@ -975,7 +1035,6 @@ impl SessionStore {
         &self,
         session_id: String,
         record: SessionRecord,
-        servers: Vec<serde_json::Value>,
         sessions: Vec<McpSession>,
     ) -> Result<(), AdapterError> {
         let mut state = self
@@ -994,7 +1053,7 @@ impl SessionStore {
         }
         state
             .resources
-            .insert(session_id.clone(), SessionResources { servers, sessions });
+            .insert(session_id.clone(), SessionResources { sessions });
         state.sessions.insert(session_id, record);
         Ok(())
     }
@@ -1100,14 +1159,7 @@ impl SessionStore {
             .skip(session.history.len())
             .cloned()
             .collect::<Vec<_>>();
-        let meta = session.persisted_meta(
-            session_id,
-            state
-                .resources
-                .get(session_id)
-                .map(|resources| resources.servers.as_slice())
-                .unwrap_or_default(),
-        );
+        let meta = session.persisted_meta(session_id);
         // This synchronous method runs on the blocking pool in production.
         // Hold admission/removal ownership through disk and memory publication.
         if let Some(persistence) = &self.persistence {
@@ -1133,10 +1185,6 @@ impl SessionStore {
                 .state
                 .lock()
                 .map_err(|e| AdapterError::Internal(e.to_string()))?;
-            let servers = state
-                .resources
-                .get(&session_id)
-                .map_or_else(Vec::new, |resources| resources.servers.clone());
             let session = state.sessions.get_mut(&session_id).ok_or_else(|| {
                 AdapterError::InvalidParams(format!("unknown session id: {session_id}"))
             })?;
@@ -1151,7 +1199,7 @@ impl SessionStore {
                 ));
             }
             if let Some(persistence) = &store.persistence {
-                persistence.clear_history(&session.persisted_meta(&session_id, &servers))?;
+                persistence.clear_history(&session.persisted_meta(&session_id))?;
             }
             session.history.clear();
             Ok(())

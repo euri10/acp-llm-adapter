@@ -40,6 +40,13 @@ Load and resume retain those settings without requiring another prompt first.
 A failed save reports a storage error and leaves the previous settings intact.
 Selected-content helpers remain ephemeral and retain their immutable limits.
 
+Both ACP v1 load/resume and v2 resume take MCP servers and additional directory
+roots from the current request. Omitted servers and roots are not restored from
+the previous session. MCP connection settings, including credentials, are not
+saved in session metadata; legacy settings are removed when a session is loaded.
+On Unix, new state directories and session, history, and log files are private
+to the owner; loaded session directories, metadata, and history are also restricted.
+
 ## Replaying tools
 
 Tool execution outcomes are stored alongside their results, but are not sent

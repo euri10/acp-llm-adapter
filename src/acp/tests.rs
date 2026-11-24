@@ -1825,7 +1825,6 @@ fn list_sessions_filters_persisted_sessions_by_requested_cwd()
                     model: "deepseek-v4-pro".to_string(),
                     reasoning_effort: ReasoningEffort::High,
                     max_tokens: None,
-                    mcp_servers: Vec::new(),
                     title: None,
                     updated_at: None,
                     cost_micros: 0,
@@ -1871,7 +1870,6 @@ fn list_sessions_merges_active_and_persisted_sessions_for_requested_cwd()
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
-                mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
                 cost_micros: 0,
@@ -1940,7 +1938,6 @@ async fn load_session_restores_state_and_replays_history()
                 model: "deepseek-v4-flash".to_string(),
                 reasoning_effort: ReasoningEffort::Max,
                 max_tokens: None,
-                mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
                 cost_micros: 0,
@@ -2177,7 +2174,6 @@ async fn resume_session_restores_state_without_replay() -> Result<(), agent_clie
                 model: "deepseek-v4-flash".to_string(),
                 reasoning_effort: ReasoningEffort::Max,
                 max_tokens: None,
-                mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
                 cost_micros: 0,
@@ -2249,7 +2245,6 @@ async fn load_session_rejects_mismatched_cwd() -> Result<(), agent_client_protoc
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
-                mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
                 cost_micros: 0,
@@ -2348,7 +2343,6 @@ fn delete_session_removes_memory_and_persistence() -> Result<(), agent_client_pr
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
-                mcp_servers: Vec::new(),
                 title: Some("temporary title".to_string()),
                 updated_at: Some("2026-06-14T00:00:00Z".to_string()),
                 cost_micros: 0,
@@ -3220,7 +3214,6 @@ async fn restore_persisted_session_rejects_mismatched_id()
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
-                mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
                 cost_micros: 0,
@@ -3240,7 +3233,6 @@ async fn restore_persisted_session_rejects_mismatched_id()
         model: "deepseek-v4-pro".to_string(),
         reasoning_effort: ReasoningEffort::High,
         max_tokens: None,
-        mcp_servers: Vec::new(),
         title: None,
         updated_at: None,
         cost_micros: 0,
@@ -3250,7 +3242,8 @@ async fn restore_persisted_session_rejects_mismatched_id()
     std::fs::write(meta_dir.join("meta.json"), meta_json.as_bytes())
         .map_err(agent_client_protocol::Error::into_internal_error)?;
 
-    let Err(error) = restore_persisted_session(&store, &session_id, &workspace, None, false).await
+    let setup = NewSessionRequest::new(&workspace);
+    let Err(error) = restore_persisted_session(&store, &session_id, &setup, false, false).await
     else {
         return Err(agent_client_protocol::Error::internal_error()
             .data("expected mismatched persisted session id to fail"));
@@ -3373,7 +3366,6 @@ async fn load_session_response_includes_history_jsonl_path_in_meta()
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
-                mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
                 cost_micros: 0,
@@ -3431,7 +3423,6 @@ async fn resume_session_response_includes_history_jsonl_path_in_meta()
                 model: "deepseek-v4-pro".to_string(),
                 reasoning_effort: ReasoningEffort::High,
                 max_tokens: None,
-                mcp_servers: Vec::new(),
                 title: None,
                 updated_at: None,
                 cost_micros: 0,

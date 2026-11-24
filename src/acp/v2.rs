@@ -247,14 +247,12 @@ async fn new_session(
     store: &SessionStore,
     request: &v2::NewSessionRequest,
 ) -> AcpResult<v2::NewSessionResponse> {
-    let mut setup = session_setup(
+    let setup = session_setup(
         &request.cwd,
         &request.additional_directories,
         &request.mcp_servers,
     )?;
     let sessions = crate::connect_mcp_sessions(&setup.mcp_servers).await?;
-    // MCP credentials are connection inputs, not durable session metadata.
-    setup.mcp_servers.clear();
     let created = super::insert_session_record(store, &setup, sessions)?;
     let session_id = created.session_id.to_string();
     Ok(v2::NewSessionResponse::new(session_id.clone())
@@ -308,9 +306,9 @@ async fn resume_session(
     let (session_id, history) = super::restore_persisted_session(
         store,
         &request.session_id.to_string().into(),
-        &setup.cwd,
-        Some(&setup),
+        &setup,
         request.replay_from.is_some(),
+        true,
     )
     .await?;
     if request.replay_from.is_some() {

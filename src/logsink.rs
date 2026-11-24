@@ -558,6 +558,9 @@ impl LogWriter {
 
         if !self.files.contains_key(destination) {
             let path = self.layout.path_for(destination);
+            if let Some(parent) = path.parent() {
+                crate::paths::create_private_dirs(&self.layout.root, parent)?;
+            }
             // Recorded before the first line, so a concurrent sweep never sees
             // this writer's log without its retention intent.
             record_retention(&path, RetentionRecord::of(self.policy))?;
@@ -664,10 +667,11 @@ fn record_retention(log: &Path, own: RetentionRecord) -> Result<(), LogSinkError
         Some(existing) => existing.merge(own),
         None => own,
     };
-    if let Some(parent) = log.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(retention_path(log), serde_json::to_vec(&merged)?)?;
+    let mut file = crate::paths::open_private_file(
+        OpenOptions::new().write(true).create(true).truncate(true),
+        &retention_path(log),
+    )?;
+    file.write_all(&serde_json::to_vec(&merged)?)?;
     Ok(())
 }
 
@@ -830,10 +834,10 @@ fn is_diagnostic_key(key: &str) -> bool {
 }
 
 fn open_append(path: &Path) -> Result<File, LogSinkError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(OpenOptions::new().create(true).append(true).open(path)?)
+    Ok(crate::paths::open_private_file(
+        OpenOptions::new().create(true).append(true),
+        path,
+    )?)
 }
 
 /// A logging handle for one client connection.

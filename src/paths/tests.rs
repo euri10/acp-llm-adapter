@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use super::{APPLICATION_STATE_DIR, PROXY_DIR, default_proxy_log_root, default_state_dir};
+use super::{
+    APPLICATION_STATE_DIR, PROXY_DIR, create_private_dirs, default_proxy_log_root,
+    default_state_dir,
+};
 
 #[test]
 fn proxy_root_sits_under_the_state_directory() {
@@ -42,4 +45,11 @@ fn state_directory_is_namespaced_to_this_application() {
         Some(APPLICATION_STATE_DIR)
     );
     assert!(Path::new(&state).is_absolute() || state.is_relative());
+}
+
+#[test]
+fn private_directory_creation_rejects_parent_traversal() {
+    let root = std::env::temp_dir().join(format!("acp-private-path-{}", uuid::Uuid::new_v4()));
+    assert!(create_private_dirs(&root, &root.join("../outside")).is_err());
+    assert!(!root.exists());
 }

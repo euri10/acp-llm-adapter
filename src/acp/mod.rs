@@ -449,8 +449,11 @@ pub(crate) async fn handle_load_session_request(
     mut notify: impl FnMut(SessionNotification) -> Result<(), agent_client_protocol::Error>,
 ) -> Result<LoadSessionResponse, agent_client_protocol::Error> {
     validate_load_session_paths(request)?;
+    let setup = NewSessionRequest::new(&request.cwd)
+        .additional_directories(request.additional_directories.clone())
+        .mcp_servers(request.mcp_servers.clone());
     let (session_id, history) =
-        restore_persisted_session(store, &request.session_id, &request.cwd, None, true).await?;
+        restore_persisted_session(store, &request.session_id, &setup, true, false).await?;
     replay_session_history(&session_id, &history, &mut notify)?;
 
     let mut response = LoadSessionResponse::new()
@@ -468,8 +471,11 @@ pub(crate) async fn handle_resume_session_request(
     request: &ResumeSessionRequest,
 ) -> Result<ResumeSessionResponse, agent_client_protocol::Error> {
     validate_resume_session_paths(request)?;
+    let setup = NewSessionRequest::new(&request.cwd)
+        .additional_directories(request.additional_directories.clone())
+        .mcp_servers(request.mcp_servers.clone());
     let (session_id, _) =
-        restore_persisted_session(store, &request.session_id, &request.cwd, None, false).await?;
+        restore_persisted_session(store, &request.session_id, &setup, false, false).await?;
 
     let mut response = ResumeSessionResponse::new()
         .modes(session_modes(store.session_behavior(&session_id.0)?))
@@ -483,19 +489,21 @@ pub(crate) async fn handle_resume_session_request(
 async fn restore_persisted_session(
     store: &SessionStore,
     requested_session_id: &SessionId,
-    cwd: &std::path::Path,
-    setup: Option<&NewSessionRequest>,
+    setup: &NewSessionRequest,
     replay: bool,
+    v2: bool,
 ) -> Result<(SessionId, Vec<ChatMessage>), agent_client_protocol::Error> {
+    validate_session_paths(setup)?;
     let mut persisted = {
         let store = store.clone();
         let id = requested_session_id.0.to_string();
-        blocking::unblock(move || store.load_persisted_record(&id))
+        let cwd = setup.cwd.clone();
+        blocking::unblock(move || store.load_persisted_record_for_restore(&id, &cwd))
             .await
             .map_err(|error| match error {
                 AdapterError::SessionPersistence(
                     acp_llm_adapter::error::SessionPersistenceError::Io(error),
-                ) if setup.is_some() && error.kind() == std::io::ErrorKind::NotFound => {
+                ) if v2 && error.kind() == std::io::ErrorKind::NotFound => {
                     agent_client_protocol::Error::from(
                         agent_client_protocol::v1::schema::Error::resource_not_found(None),
                     )
@@ -505,43 +513,22 @@ async fn restore_persisted_session(
                 AdapterError::SessionPersistence(error) => {
                     AdapterError::Internal(error.to_string()).into()
                 }
+                AdapterError::InvalidParams(message) => {
+                    agent_client_protocol::Error::invalid_params().data(message)
+                }
                 error => error.into(),
             })?
     };
-    if persisted.meta.cwd != cwd {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data("session was persisted for cwd different from the requested cwd"));
-    }
 
     let session_id = SessionId::new(persisted.meta.session_id.clone());
-    if session_id != *requested_session_id {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data("persisted session id does not match requested session id"));
-    }
     if replay {
         validate_replay_history(&persisted.history)?;
     }
-    let servers = if let Some(setup) = setup {
-        validate_session_paths(setup)?;
-        // v2 supplies fresh connection settings on every resume. Never
-        // restore removed roots/servers or persist their credential values.
-        persisted
-            .meta
-            .additional_directories
-            .clone_from(&setup.additional_directories);
-        persisted.meta.mcp_servers.clear();
-        setup.mcp_servers.clone()
-    } else {
-        persisted
-            .meta
-            .mcp_servers
-            .iter()
-            .cloned()
-            .map(serde_json::from_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(AdapterError::from)?
-    };
-    let mcp_sessions = connect_mcp_sessions(&servers).await?;
+    persisted
+        .meta
+        .additional_directories
+        .clone_from(&setup.additional_directories);
+    let mcp_sessions = connect_mcp_sessions(&setup.mcp_servers).await?;
     let history = persisted.history;
     let reasoning_effort = persisted
         .meta
@@ -580,7 +567,6 @@ async fn restore_persisted_session(
             updated_at,
             cost_micros: persisted.meta.cost_micros,
         },
-        persisted.meta.mcp_servers,
         mcp_sessions,
     )?;
 
@@ -617,12 +603,6 @@ fn insert_session_record(
             updated_at: now,
             cost_micros: 0,
         },
-        request
-            .mcp_servers
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()
-            .map_err(AdapterError::from)?,
         mcp_sessions,
     )?;
 
