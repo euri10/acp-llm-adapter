@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/euri10/acp-llm-adapter/compare/v0.10.1...v0.10.2) - 2026-11-24
+
+### Fixed
+
+- *(pricing)* refresh DeepSeek rates with peak windows
+- *(plan)* require consent to exit
+- *(session)* keep MCP secrets out of state
+- *(audit)* ignore unmaintained chrono pulled in by rmcp
+- *(deps)* bump url to 2.5.9 for RUSTSEC-2026-0592
+- *(deps)* bump quinn-proto and quinn-udp for audit
+
+### Other
+
+- fix release and client drift
+- *(beads)* reality check 2026-11-24 bridge and decisions
+- *(beads)* close daa-ckzh after live audit run
+- Merge pull request #108 from euri10/dependabot/cargo/clap-4.6.9
+- *(deps)* bump agent-client-protocol from 5.1.0 to 5.4.0
+- *(deps)* bump clap from 4.6.7 to 4.6.9
+- Merge pull request #105 from euri10/dependabot/cargo/uuid-1.29.3
+- *(deps)* bump uuid from 1.29.2 to 1.29.3
+- *(deps)* bump rmcp from 3.9.0 to 3.11.0
+- Merge pull request #98 from euri10/dependabot/cargo/uuid-1.29.2
+- Merge pull request #99 from euri10/dependabot/cargo/agent-client-protocol-5.1.0
+- *(deps)* bump agent-client-protocol from 5.0.0 to 5.1.0
+- *(deps)* bump uuid from 1.29.1 to 1.29.2
+
 ## [0.10.1](https://github.com/euri10/acp-llm-adapter/compare/v0.10.0...v0.10.1) - 2026-11-11
 
 ### Fixed
