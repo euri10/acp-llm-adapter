@@ -34,6 +34,12 @@ The current mode governs each subsequent provider request and tool dispatch.
 Switching to Plan also prevents pending approvals and file preflight reads from
 authorizing a later mutation; an operation already started is not undone.
 
+In Plan mode the model can update the visible plan with `update_plan`. To leave
+Plan, it can call `exit_plan_mode`, which requests your approval to switch to
+`accept-edits`. Rejecting keeps the session in Plan mode. No later tool call in
+the same provider response runs, even if the exit is approved. Mode updates are
+reported to the editor if the turn is cancelled after the change.
+
 Ordinary session mode, model, reasoning effort and output-token settings are
 persisted before an update succeeds, including changes made between prompts.
 Load and resume retain those settings without requiring another prompt first.

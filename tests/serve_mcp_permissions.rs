@@ -347,7 +347,7 @@ async fn remembered_allow_skips_approval_but_cannot_override_plan() -> Result<()
             .request()
             .await?
             .to_string()
-            .contains("plan mode refuses")
+            .contains("tool was not advertised for this request")
     );
     assert_eq!(fixture.events(), ["invoked", "invoked"]);
     stop(&mut serve).await

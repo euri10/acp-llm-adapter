@@ -2400,7 +2400,7 @@ fn update_plan_tool_execution_rejects_invalid_json() {
 }
 
 #[test_log::test(tokio::test)]
-async fn exit_plan_mode_tool_execution_switches_to_accept_edits()
+async fn exit_plan_mode_tool_execution_requires_explicit_approval()
 -> Result<(), agent_client_protocol::Error> {
     let store = test_store();
     let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
@@ -2414,10 +2414,20 @@ async fn exit_plan_mode_tool_execution_switches_to_accept_edits()
     };
     let call = ChatToolCall::new("exit-plan", "exit_plan_mode", "{}");
 
-    let result = exit_plan_mode_tool_execution(&store, &call, &context);
+    let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("allow_once")),
+    )]);
+    let result = exit_plan_mode_tool_execution(
+        &store,
+        &call,
+        &context,
+        Some(&requester),
+        &CancellationToken::new(),
+    )
+    .await;
 
     assert!(result.success);
-    assert_eq!(result.content, "switched to Accept edits mode");
+    assert_eq!(result.content, "plan approved for Accept edits mode");
     assert_eq!(result.raw_output["mode_id"], "accept-edits");
     assert_eq!(result.raw_output["mode_name"], "Accept edits");
 
@@ -2431,8 +2441,94 @@ async fn exit_plan_mode_tool_execution_switches_to_accept_edits()
         .ok_or_else(|| {
             agent_client_protocol::Error::internal_error().data("missing stored session")
         })?;
-    assert_eq!(stored.mode, SessionBehavior::AcceptEdits);
+    // The turn owns the transition after the entire provider batch is paired.
+    assert_eq!(stored.mode, SessionBehavior::Plan);
 
+    Ok(())
+}
+
+struct CancelOnApproval(CancellationToken);
+
+impl PermissionRequester for CancelOnApproval {
+    fn request_permission(
+        &self,
+        _request: RequestPermissionRequest,
+        _tool_name: &str,
+        _cwd: &std::path::Path,
+    ) -> BoxFuture<'_, Result<RequestPermissionResponse, agent_client_protocol::Error>> {
+        Box::pin(async move {
+            self.0.cancel();
+            Ok(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    PERMISSION_ALLOW_ONCE_OPTION_ID,
+                )),
+            ))
+        })
+    }
+}
+
+#[test_log::test(tokio::test)]
+async fn exit_plan_mode_refuses_rejection_cancellation_and_missing_editor()
+-> Result<(), agent_client_protocol::Error> {
+    let store = test_store();
+    let session = handle_new_session_request(&store, &NewSessionRequest::new("/tmp"))?;
+    store.set_mode(&session.session_id.0, SessionBehavior::Plan)?;
+    let context = ToolContext {
+        session_id: session.session_id.0.to_string(),
+        cwd: "/tmp".into(),
+        additional_directories: Vec::new(),
+        client_capabilities: None,
+    };
+    let call = ChatToolCall::new("exit-plan", "exit_plan_mode", "{}");
+    let requester = FakePermissionRequester::new(vec![RequestPermissionResponse::new(
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("reject_once")),
+    )]);
+    let token = CancellationToken::new();
+    assert!(
+        !exit_plan_mode_tool_execution(&store, &call, &context, Some(&requester), &token)
+            .await
+            .success
+    );
+    assert!(
+        !exit_plan_mode_tool_execution(&store, &call, &context, None, &token)
+            .await
+            .success
+    );
+    token.cancel();
+    assert!(
+        !exit_plan_mode_tool_execution(&store, &call, &context, Some(&requester), &token)
+            .await
+            .success
+    );
+    assert_eq!(
+        store.session_behavior(&session.session_id.0)?,
+        SessionBehavior::Plan
+    );
+    assert_eq!(
+        requester
+            .requests()
+            .lock()
+            .map_err(agent_client_protocol::Error::into_internal_error)?
+            .len(),
+        1
+    );
+    let racing_token = CancellationToken::new();
+    let racing_requester = CancelOnApproval(racing_token.clone());
+    assert!(
+        !exit_plan_mode_tool_execution(
+            &store,
+            &call,
+            &context,
+            Some(&racing_requester),
+            &racing_token,
+        )
+        .await
+        .success
+    );
+    assert_eq!(
+        store.session_behavior(&session.session_id.0)?,
+        SessionBehavior::Plan
+    );
     Ok(())
 }
 

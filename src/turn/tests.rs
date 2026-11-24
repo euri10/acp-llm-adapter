@@ -886,13 +886,18 @@ fn assert_plan_mode_exit_notifications(notifications: &[SessionNotification]) {
     )));
 }
 
-fn assert_no_permission_requests(
+fn assert_plan_exit_permission(
     requests: &Arc<Mutex<Vec<RequestPermissionRequest>>>,
 ) -> Result<(), agent_client_protocol::Error> {
     let request_guard = requests
         .lock()
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    assert_eq!(request_guard.len(), 0);
+    assert_eq!(request_guard.len(), 1);
+    assert_eq!(
+        request_guard[0].tool_call.fields.title.as_deref(),
+        Some("Approve plan and switch to Accept Edits")
+    );
+    assert_eq!(request_guard[0].options.len(), 2);
     Ok(())
 }
 
@@ -905,6 +910,243 @@ struct FakeToolRegistry {
 struct PlanModeToolRegistry {
     definitions: Vec<ToolDefinition>,
     calls: Arc<Mutex<Vec<ChatToolCall>>>,
+}
+
+struct ExitBatchRegistry {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl ToolRegistry for ExitBatchRegistry {
+    fn definitions(
+        &self,
+        _context: &ToolContext,
+        _store: &SessionStore,
+    ) -> Result<Vec<ToolDefinition>, AdapterError> {
+        Ok([
+            "exit_plan_mode",
+            "read_file",
+            "write_file",
+            "mcp__server__tool",
+        ]
+        .into_iter()
+        .map(|name| ToolDefinition::new(name, name, serde_json::json!({"type":"object"})))
+        .collect())
+    }
+
+    fn kind(&self, name: &str) -> ToolKind {
+        match name {
+            "exit_plan_mode" => ToolKind::Think,
+            "read_file" => ToolKind::Read,
+            "write_file" => ToolKind::Edit,
+            _ => crate::mcp_tool_kind(),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ChatToolCall,
+        context: &'a ToolContext,
+        store: &'a SessionStore,
+        _executor: Option<&'a dyn ToolExecutor>,
+        _cancellation: CancellationToken,
+    ) -> BoxFuture<'a, ToolExecution> {
+        Box::pin(async move {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(call.name().to_owned());
+            }
+            if call.name() == "exit_plan_mode" {
+                if let Err(error) =
+                    store.set_mode(&context.session_id, SessionBehavior::AcceptEdits)
+                {
+                    return ToolExecution::failed(error.to_string());
+                }
+                ToolExecution::completed("approved", serde_json::json!({"mode_id":"accept-edits"}))
+            } else {
+                ToolExecution::completed("executed", serde_json::json!({}))
+            }
+        })
+    }
+}
+
+fn exit_batch_client(names: &[&str]) -> FakeLlmClient {
+    let mut events = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            Ok(StreamEvent::ToolCallDelta(ToolCallDelta::new(
+                index,
+                Some(format!("call-{index}")),
+                Some((*name).to_owned()),
+                Some("{}".into()),
+            )))
+        })
+        .collect::<Vec<_>>();
+    events.push(Ok(StreamEvent::Finished(FinishReason::ToolCalls)));
+    FakeLlmClient::new(events)
+}
+
+#[test_log::test(tokio::test)]
+async fn plan_exit_batch_refuses_unadvertised_and_later_calls() -> Result<(), AdapterError> {
+    let store = domain_store()?;
+    store.set_mode("domain", SessionBehavior::Plan)?;
+    let client = exit_batch_client(&[
+        "exit_plan_mode",
+        "write_file",
+        "mcp__server__tool",
+        "read_file",
+    ]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let registry = ExitBatchRegistry {
+        calls: Arc::clone(&calls),
+    };
+    let mut results = Vec::new();
+    super::handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        domain_prompt("plan"),
+        std::num::NonZeroUsize::MIN,
+        |event| {
+            if let TurnEvent::ToolResult { call, result } = event {
+                results.push((call.name().to_owned(), result));
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    let requests = client.requests();
+    let requests = requests
+        .lock()
+        .map_err(|e| AdapterError::Internal(e.to_string()))?;
+    let advertised: Vec<_> = requests[0]
+        .tools()
+        .iter()
+        .map(ToolDefinition::name)
+        .collect();
+    let executed = calls
+        .lock()
+        .map_err(|e| AdapterError::Internal(e.to_string()))?;
+    assert_eq!(
+        *executed,
+        ["exit_plan_mode"],
+        "advertised={advertised:?}, results={results:?}"
+    );
+    for (name, result) in &results[1..] {
+        assert!(
+            !result.success,
+            "advertised={advertised:?}, refused={name}: {result:?}"
+        );
+    }
+    store.with_session("domain", |record| {
+        for message in record
+            .history
+            .iter()
+            .filter(|m| m.tool_call_id().is_some_and(|id| id != "call-0"))
+        {
+            assert_eq!(
+                message.tool_success(),
+                Some(false),
+                "advertised={advertised:?}, result={message:?}"
+            );
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn cancelled_plan_exit_announces_the_stored_mode() -> Result<(), AdapterError> {
+    let store = domain_store()?;
+    store.set_mode("domain", SessionBehavior::Plan)?;
+    let client = exit_batch_client(&["exit_plan_mode"]);
+    let registry = ExitBatchRegistry {
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut modes = Vec::new();
+    let response = super::handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        domain_prompt("plan"),
+        std::num::NonZeroUsize::MIN,
+        |event| {
+            match event {
+                TurnEvent::ToolResult { .. } => store.cancel_active_turn("domain")?,
+                TurnEvent::ModeChanged(mode) => modes.push(mode),
+                _ => {}
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    assert_eq!(response.stop_reason, DomainStop::Cancelled);
+    assert_eq!(modes, [store.session_behavior("domain")?]);
+    assert_eq!(modes, [SessionBehavior::AcceptEdits]);
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn plan_request_refuses_unadvertised_mcp_after_editor_changes_mode()
+-> Result<(), AdapterError> {
+    let store = domain_store()?;
+    store.set_mode("domain", SessionBehavior::Plan)?;
+    let client = exit_batch_client(&["mcp__server__tool"]);
+    let registry = PlanModeToolRegistry::new();
+    let calls = registry.calls();
+    let mut results = Vec::new();
+    super::handle_prompt_request(
+        &store,
+        &client,
+        &registry,
+        None,
+        domain_prompt("plan"),
+        std::num::NonZeroUsize::MIN,
+        |event| {
+            match event {
+                TurnEvent::ToolCall { .. } => {
+                    store.set_mode("domain", SessionBehavior::AcceptEdits)?;
+                }
+                TurnEvent::ToolResult { call, result } => {
+                    results.push((call.name().to_owned(), result));
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    let requests = client.requests();
+    let requests = requests
+        .lock()
+        .map_err(|e| AdapterError::Internal(e.to_string()))?;
+    let advertised: Vec<_> = requests[0]
+        .tools()
+        .iter()
+        .map(ToolDefinition::name)
+        .collect();
+    assert!(!advertised.contains(&"mcp__server__tool"), "{advertised:?}");
+    assert!(
+        calls
+            .lock()
+            .map_err(|e| AdapterError::Internal(e.to_string()))?
+            .is_empty(),
+        "advertised={advertised:?}, refused calls={results:?}"
+    );
+    assert_eq!(
+        results[0].1.content,
+        "tool was not advertised for this request"
+    );
+    store.with_session("domain", |record| {
+        let result = record
+            .history
+            .last()
+            .ok_or_else(|| AdapterError::Internal("missing result".into()))?;
+        assert_eq!(result.tool_success(), Some(false));
+        Ok(())
+    })?;
+    Ok(())
 }
 
 impl PlanModeToolRegistry {
@@ -1281,12 +1523,28 @@ async fn live_mode_changes_control_dispatch_and_next_request() -> Result<(), Ada
             .calls
             .lock()
             .map_err(|error| AdapterError::Internal(error.to_string()))?;
-        assert_eq!(calls.is_empty(), after == SessionBehavior::Plan);
+        assert!(
+            calls.is_empty(),
+            "the call must satisfy both the advertised set and the live mode"
+        );
         let requests = client
             .requests
             .lock()
             .map_err(|error| AdapterError::Internal(error.to_string()))?;
         assert_eq!(requests.len(), 2);
+        let result = requests[1]
+            .messages()
+            .last()
+            .ok_or_else(|| AdapterError::Internal("missing rejected tool result".into()))?;
+        assert_eq!(result.tool_success(), Some(false));
+        assert_eq!(
+            result.content(),
+            if before == SessionBehavior::Plan {
+                "tool was not advertised for this request"
+            } else {
+                "plan mode refuses run_command tool calls"
+            }
+        );
         for (request, behavior) in requests.iter().zip([before, after]) {
             assert_eq!(
                 request.messages()[0].content().contains("Plan mode"),
@@ -1528,7 +1786,11 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
         ],
     ]);
     let requests = client.requests();
-    let requester = TransitionRequester::new(vec![]);
+    let requester = TransitionRequester::new(vec![RequestPermissionResponse::new(
+        agent_client_protocol::v1::schema::RequestPermissionOutcome::Selected(
+            agent_client_protocol::v1::schema::SelectedPermissionOutcome::new("allow_once"),
+        ),
+    )]);
     let requester_requests = requester.requests();
     let registry = AdapterToolRegistry;
     let mut notifications = Vec::new();
@@ -1566,7 +1828,7 @@ async fn plan_mode_exit_transition_updates_mode_and_restores_normal_behavior()
         );
     }
 
-    assert_no_permission_requests(&requester_requests)?;
+    assert_plan_exit_permission(&requester_requests)?;
 
     {
         let state_guard = store

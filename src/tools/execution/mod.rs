@@ -8,8 +8,10 @@ use std::process::Stdio;
 use acp_llm_adapter::error::AdapterError;
 use acp_llm_adapter::llm::{ToolCall as ChatToolCall, ToolDefinition};
 use agent_client_protocol::v1::schema::{
-    CreateTerminalRequest, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    ReadTextFileRequest, TerminalOutputRequest, WaitForTerminalExitRequest, WriteTextFileRequest,
+    CreateTerminalRequest, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, ReadTextFileRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, TerminalOutputRequest, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use globset::{Glob, GlobSetBuilder};
 use grep::regex::RegexMatcher;
@@ -23,6 +25,7 @@ use super::registry::{
     AdapterToolRegistry, ToolContext, ToolEdit, ToolExecution, ToolKind, ToolRegistry,
 };
 use super::search::{SearchReader, walk_files};
+use crate::session::{PERMISSION_ALLOW_ONCE_OPTION_ID, PERMISSION_REJECT_ONCE_OPTION_ID};
 use crate::{
     PermissionDecision, PermissionRequester, ReadTextFileRequester, SessionBehavior, SessionStore,
     TerminalRequester, ToolProgressReporter, WriteTextFileRequester, request_tool_permission,
@@ -226,7 +229,7 @@ pub(crate) fn update_plan_tool_definition() -> ToolDefinition {
 pub(crate) fn exit_plan_mode_tool_definition() -> ToolDefinition {
     ToolDefinition::new(
         "exit_plan_mode",
-        "Exit Plan mode by choosing another session mode.",
+        "Ask the user to approve the plan and switch to Accept Edits mode.",
         serde_json::json!({
             "type": "object",
             "properties": {},
@@ -276,17 +279,18 @@ pub(crate) fn update_plan_tool_execution(call: &ChatToolCall) -> ToolExecution {
     }
 }
 
-pub(crate) fn exit_plan_mode_tool_execution(
+pub(crate) async fn exit_plan_mode_tool_execution(
     store: &SessionStore,
     call: &ChatToolCall,
     context: &ToolContext,
+    requester: Option<&dyn PermissionRequester>,
+    cancellation: &CancellationToken,
 ) -> ToolExecution {
-    let _arguments = match serde_json::from_str::<serde_json::Value>(call.arguments()) {
-        Ok(arguments) => arguments,
-        Err(error) => {
-            return ToolExecution::failed(format!("invalid exit_plan_mode arguments: {error}"));
-        }
-    };
+    if !serde_json::from_str::<serde_json::Value>(call.arguments())
+        .is_ok_and(|arguments| arguments.as_object().is_some_and(serde_json::Map::is_empty))
+    {
+        return ToolExecution::failed("invalid exit_plan_mode arguments");
+    }
 
     match store.session_behavior(&context.session_id) {
         Ok(SessionBehavior::Plan) => {}
@@ -294,16 +298,71 @@ pub(crate) fn exit_plan_mode_tool_execution(
             return ToolExecution::failed("exit_plan_mode is only available while in Plan mode");
         }
         Err(error) => {
-            return ToolExecution::failed(format!("failed to exit plan mode: {error}"));
+            tracing::warn!(error = ?error, "failed to check plan mode");
+            return ToolExecution::failed("failed to check plan mode");
         }
     }
 
-    if let Err(error) = store.set_mode(&context.session_id, SessionBehavior::AcceptEdits) {
-        return ToolExecution::failed(format!("failed to exit plan mode: {error}"));
+    let Some(requester) = requester else {
+        return ToolExecution::failed("exit_plan_mode requires editor approval");
+    };
+    if cancellation.is_cancelled() {
+        return ToolExecution::failed("exit_plan_mode cancelled");
+    }
+    let request = RequestPermissionRequest::new(
+        context.session_id.clone(),
+        ToolCallUpdate::new(
+            call.id().to_string(),
+            ToolCallUpdateFields::new()
+                .title("Approve plan and switch to Accept Edits")
+                .status(ToolCallStatus::Pending),
+        ),
+        vec![
+            PermissionOption::new(
+                PERMISSION_ALLOW_ONCE_OPTION_ID,
+                "Approve",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PERMISSION_REJECT_ONCE_OPTION_ID,
+                "Reject",
+                PermissionOptionKind::RejectOnce,
+            ),
+        ],
+    );
+    let response = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return ToolExecution::failed("exit_plan_mode cancelled"),
+        response = async { requester.request_permission(request, call.name(), &context.cwd).await } => response,
+    };
+    if cancellation.is_cancelled() {
+        return ToolExecution::failed("exit_plan_mode cancelled");
+    }
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(code = ?error.code, "plan approval request failed");
+            return ToolExecution::failed("plan approval request failed");
+        }
+    };
+    if !matches!(response.outcome, RequestPermissionOutcome::Selected(ref selected) if selected.option_id.0.as_ref() == PERMISSION_ALLOW_ONCE_OPTION_ID)
+    {
+        return ToolExecution::failed("plan exit was not approved");
+    }
+    match store.session_behavior(&context.session_id) {
+        Ok(SessionBehavior::Plan) => {}
+        Ok(_) => return ToolExecution::failed("plan mode changed while awaiting approval"),
+        Err(error) => {
+            tracing::warn!(error = ?error, "failed to check plan mode after approval");
+            return ToolExecution::failed("failed to check plan mode");
+        }
     }
 
     ToolExecution {
-        content: format!("switched to {} mode", SessionBehavior::AcceptEdits.name()),
+        content: format!(
+            "plan approved for {} mode",
+            SessionBehavior::AcceptEdits.name()
+        ),
         raw_output: serde_json::json!({
             "mode_id": SessionBehavior::AcceptEdits.mode_id(),
             "mode_name": SessionBehavior::AcceptEdits.name(),
@@ -1654,6 +1713,10 @@ impl ToolRegistry for AdapterToolRegistry {
 }
 
 /// Execute built-in/MCP effects at the tool I/O boundary.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the shared access checks and cohesive tool dispatch together."
+)]
 pub(crate) fn execute_tools<'a>(
     call: &'a ChatToolCall,
     context: &'a ToolContext,
@@ -1743,11 +1806,14 @@ pub(crate) fn execute_tools<'a>(
             }
             "update_plan" => update_plan_tool_execution(call),
             "exit_plan_mode" => {
-                let store = store.clone();
-                let call = call.clone();
-                let context = context.clone();
-                blocking::unblock(move || exit_plan_mode_tool_execution(&store, &call, &context))
-                    .await
+                exit_plan_mode_tool_execution(
+                    store,
+                    call,
+                    context,
+                    connection.map(|requester| requester as &dyn crate::PermissionRequester),
+                    &cancellation_token,
+                )
+                .await
             }
             name if crate::is_mcp_tool_name(name) => {
                 crate::mcp_tool_execution(

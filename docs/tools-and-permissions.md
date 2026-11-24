@@ -75,6 +75,15 @@ conflict check, and its result reports text rather than a diff.
 filesystem sandbox**. MCP tools have their own permission boundary; these file
 roots do not sandbox MCP servers.
 
+## Planning tools
+
+`update_plan` publishes structured plan steps to the editor. In Plan mode,
+`exit_plan_mode` asks the editor to approve the plan and switch to
+`accept-edits`. Rejection keeps Plan mode and reports a failed tool call to the
+provider. The exit request ends its provider batch: every later call in that
+batch is refused, and the approved mode applies to the next provider request.
+Calls that were not advertised in the provider request are always refused.
+
 ## MCP tools
 
 MCP tools are external executors and use the same Execute permission policy as shell commands: `ask` and `accept-edits` request editor approval, while `yolo` auto-approves. Explicit “allow always” and “reject always” decisions apply to that tool name for the current session; a remembered rejection takes precedence over `yolo`. Restoring a session starts with fresh permission decisions. Plan mode and selected-content sessions prohibit MCP execution even with a remembered approval.

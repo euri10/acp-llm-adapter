@@ -606,6 +606,7 @@ async fn run_prompt_turn(
         }
 
         let mut pending_mode_transition = None;
+        let mut exit_requested = false;
         for tool_call in &turn.tool_calls {
             let tool_kind = env.tool_registry.kind(tool_call.name());
             notify(TurnEvent::ToolCall {
@@ -616,6 +617,13 @@ async fn run_prompt_turn(
                 // Preserve the provider's call/result pairing for resume, but
                 // never dispatch the remaining calls in a cancelled batch.
                 ToolExecution::failed("tool call cancelled")
+            } else if !tool_definitions
+                .iter()
+                .any(|definition| definition.name() == tool_call.name())
+            {
+                ToolExecution::failed("tool was not advertised for this request")
+            } else if exit_requested {
+                ToolExecution::failed("tool call not authorized after exit_plan_mode")
             } else {
                 let behavior = env.store.session_behavior(&env.request.session_id)?;
                 if behavior.allows_tool_kind(tool_kind) {
@@ -643,6 +651,9 @@ async fn run_prompt_turn(
             if let Some(mode) = transition_mode_from_tool_result(tool_call, &tool_result)? {
                 pending_mode_transition = Some(mode);
             }
+            if tool_call.name() == "exit_plan_mode" {
+                exit_requested = true;
+            }
             messages.push(ChatMessage::tool_result(
                 tool_call.id(),
                 tool_result.content_for_model(),
@@ -650,12 +661,17 @@ async fn run_prompt_turn(
             ));
         }
 
-        if let Some(mode) =
-            pending_mode_transition.filter(|_| !env.cancellation_token.is_cancelled())
-        {
-            let store = env.store.clone();
-            let session_id = env.request.session_id.clone();
-            blocking::unblock(move || store.set_mode(&session_id, mode)).await?;
+        if let Some(mode) = pending_mode_transition {
+            let current = env.store.session_behavior(&env.request.session_id)?;
+            if !env.cancellation_token.is_cancelled() && current == SessionBehavior::Plan {
+                let store = env.store.clone();
+                let session_id = env.request.session_id.clone();
+                blocking::unblock(move || store.set_mode(&session_id, mode)).await?;
+            }
+            let current = env.store.session_behavior(&env.request.session_id)?;
+            if current != behavior {
+                notify(TurnEvent::ModeChanged(current))?;
+            }
         }
 
         // Persist after every complete turn cycle (assistant text + tool results).
@@ -669,8 +685,7 @@ async fn run_prompt_turn(
             stop_reason = StopReason::Cancelled;
             break;
         }
-        if let Some(mode) = pending_mode_transition {
-            notify(TurnEvent::ModeChanged(mode))?;
+        if pending_mode_transition.is_some() {
             stop_reason = StopReason::EndTurn;
             break;
         }
