@@ -106,11 +106,36 @@ jobs:
       - *install-rust
 
       - name: Run release-plz release-pr
+        id: release-pr
         uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # release-plz exposes the PR head after creating or updating it. Its
+      # next update can replace bot commits, so regenerate this on every run.
+      - name: Checkout release PR
+        if: ${{ steps.release-pr.outputs.pr && steps.release-pr.outputs.pr != 'null' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJSON(steps.release-pr.outputs.pr).head_branch }}
+          persist-credentials: true
+
+      - name: Update installation version on release PR
+        if: ${{ steps.release-pr.outputs.pr && steps.release-pr.outputs.pr != 'null' }}
+        env:
+          PR_BRANCH: ${{ fromJSON(steps.release-pr.outputs.pr).head_branch }}
+        run: |
+          python3 scripts/check-installation-version --write
+          python3 scripts/check-installation-version
+          if ! git diff --quiet -- docs/installation.md; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -- docs/installation.md
+            git commit -m 'docs: sync installation version'
+            git push origin "HEAD:refs/heads/$PR_BRANCH"
+          fi
 
   # Same-workflow outputs work with GITHUB_TOKEN; release/tag events do not.
   # https://release-plz.dev/docs/github/output

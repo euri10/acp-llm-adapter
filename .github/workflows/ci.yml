@@ -10,6 +10,7 @@
 #   • scripts/check-agent-instructions (AGENTS.md size limit)
 #   • scripts/check-readme-snippets (README quotes the tested snippets)
 #   • scripts/test-editor-snippets (LouiseLM and CodeCompanion snippets run)
+#   • scripts/test-agentic and scripts/test-cc-connect.mjs (pinned clients)
 #
 # MSRV: 1.95  (stable toolchain, edition 2024)
 
@@ -142,8 +143,14 @@ jobs:
       - name: README snippet quotes
         run: ./scripts/check-readme-snippets
 
+      - name: Installation version matches Cargo.toml
+        run: python3 scripts/check-installation-version
+
+      - name: Installation version guard regression
+        run: python3 scripts/test-installation-version
+
   editor-snippets:
-    name: "editor snippets (LouiseLM, CodeCompanion)"
+    name: "editor snippets and pinned clients"
     runs-on: ubuntu-latest
     env:
       # Neovim stable from https://github.com/neovim/neovim/releases; LouiseLM
@@ -171,8 +178,26 @@ jobs:
           echo "$RUNNER_TEMP/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
           sudo apt-get update -q && sudo apt-get install -yq sqlite3
 
+      - name: Install Node.js for cc-connect check
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.16.0"
+
       - name: Plugin checkout failure handling
         run: python3 scripts/test-editor-snippets-fetch
 
       - name: Run editor snippets against the fake provider
         run: ./scripts/test-editor-snippets
+
+      - name: Run agentic.nvim against the fake provider
+        run: ./scripts/test-agentic
+
+      - name: Download and verify pinned cc-connect
+        run: |
+          archive="$RUNNER_TEMP/cc-connect.tar.gz"
+          curl -fsSL https://github.com/chenhg5/cc-connect/releases/download/v1.5.2-beta.1/cc-connect-v1.5.2-beta.1-linux-amd64.tar.gz -o "$archive"
+          printf '%s  %s\n' cdffb845337df1d7ac46f978feb44e48a7a0e4de223e368a02a1ca67f6be4243 "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+
+      - name: Run cc-connect against local fake services
+        run: node scripts/test-cc-connect.mjs "$RUNNER_TEMP/cc-connect-v1.5.2-beta.1-linux-amd64"

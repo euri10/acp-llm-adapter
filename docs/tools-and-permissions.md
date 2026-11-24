@@ -10,7 +10,17 @@
 - `edit_file`
 - `run_command`
 
-Tool calls are permission-gated and surfaced through ACP so the editor can show native diffs and command output. A tool call is reported in progress only once its work actually starts — after you approve it — so a command waiting on a permission prompt stays visibly pending rather than appearing to run.
+`read_file`, `list_dir`, `glob` and `grep` do not prompt in any mode. In
+`ask`, writes, edits and commands request approval; `accept-edits` approves
+writes and edits automatically but still asks for commands; `yolo` approves
+both automatically. Remembered allow or reject decisions can affect subsequent
+prompts for the same tool; remembered rejection takes precedence over
+automatic approval.
+
+Tool calls are surfaced through ACP so the editor can show native diffs and
+command output. A tool call is reported in progress only once its work actually
+starts, so a command waiting on a permission prompt stays visibly pending
+rather than appearing to run.
 
 Cancelling during approval ends the wait without starting the tool. Late approval
 replies cannot execute the cancelled call or change remembered permissions.

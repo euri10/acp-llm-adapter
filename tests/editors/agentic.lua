@@ -6,7 +6,13 @@ local evidence = assert(vim.env.AGENTIC_EVIDENCE)
 local agentic = require("agentic")
 local registry = require("agentic.session_registry")
 
+local function step(name)
+  io.stdout:write("agentic: " .. name .. "\n")
+  io.stdout:flush()
+end
+
 smoke.run("agentic", function()
+  step("start session")
   dofile(root .. "/examples/agentic.lua")
   local project = smoke.project()
   vim.fn.writefile({ project }, evidence .. "/project-path.txt")
@@ -51,6 +57,7 @@ smoke.run("agentic", function()
     end
     error("missing permission choice " .. kind)
   end
+  step("reply, read and search")
   send("Say hello")
   finish()
   assert(chat():find(smoke.reply, 1, true), "reply absent")
@@ -61,6 +68,7 @@ smoke.run("agentic", function()
   finish()
   assert(chat():find("hello.py:1:", 1, true), "search result absent")
 
+  step("edit preview and approval")
   send(smoke.tool_prompt("edit_file", smoke.docstring_edit))
   local id = pending()
   assert(smoke.read(project .. "/hello.py") == smoke.hello, "edit happened before approval")
@@ -82,11 +90,13 @@ smoke.run("agentic", function()
   finish()
   assert(smoke.read(project .. "/hello.py"):find('"""Greet someone."""', 1, true))
 
+  step("rejected write")
   send(smoke.tool_prompt("write_file", { path = "denied.txt", content = "must not be written" }))
   choose("reject_once")
   finish()
   assert(vim.fn.filereadable(project .. "/denied.txt") == 0, "denied write executed")
 
+  step("command cancellation and continuation")
   send(smoke.tool_prompt("run_command", { command = "touch started; sleep 3; touch cancelled-too-late" }))
   choose("allow_once")
   smoke.wait("command never started", function()
@@ -124,6 +134,7 @@ smoke.run("agentic", function()
     assert(chosen, "selector did not open")
     return chosen
   end
+  step("mode and model controls")
   select_option("<S-Tab>", "plan")
   smoke.wait("plan mode not applied", function()
     return session.config_options:get_mode_id() == "plan"
@@ -140,6 +151,7 @@ smoke.run("agentic", function()
   finish()
   assert(chat():find("request model: " .. model, 1, true), "selected model did not reach provider")
   -- Destroy the host widget, then exercise the public restore picker and ACP load.
+  step("restore session")
   agentic.destroy_session()
   local old_select = vim.ui.select
   vim.ui.select = function(items, _, callback)
@@ -179,6 +191,7 @@ smoke.run("agentic", function()
     "agentic: read/search/edit, preview, denied write, cancellation, mode/model controls and restored continuation passed\n"
   )
 end, function()
+  step("reap adapter")
   local instances = require("agentic.acp.agent_instance")
   local client = instances._instances["deepseek-adapter"]
   local exited = true

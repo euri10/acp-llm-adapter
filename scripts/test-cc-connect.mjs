@@ -25,6 +25,8 @@ const version = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim()
 const stable = version.startsWith('cc-connect v1.5.0\n');
 assert(stable || version.startsWith('cc-connect v1.5.2-beta.1\n'), 'Update the pinned-version expectations before checking another release');
 const say = (s) => console.log(s.replaceAll(run, '<disposable>'));
+let step = 'startup';
+const begin = (name) => { step = name; say(`RUN ${name}`); };
 async function handleRequest(req, res) {
   let body = '';
   for await (const part of req) body += part;
@@ -131,21 +133,26 @@ const wire = async () => {
 };
 try {
   say(version);
+  say(execFileSync(join(root, 'target/debug/acp-llm-adapter'), ['--version'], { encoding: 'utf8' }).trim());
   say(`Disposable workspace: ${workspace}`);
+  begin('initialization and reply');
   child = spawn(binary, ['--config', join(run, 'config.toml')], { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
   child.stdout.on('data', b => { logs += b; });
   child.stderr.on('data', b => { logs += b; });
   await waitFor(() => registered, 'local chat registration');
   await turn('hello-local', 'ANSWER hello-local');
   say('PASS initialization + streamed provider answer through real cc-connect');
+  begin('read_file');
   await turn('fixture-tool read_file {"path":"notes.txt"}', 'fixture-note');
   say('PASS read_file returns fixture-note');
+  begin('approved and denied writes');
   await permission('write_file', { path: 'approved.txt', content: 'approved\n' }, 'allow');
   assert.equal(await readFile(join(workspace, 'approved.txt'), 'utf8'), 'approved\n');
   say('PASS approved write_file creates approved.txt');
   await permission('write_file', { path: 'denied.txt', content: 'denied\n' }, 'deny');
   assert.equal(await exists(join(workspace, 'denied.txt')), false);
   say('PASS denied write_file leaves no denied.txt');
+  begin('cancellation and continuation');
   const started = outbound.length;
   enqueue('fixture-tool run_command {"command":"printf started > started.txt; sleep 2; printf late > cancelled.txt"}');
   await waitFor(() => outbound.slice(started).some(m => JSON.stringify(m).includes('perm:allow')), 'command permission');
@@ -159,6 +166,7 @@ try {
   assert.equal(await exists(join(workspace, 'cancelled.txt')), false);
   await turn('after-cancel', 'ANSWER after-cancel');
   say('PASS /stop cancels a running command; continuation succeeds; no cancelled.txt');
+  begin('thought rendering and attachments');
   const thought = await turn('thought-check', 'ANSWER thought-check');
   assert.equal(thought.includes('SYNTHETIC_THOUGHT'), stable, 'version-specific thought rendering changed');
   say(`OBSERVED thinking_messages=false: thought in reply=${thought.includes('SYNTHETIC_THOUGHT')}`);
@@ -173,6 +181,7 @@ try {
   assert.equal(typeof imagePrompt, 'string');
   assert.match(imagePrompt, /Image files saved locally:/);
   say('PASS image attachment becomes local path text; no image/vision input');
+  begin('session identity and restore');
   const beforeSwitch = await wire();
   assert(beforeSwitch.some(r => r.payload?.params?.update?.sessionUpdate === 'agent_thought_chunk'), 'fixture must emit a real ACP thought chunk');
   assert(beforeSwitch.some(r => r.payload?.method === 'initialize' && r.payload.params.protocolVersion === 1));
@@ -202,7 +211,11 @@ try {
   say(`PASS client preview output (${previewCount} starts); platform rendering still requires real Feishu`);
   await writeFile(join(run, 'wire.json'), JSON.stringify(await wire(), null, 2));
   say('LOCAL VALIDATION COMPLETE; synthetic chat/provider, not Feishu or user-adoption evidence');
+} catch (error) {
+  console.error(`FAIL ${step}`);
+  throw error;
 } finally {
+  say('RUN shutdown and reaping');
   if (child && child.exitCode === null) {
     child.kill('SIGTERM');
     const killed = setTimeout(() => child.kill('SIGKILL'), 4000);

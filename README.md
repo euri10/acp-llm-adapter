@@ -53,10 +53,10 @@ command, and that the edit preview shown before approval is the exact change.
 The checks wait for adapter shutdown and reap their local fake provider on exit.
 They use DeepSeek; for another backend change `--backend` and the key.
 
-Additional recipes: [agentic.nvim](docs/agentic.md), with real-client checks
-and a separate live DeepSeek pilot; and [cc-connect / cc-connect 试用](docs/cc-connect.md),
-with local synthetic transport/provider checks and real chat-account validation
-still pending.
+CI also checks [agentic.nvim](docs/agentic.md) and
+[cc-connect / cc-connect 试用](docs/cc-connect.md) using their pinned clients
+and local fake services. The agentic guide also describes a separate live
+DeepSeek pilot; real chat-account validation for cc-connect is still pending.
 
 ### LouiseLM
 
@@ -99,8 +99,8 @@ In Zed's `settings.json`
 ```
 
 In the Agent Panel's new-thread menu, pick the external agent
-"DeepSeek (acp-llm-adapter)", not Zed's built-in agent. Tested with Zed 1.23.2,
-2026-10-09.
+"DeepSeek (acp-llm-adapter)", not Zed's built-in agent. Last manual check of
+this setup: Zed 1.23.2, 2026-10-09.
 
 ![Zed Agent Panel running the DeepSeek (acp-llm-adapter) external agent: the permission prompt shows the docstring diff for hello.py before approval](https://raw.githubusercontent.com/euri10/acp-llm-adapter/main/docs/images/zed.png)
 

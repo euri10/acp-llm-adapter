@@ -13,7 +13,7 @@ Alpine/musl, ARM, macOS and Windows binaries are not supplied or verified.
 You need `curl`, `sha256sum` and `tar` for installation. Run in a shell:
 
 ```sh
-version=0.10.0
+version=0.10.1
 archive="acp-llm-adapter-v$version-x86_64-unknown-linux-gnu.tar.gz"
 release_url="https://github.com/euri10/acp-llm-adapter/releases/download/v$version"
 download_dir=$(mktemp -d)
@@ -27,10 +27,11 @@ export PATH="$HOME/.local/bin:$PATH" &&
 acp-llm-adapter --version
 ```
 
-Expected version: `acp-llm-adapter 0.10.0`. The archive also includes the MIT
-license and `SOURCE.txt` with the release tag, exact source commit, compiler,
-target, features and lockfile SHA-256. Checksums detect a damaged download;
-they are not a separate cryptographic signature.
+The final command should report `acp-llm-adapter` followed by the chosen
+version. The archive also includes the MIT license and `SOURCE.txt` with the
+release tag, exact source commit, compiler, target, features and lockfile
+SHA-256. Checksums detect a damaged download; they are not a separate
+cryptographic signature.
 
 Keep `$HOME/.local/bin` in the environment that launches your editor or
 cc-connect; for a GUI editor you can instead configure the absolute executable
@@ -57,7 +58,7 @@ they do not establish live-provider or additional editor compatibility.
 With Rust 1.95 or newer:
 
 ```sh
-cargo install --locked --version 0.10.0 acp-llm-adapter
+cargo install --locked acp-llm-adapter
 acp-llm-adapter --version
 ```
 
@@ -76,7 +77,8 @@ requests, rejects one command, approves another, checks disk effects and
 continuation, then waits for graceful process exit. This is native runtime
 verification, not merely cross-compilation.
 
-On **2026-11-06**, [release run 42187690080](https://github.com/euri10/acp-llm-adapter/actions/runs/42187690080)
+Historical verification for **v0.10.0**: on **2026-11-06**,
+[release run 42187690080](https://github.com/euri10/acp-llm-adapter/actions/runs/42187690080)
 published `v0.10.0` from commit `844bfbb0d6404d1dd6c4fa0d73885be10cd97204`.
 An independent public download passed the same mock workflow in Ubuntu 22.04
 and Debian 13 containers, plus the `sha256sum` / `tar` / `install` path above.
@@ -95,6 +97,8 @@ python3 scripts/check-release-binary \
 ```
 
 Future Release-plz releases attach this same single target automatically.
+The release PR updates the installation recipe's version from `Cargo.toml`;
+CI checks that they match.
 Maintainers can backfill a published stable tag with
 `gh workflow run release-plz.yml --ref main -f release_tag=v0.10.0`.
 This runs only the binary job; it does not create a new crate version or release

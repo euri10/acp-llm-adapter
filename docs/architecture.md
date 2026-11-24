@@ -7,14 +7,14 @@ The adapter bridges two independent channels:
 │                         acp-llm-adapter                                           │
 │                                                                                        │
 │  Editor ──ACP/stdio──▶ ┌─────────────────┐  ┌─────────────────┐                        │
-│  (Zed,      JSON-RPC   │  acp.rs         │  │  llm/*          │                        │
+│  (Zed,      JSON-RPC   │  acp/           │  │  llm/*          │                        │
 │   Neovim,   frames  ◀──│  ACP transport  │  │  HTTPS + SSE    │──▶ LLM Provider API    │
 │   ...)                 │  + request      │  │  client, types, │  │ (DeepSeek/GLM/Groq)  │
 │                        │  handlers       │  │  stream parser  │  │ /chat/completions    │
 │                        └─────────┬───────┘  └────────┬────────┘                        │
 │                                  │                   │                                 │
 │                           ┌──────▼───────────────────▼──────────────────┐              │
-│                           │ · turn.rs           · tools.rs     · mcp.rs │              │
+│                           │ · turn.rs           · tools/       · mcp.rs │              │
 │                           │ · Session state     · tool loop    · MCP    │              │
 │                           │ · Permission gating · cancellation          │              │
 │                           └───────────────────┬─────────────────────────┘              │
@@ -26,7 +26,7 @@ The adapter bridges two independent channels:
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Left side** — the adapter speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio as JSON-RPC 2.0 frames. The `agent-client-protocol` 3.x SDK handles the stable ACP v1 wire protocol; [`acp/`](../src/acp/) registers request handlers and translates between ACP schema types and the adapter's internal types. Its `process` feature supports the `dev` command's child agent, while the server uses the generic `Lines` transport.
+**Left side** — the adapter speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio as JSON-RPC 2.0 frames. The `agent-client-protocol` 5.x SDK handles stable ACP v1 and, by default, experimental ACP v2; [`acp/`](../src/acp/) registers request handlers and translates between ACP schema types and the adapter's internal types. Its `process` feature supports the `dev` command's child agent, while the server uses the generic `Lines` transport.
 
 **Right side** — the adapter speaks HTTPS + Server-Sent Events to the provider's OpenAI-compatible `/chat/completions` endpoint via a thin client owned by this crate in [`src/llm/`](../src/llm/). A [`LlmClient`](../src/llm/client.rs) trait provides the mock seam for testing without a live API key.
 
@@ -38,8 +38,13 @@ The adapter bridges two independent channels:
 
 | Module                                     | Responsibility                                                                                       |
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| [`main.rs`](../src/main.rs)                   | Adapter CLI, backend selection and stdio server setup                                                |
 | [`acp/`](../src/acp/)                         | ACP transport registration, request handler dispatch, response builders, permission requesters       |
-| [`acp/v2.rs`](../src/acp/v2.rs)               | Experimental ACP v2 edge, enabled by default alongside v1 ([protocol-v2](protocol-v2.md)) |
+| [`acp/session_options.rs`](../src/acp/session_options.rs) | ACP mode and configuration selectors                                      |
+| [`acp/requesters.rs`](../src/acp/requesters.rs) | Editor permission, filesystem and terminal requests                                               |
+| [`acp/turn_events.rs`](../src/acp/turn_events.rs) | Turn event translation into ACP notifications                                                   |
+| [`acp/v2.rs`](../src/acp/v2.rs), [`acp/v2/`](../src/acp/v2/) | Experimental ACP v2 edge, enabled by default alongside v1 ([protocol-v2](protocol-v2.md)) |
+| [`selected_content.rs`](../src/selected_content.rs) | Limits for tool-less selected-content sessions                                                |
 | [`session.rs`](../src/session.rs)             | Adapter-owned session data, mode/permission policy, tool-call accumulation                          |
 | [`turn.rs`](../src/turn.rs)                   | Prompt-turn orchestration: LLM streaming, tool-call accumulation, loop control, cancellation         |
 | [`tools/`](../src/tools/)                     | Built-in tool registration, execution and filesystem boundaries                                      |
@@ -47,20 +52,30 @@ The adapter bridges two independent channels:
 | [`execution/`](../src/tools/execution)        | Tool definitions, argument parsing, execution (read/write/edit/grep/glob/command), output truncation |
 | [`filesystem.rs`](../src/tools/filesystem.rs) | Approved-root path resolution, directory-capability I/O, editor-path validation                     |
 | [`search.rs`](../src/tools/search.rs)         | Confined cwd traversal, in-root ignore rules and cancellable file reads                              |
-| [`mcp.rs`](../src/mcp.rs)                     | MCP server connection (stdio + HTTP streamable), tool-name mapping, invocation, result rendering     |
+| [`mcp.rs`](../src/mcp.rs), [`mcp/sse.rs`](../src/mcp/sse.rs) | MCP connections (stdio, streamable HTTP and legacy SSE), tool mapping and invocation |
 | [`session_store.rs`](../src/session_store.rs) | Shared session lifecycle, MCP resource ownership, metadata and JSONL history persistence              |
 | [`dev.rs`](../src/dev.rs)                     | Development utilities, smoke tests, CLI testing backends                                             |
-| [`error.rs`](../src/error.rs)                 | Unified domain error type (adapter crate root)                                                       |
+| [`test_utils.rs`](../src/test_utils.rs)       | Test-only helpers                                                                                    |
+| [`bin/acp-proxy.rs`](../src/bin/acp-proxy.rs) | Separate ACP debugging proxy CLI                                                                    |
 
-**Library Modules** (`llm` - reusable client):
+**Library Modules** (shared by the binaries):
 
 | Module                               | Responsibility                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------ |
+| [`lib.rs`](../src/lib.rs)               | Shared library entry point                                                     |
+| [`llm/`](../src/llm/)                   | Reusable provider client facade                                                |
 | [`llm/types.rs`](../src/llm/types.rs)   | Chat message, request, tool definition, and stream-event types (public facade) |
 | [`llm/client.rs`](../src/llm/client.rs) | HTTP client with SSE retry, `LlmClient` trait, `ChatClient` impl               |
 | [`llm/stream.rs`](../src/llm/stream.rs) | SSE event parsing, tool-call delta reassembly, finish-reason mapping           |
 | [`llm/config.rs`](../src/llm/config.rs) | Environment-driven config (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`)         |
 | [`llm/error.rs`](../src/llm/error.rs)   | Typed error enum (config, HTTP, SSE, JSON, transport)                          |
+| [`llm/models.rs`](../src/llm/models.rs) | Model discovery and context-window metadata                                   |
+| [`llm/pricing.rs`](../src/llm/pricing.rs) | Usage pricing                                                              |
+| [`error.rs`](../src/error.rs)           | Shared domain error type                                                      |
+| [`logsink.rs`](../src/logsink.rs)       | Shared structured logging and routing                                         |
+| [`paths.rs`](../src/paths.rs)           | State directory locations                                                     |
+| [`proxy.rs`](../src/proxy.rs)           | Transparent ACP proxy and process lifecycle                                   |
+| [`timestamp.rs`](../src/timestamp.rs)   | UTC timestamp helpers                                                         |
 
 Completion transport recovery is limited to three retries on fresh connections
 before any text, thought, tool delta or other completion event has been emitted.

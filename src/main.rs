@@ -114,7 +114,7 @@ fn adapter_available_commands() -> Vec<AvailableCommand> {
 #[command(
     name = "acp-llm-adapter",
     version,
-    about = "ACP stdio adapter for LLM-backed coding sessions (DeepSeek, GLM)"
+    about = "ACP stdio adapter for LLM-backed coding sessions (DeepSeek, GLM, Groq)"
 )]
 struct Cli {
     #[command(subcommand)]

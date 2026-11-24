@@ -24,6 +24,9 @@ plugin=$(realpath "$plugin")
 # Resolve version-manager shims before isolating HOME and the environment.
 nvim_bin=$(nvim --headless --noplugin -u NONE -i NONE '+lua io.write(vim.v.progpath)' +qa)
 cargo build --locked -q --bin acp-llm-adapter --example fake_provider
+printf 'agentic.nvim revision: %s\n' "$rev"
+"$nvim_bin" --version
+target/debug/acp-llm-adapter --version
 coproc PROVIDER {
   exec env -i PATH="$PATH" FAKE_PROVIDER_KEY=agentic-offline-key \
     FAKE_PROVIDER_REPLY='Hello from the offline agentic check.' \

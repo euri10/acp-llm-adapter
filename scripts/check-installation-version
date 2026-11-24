@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Check or update the installation recipe's version from Cargo.toml."""
+
+import argparse
+from pathlib import Path
+import re
+import sys
+import tomllib
+
+root = Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--write", action="store_true", help="update the recipe")
+args = parser.parse_args()
+
+with (root / "Cargo.toml").open("rb") as manifest:
+    version = tomllib.load(manifest)["package"]["version"]
+
+path = root / "docs/installation.md"
+document = path.read_text()
+pattern = re.compile(r"^version=([^\s]+)$", re.MULTILINE)
+matches = list(pattern.finditer(document))
+if len(matches) != 1:
+    sys.exit("installation.md must have exactly one version= assignment")
+
+documented = matches[0].group(1)
+if args.write:
+    path.write_text(pattern.sub(lambda _: f"version={version}", document))
+elif documented != version:
+    sys.exit(f"installation.md version {documented} does not match Cargo.toml {version}")
+else:
+    print(f"installation.md version matches Cargo.toml: {version}")

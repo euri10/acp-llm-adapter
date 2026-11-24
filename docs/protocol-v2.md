@@ -40,6 +40,11 @@ checks cover both the default dual-protocol build and the explicit v1-only
 fallback. Editor adoption and the real-editor evidence below remain separate
 from protocol and SDK stability; this upgrade does not promote v2 to stable.
 
+On 2026-11-24, `Cargo.lock` resolves SDK 5.4.0 and schema 1.19.0;
+`Cargo.toml` still enables v2 through the SDK's `unstable_protocol_v2`
+feature. The earlier editor and protocol-status observations remain dated
+evidence, not a new editor or protocol-stability check.
+
 Real-editor QA (`daa-ltct`) completed on 2026-11-06. Zed 1.27.0-pre includes
 the v2 client, but its
 [release build only honors feature-flag overrides for staff](https://github.com/zed-industries/zed/blob/1a91814bd79e80e8f21ed7bea8e228852cd13def/crates/feature_flags/src/store.rs#L99).
